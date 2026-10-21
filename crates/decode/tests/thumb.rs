@@ -538,10 +538,11 @@ fn undefined_spaces() {
         decode_thumb(0xE800, 0),
         ThumbInstr::Undefined { encoding: 0xE800 }
     );
-    // Standalone second half of BL (hw>>11 == 11111).
+    // Standalone second half of BL decodes as the documented
+    // "BL LR+imm" idiom, not as an undefined space.
     assert_eq!(
         decode_thumb(0xF800, 0),
-        ThumbInstr::Undefined { encoding: 0xF800 }
+        ThumbInstr::LongBranchWithLinkFromLr { offset: 0 }
     );
     // First half of BL without a valid second half.
     assert_eq!(

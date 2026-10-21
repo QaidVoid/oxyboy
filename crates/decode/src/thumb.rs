@@ -300,18 +300,27 @@ fn decode_unconditional_branch(first: u16) -> ThumbInstr {
 ///
 /// The first halfword supplies the high 11 offset bits, the second the
 /// low 11; the pair is one instruction and `next` is consumed here. A
-/// standalone first halfword (next not a second-half) is not a pair,
-/// so this function reports `Undefined` for it.
+/// standalone second halfword decodes to
+/// [`ThumbInstr::LongBranchWithLinkFromLr`], a real-world idiom documented
+/// by GBATEK.
 fn decode_long_branch_with_link(first: u16, next: u16) -> ThumbInstr {
-    if first >> 11 != 0b11110 || next >> 11 != 0b11111 {
-        return ThumbInstr::Undefined { encoding: first };
-    }
-    let imm_hi = thumb_bits(first, 10, 0) as u32;
-    let imm_lo = thumb_bits(next, 10, 0) as u32;
-    ThumbInstr::LongBranchWithLink {
-        // Target = PC + 4 + offset; offset is 23-bit sign extended,
-        // halfword units.
-        offset: sign_extend((imm_hi << 12) | (imm_lo << 1), 23),
+    match (first >> 11, next >> 11) {
+        (0b11110, 0b11111) => {
+            let imm_hi = thumb_bits(first, 10, 0) as u32;
+            let imm_lo = thumb_bits(next, 10, 0) as u32;
+            ThumbInstr::LongBranchWithLink {
+                // Target = PC + 4 + offset; offset is 23-bit sign
+                // extended, halfword units.
+                offset: sign_extend((imm_hi << 12) | (imm_lo << 1), 23),
+            }
+        }
+        // Standalone second half: branch to LR + offset with link
+        // (GBATEK THUMB.19 note: "Using only the 2nd half of BL as 'BL
+        // LR+imm' is possible").
+        (0b11111, _) => ThumbInstr::LongBranchWithLinkFromLr {
+            offset: (sign_extend(thumb_bits(first, 10, 0) as u32, 11) << 1) as i16,
+        },
+        _ => ThumbInstr::Undefined { encoding: first },
     }
 }
 
@@ -486,6 +495,14 @@ pub enum ThumbInstr {
         /// 23-bit sign-extended offset, halfword units.
         offset: i32,
     },
+    /// Format 19 second halfword standing alone: branch to LR + offset
+    /// with link. Not an official encoding, but real games emit it as a
+    /// cheap call (GBATEK THUMB.19 note; for example Mario Golf Advance
+    /// Tour uses F800h as `BL LR+0`).
+    LongBranchWithLinkFromLr {
+        /// 11-bit sign-extended offset, halfword units.
+        offset: i16,
+    },
     /// The ARM7TDMI would not execute this halfword.
     Undefined {
         /// The raw first halfword.
@@ -591,4 +608,26 @@ pub enum ThumbSignedMemOp {
     Ldrh,
     /// `LDSH`, sign-extended halfword load.
     Ldsh,
+}
+
+impl ThumbInstr {
+    /// True when the encoding is architecturally UNPREDICTABLE on the
+    /// ARM7TDMI.
+    ///
+    /// Currently this covers push/pop and load/store multiple with an
+    /// empty register list or with the base register in the list (ARM ARM
+    /// A7.7; GBATEK THUMB.15 documents only the ARM7's de facto "Strange
+    /// Effects on Invalid Rlist's" behavior: an empty list transfers R15
+    /// and adds 40h to the base, and a list containing the base stores or
+    /// skips writeback depending on position).
+    #[must_use]
+    pub fn is_unpredictable(&self) -> bool {
+        match self {
+            ThumbInstr::PushPop { registers, .. } => *registers == 0,
+            ThumbInstr::LoadStoreMultiple { rb, registers, .. } => {
+                *registers == 0 || u16::from(*registers) & (1u16 << rb.bits()) != 0
+            }
+            _ => false,
+        }
+    }
 }
