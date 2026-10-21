@@ -54,3 +54,7 @@ dependencies = [
  "decode",
  "rom",
 ]
+
+[[package]]
+name = "testutil"
+version = "0.1.0"

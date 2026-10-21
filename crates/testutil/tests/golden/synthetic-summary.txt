@@ -1,0 +1,1 @@
+title=GOLDEN code=GOLD len=512
