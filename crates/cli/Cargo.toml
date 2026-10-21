@@ -1,0 +1,13 @@
+[package]
+name = "oxyboy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+analysis = { version = "0.1.0", path = "../analysis" }
+decode = { version = "0.1.0", path = "../decode" }
+emit = { version = "0.1.0", path = "../emit" }
+ir = { version = "0.1.0", path = "../ir" }
+rom = { version = "0.1.0", path = "../rom" }
+runtime = { version = "0.1.0", path = "../runtime" }

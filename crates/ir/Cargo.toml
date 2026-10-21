@@ -1,0 +1,9 @@
+[package]
+name = "ir"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+analysis = { version = "0.1.0", path = "../analysis" }
+decode = { version = "0.1.0", path = "../decode" }

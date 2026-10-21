@@ -1,0 +1,9 @@
+[package]
+name = "runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+decode = { version = "0.1.0", path = "../decode" }
+rom = { version = "0.1.0", path = "../rom" }
