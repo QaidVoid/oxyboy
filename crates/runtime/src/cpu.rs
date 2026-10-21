@@ -1,0 +1,1186 @@
+//! The ARM7TDMI CPU interpreter.
+//!
+//! Implements ARM-mode execution for every instruction class the
+//! decoder produces, with CPU modes, banked registers, CPSR/SPSR
+//! handling, and exception entry. Cycle counts are coarse region-default
+//! approximations (one N-cycle per bus access, region cost from
+//! [`crate::bus`]); real WAITSTATE timing is not modeled yet.
+
+use crate::bus::Bus;
+use decode::{
+    ArmInstr, Condition, DataOp, HalfwordKind, Register, RegisterList, ShiftAmount, ShiftKind,
+    ShifterOperand, decode_arm,
+};
+
+/// A CPU operating mode (ARM ARM A2.2, GBATEK "CPU Modes").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    /// 0b10000: user, unprivileged.
+    User,
+    /// 0b10001: FIQ.
+    Fiq,
+    /// 0b10010: IRQ.
+    Irq,
+    /// 0b10011: supervisor (reset, SWI).
+    Supervisor,
+    /// 0b10111: abort.
+    Abort,
+    /// 0b11011: undefined instruction.
+    Undefined,
+    /// 0b11111: system (user registers, privileged).
+    System,
+}
+
+impl Mode {
+    /// Decodes the CPSR mode field, bits 4..0.
+    #[must_use]
+    pub fn from_bits(bits: u8) -> Option<Self> {
+        Some(match bits {
+            0x10 => Self::User,
+            0x11 => Self::Fiq,
+            0x12 => Self::Irq,
+            0x13 => Self::Supervisor,
+            0x17 => Self::Abort,
+            0x1B => Self::Undefined,
+            0x1F => Self::System,
+            _ => return None,
+        })
+    }
+
+    /// The CPSR mode field value.
+    #[must_use]
+    pub fn bits(self) -> u8 {
+        match self {
+            Self::User => 0x10,
+            Self::Fiq => 0x11,
+            Self::Irq => 0x12,
+            Self::Supervisor => 0x13,
+            Self::Abort => 0x17,
+            Self::Undefined => 0x1B,
+            Self::System => 0x1F,
+        }
+    }
+
+    /// The register-bank slot for this mode.
+    ///
+    /// User and System share one r13/r14 bank; only FIQ banks r8..r12.
+    fn bank(self) -> Bank {
+        match self {
+            Self::User | Self::System => Bank::Usr,
+            Self::Fiq => Bank::Fiq,
+            Self::Irq => Bank::Irq,
+            Self::Supervisor => Bank::Svc,
+            Self::Abort => Bank::Abt,
+            Self::Undefined => Bank::Und,
+        }
+    }
+}
+
+/// Register-bank slot identifiers, one per distinct register set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Bank {
+    Usr,
+    Fiq,
+    Irq,
+    Svc,
+    Abt,
+    Und,
+}
+
+/// One slot per [`Bank`]; the `Usr` SPSR slot is unused (User and System
+/// modes have no SPSR).
+const BANK_COUNT: usize = 6;
+
+fn bank_index(bank: Bank) -> usize {
+    match bank {
+        Bank::Usr => 0,
+        Bank::Fiq => 1,
+        Bank::Irq => 2,
+        Bank::Svc => 3,
+        Bank::Abt => 4,
+        Bank::Und => 5,
+    }
+}
+
+/// Where execution continues after the current instruction.
+enum Flow {
+    /// No control transfer: advance by one instruction.
+    Sequential,
+    /// `self.pc` already holds the next fetch address.
+    Handled,
+}
+
+/// The ARM7TDMI processor state.
+///
+/// The visible register file is `regs`; r8..r12 have a second copy that
+/// only FIQ swaps, and r13/r14 have one bank per mode (User and System
+/// share theirs). Every privileged mode also owns an SPSR.
+pub struct Cpu {
+    regs: [u32; 16],
+    /// The r8..r12 copy for the non-FIQ view (user, system, IRQ, SVC,
+    /// ABT, UND all share it).
+    r8_12_normal: [u32; 5],
+    /// The r8..r12 copy visible only in FIQ mode.
+    r8_12_fiq: [u32; 5],
+    /// r13/r14 per bank slot.
+    sp: [[u32; 2]; BANK_COUNT],
+    /// SPSR per bank slot; slot 0 is unused (no SPSR in User/System).
+    spsr: [u32; BANK_COUNT],
+    cpsr: u32,
+    /// Address of the instruction currently being executed.
+    pc: u32,
+    /// Accumulated cycle count (coarse region-default approximation).
+    cycles: u64,
+    /// The IRQ input line, sampled at the start of every step.
+    irq_line: bool,
+}
+
+impl Cpu {
+    /// Builds a CPU in supervisor mode with interrupts masked, as after
+    /// reset; the walking skeleton boots straight into the cart, so the
+    /// caller picks the entry point (normally `0x08000000`).
+    #[must_use]
+    pub fn new(pc: u32) -> Self {
+        Cpu {
+            regs: [0; 16],
+            r8_12_normal: [0; 5],
+            r8_12_fiq: [0; 5],
+            sp: [[0; 2]; BANK_COUNT],
+            spsr: [0; BANK_COUNT],
+            cpsr: (u32::from(Mode::Supervisor.bits())) | 0x0000_00C0,
+            pc,
+            cycles: 0,
+            irq_line: false,
+        }
+    }
+
+    /// The program counter: address of the instruction being executed.
+    #[must_use]
+    pub fn pc(&self) -> u32 {
+        self.pc
+    }
+
+    /// Overrides the program counter; used to boot the CPU at an entry
+    /// point and by tests that park execution at a synthetic handler.
+    pub fn set_pc(&mut self, pc: u32) {
+        self.pc = pc;
+    }
+
+    /// Total coarse cycle count accumulated so far.
+    #[must_use]
+    pub fn cycles(&self) -> u64 {
+        self.cycles
+    }
+
+    /// Raw register value; R15 reads as the instruction address plus 8
+    /// (ARM pipeline behavior, ARM ARM A2.3).
+    #[must_use]
+    pub fn reg(&self, r: Register) -> u32 {
+        match r {
+            Register::Pc => self.pc.wrapping_add(8),
+            _ => self.regs[r.bits() as usize],
+        }
+    }
+
+    /// Writes a general register in the current bank.
+    pub fn set_reg(&mut self, r: Register, value: u32) {
+        if r != Register::Pc {
+            self.regs[r.bits() as usize] = value;
+        }
+    }
+
+    /// Reads a general register from the user bank (the force-user T
+    /// form and the block-transfer S bit), ARM ARM A4.1.9.
+    fn reg_user(&self, r: Register) -> u32 {
+        match r {
+            Register::Pc => self.pc.wrapping_add(8),
+            Register::Sp | Register::Lr => self.sp[bank_index(Bank::Usr)][(r.bits() - 13) as usize],
+            _ if self.mode() == Mode::Fiq => self.r8_12_normal[r.bits() as usize - 8],
+            _ => self.regs[r.bits() as usize],
+        }
+    }
+
+    /// Writes a general register in the user bank.
+    fn set_reg_user(&mut self, r: Register, value: u32) {
+        match r {
+            Register::Pc => {}
+            Register::Sp | Register::Lr => {
+                self.sp[bank_index(Bank::Usr)][(r.bits() - 13) as usize] = value;
+            }
+            _ if self.mode() == Mode::Fiq => {
+                self.r8_12_normal[r.bits() as usize - 8] = value;
+            }
+            _ => self.regs[r.bits() as usize] = value,
+        }
+    }
+
+    /// The current operating mode.
+    #[must_use]
+    pub fn mode(&self) -> Mode {
+        Mode::from_bits((self.cpsr & 0x1F) as u8).unwrap_or(Mode::Supervisor)
+    }
+
+    /// The raw CPSR value.
+    #[must_use]
+    pub fn cpsr(&self) -> u32 {
+        self.cpsr
+    }
+
+    /// Overrides the CPSR wholesale (test hook).
+    pub fn set_cpsr_raw(&mut self, value: u32) {
+        self.cpsr = value;
+    }
+
+    /// Reads a general register for tests.
+    #[must_use]
+    pub fn reg_for_test(&self, index: u8) -> u32 {
+        self.regs[(index & 0xF) as usize]
+    }
+
+    /// Writes a general register for tests.
+    pub fn set_reg_for_test(&mut self, index: u8, value: u32) {
+        self.regs[(index & 0xF) as usize] = value;
+    }
+
+    /// The raw SPSR of the current mode; `None` in User/System.
+    #[must_use]
+    pub fn spsr_for_test(&self) -> Option<u32> {
+        let i = bank_index(self.mode().bank());
+        (i != bank_index(Bank::Usr)).then_some(self.spsr[i])
+    }
+
+    /// Raises the IRQ input line.
+    pub fn set_irq_line(&mut self, high: bool) {
+        self.irq_line = high;
+    }
+
+    /// Switches operating mode, swapping the banked registers.
+    ///
+    /// r8..r12 swap between the normal view and the FIQ view only when
+    /// crossing the FIQ boundary; r13/r14 swap per bank slot.
+    fn switch_mode(&mut self, new: Mode) {
+        let old_bank = self.mode().bank();
+        let new_bank = new.bank();
+        if old_bank == new_bank {
+            self.cpsr = (self.cpsr & !0x1F) | u32::from(new.bits());
+            return;
+        }
+        if old_bank == Bank::Fiq {
+            self.r8_12_fiq.copy_from_slice(&self.regs[8..13]);
+            self.regs[8..13].copy_from_slice(&self.r8_12_normal);
+        } else if new_bank == Bank::Fiq {
+            self.r8_12_normal.copy_from_slice(&self.regs[8..13]);
+            self.regs[8..13].copy_from_slice(&self.r8_12_fiq);
+        }
+        self.sp[bank_index(old_bank)].copy_from_slice(&self.regs[13..15]);
+        self.regs[13..15].copy_from_slice(&self.sp[bank_index(new_bank)]);
+        self.cpsr = (self.cpsr & !0x1F) | u32::from(new.bits());
+    }
+
+    /// The SPSR of the current mode; User/System have none (reads 0,
+    /// writes ignored: ARM7TDMI behavior, documented as UNPREDICTABLE in
+    /// the ARM ARM A2.6 note on SPSR access).
+    fn spsr_of_current(&self) -> u32 {
+        let i = bank_index(self.mode().bank());
+        if i == bank_index(Bank::Usr) {
+            0
+        } else {
+            self.spsr[i]
+        }
+    }
+
+    /// Architectural exception entry (ARM ARM A2.6).
+    ///
+    /// Saves the CPSR into the new mode's SPSR, banks the registers,
+    /// forces ARM state, masks IRQ (and FIQ when requested), and jumps
+    /// to the vector.
+    fn exception(&mut self, new_mode: Mode, lr: u32, vector: u32, mask_fiq: bool) {
+        self.spsr[bank_index(new_mode.bank())] = self.cpsr;
+        self.switch_mode(new_mode);
+        self.cpsr &= !0x20; // T = 0: vectors entered in ARM state
+        self.cpsr |= 0x80; // I = 1
+        if mask_fiq {
+            self.cpsr |= 0x40; // F = 1
+        }
+        self.regs[Register::Lr.bits() as usize] = lr;
+        self.pc = vector;
+    }
+
+    fn flag_c(&self) -> bool {
+        self.cpsr & 0x2000_0000 != 0
+    }
+
+    /// Updates the NZCV flags from parts; `None` leaves that flag
+    /// unchanged (logical operations do not touch C or V).
+    fn set_flags(&mut self, n: bool, z: bool, c: Option<bool>, v: Option<bool>) {
+        let mut cpsr = self.cpsr & !(0xF000_0000);
+        if n {
+            cpsr |= 0x8000_0000;
+        }
+        if z {
+            cpsr |= 0x4000_0000;
+        }
+        if c.unwrap_or(self.flag_c()) {
+            cpsr |= 0x2000_0000;
+        }
+        if v.unwrap_or(self.cpsr & 0x1000_0000 != 0) {
+            cpsr |= 0x1000_0000;
+        }
+        self.cpsr = cpsr;
+    }
+
+    fn set_flag_bits(&mut self, mask: u32, value: u32) {
+        self.cpsr = (self.cpsr & !mask) | (value & mask);
+    }
+}
+
+/// Evaluates an instruction condition against CPSR flag bits.
+fn condition_holds(cond: Condition, cpsr: u32) -> bool {
+    let n = cpsr & 0x8000_0000 != 0;
+    let z = cpsr & 0x4000_0000 != 0;
+    let c = cpsr & 0x2000_0000 != 0;
+    let v = cpsr & 0x1000_0000 != 0;
+    match cond {
+        Condition::Eq => z,
+        Condition::Ne => !z,
+        Condition::Cs => c,
+        Condition::Cc => !c,
+        Condition::Mi => n,
+        Condition::Pl => !n,
+        Condition::Vs => v,
+        Condition::Vc => !v,
+        Condition::Hi => c && !z,
+        Condition::Ls => !c || z,
+        Condition::Ge => n == v,
+        Condition::Lt => n != v,
+        Condition::Gt => !z && n == v,
+        Condition::Le => z || n != v,
+        Condition::Al => true,
+    }
+}
+
+/// A shifted operand: its value plus the carry the shift produced.
+struct ShiftOut {
+    value: u32,
+    carry: bool,
+}
+
+/// Applies a barrel shifter operation with ARM7 carry semantics.
+///
+/// `amount` is the resolved shift amount; the immediate 0 forms that
+/// mean "32" (LSR/ASR) or RRX are normalized by the caller. Register
+/// amounts of exactly 32 and above follow ARM ARM A2.4 (shift results
+/// and carry for amounts >= 32).
+fn apply_shift(value: u32, kind: ShiftKind, amount: u32, carry_in: bool) -> ShiftOut {
+    match kind {
+        ShiftKind::Lsl => match amount {
+            0 => ShiftOut {
+                value,
+                carry: carry_in,
+            },
+            1..=31 => ShiftOut {
+                value: value << amount,
+                carry: value & (1 << (32 - amount)) != 0,
+            },
+            32 => ShiftOut {
+                value: 0,
+                carry: value & 1 != 0,
+            },
+            _ => ShiftOut {
+                value: 0,
+                carry: false,
+            },
+        },
+        ShiftKind::Lsr => match amount {
+            0 => ShiftOut {
+                value,
+                carry: carry_in,
+            },
+            1..=31 => ShiftOut {
+                value: value >> amount,
+                carry: value & (1 << (amount - 1)) != 0,
+            },
+            _ => ShiftOut {
+                value: 0,
+                carry: value & 0x8000_0000 != 0,
+            },
+        },
+        ShiftKind::Asr => {
+            if amount == 0 {
+                ShiftOut {
+                    value,
+                    carry: carry_in,
+                }
+            } else if amount >= 32 {
+                let fill = u32::from(value & 0x8000_0000 != 0);
+                ShiftOut {
+                    value: fill.wrapping_neg(),
+                    carry: fill != 0,
+                }
+            } else {
+                ShiftOut {
+                    value: ((value as i32) >> amount) as u32,
+                    carry: value & (1 << (amount - 1)) != 0,
+                }
+            }
+        }
+        ShiftKind::Ror => {
+            if amount == 0 {
+                ShiftOut {
+                    value,
+                    carry: carry_in,
+                }
+            } else {
+                let n = amount % 32;
+                if n == 0 {
+                    ShiftOut {
+                        value,
+                        carry: value & 0x8000_0000 != 0,
+                    }
+                } else {
+                    ShiftOut {
+                        value: value.rotate_right(n),
+                        carry: value & (1 << (n - 1)) != 0,
+                    }
+                }
+            }
+        }
+        // RRX: rotate right one place through the carry.
+        ShiftKind::Rrx => ShiftOut {
+            value: (value >> 1) | (u32::from(carry_in) << 31),
+            carry: value & 1 != 0,
+        },
+    }
+}
+
+/// 64-bit add with carry-in, returning result, carry-out, and signed
+/// overflow.
+fn add_with_carry(a: u32, b: u32, carry_in: bool) -> (u32, bool, bool) {
+    let r = u64::from(a) + u64::from(b) + u64::from(carry_in);
+    let res = r as u32;
+    let c = r >> 32 == 1;
+    let v = ((!(a ^ b)) & (a ^ res)) & 0x8000_0000 != 0;
+    (res, c, v)
+}
+
+/// 64-bit subtract with borrow-in (`borrow = !carry`), returning
+/// result, carry-out (true when no borrow), and signed overflow.
+fn sub_with_borrow(a: u32, b: u32, borrow: bool) -> (u32, bool, bool) {
+    let r = (u64::from(a))
+        .wrapping_sub(u64::from(b))
+        .wrapping_sub(u64::from(borrow));
+    let res = r as u32;
+    let c = r >> 63 == 0;
+    let v = ((a ^ b) & (a ^ res)) & 0x8000_0000 != 0;
+    (res, c, v)
+}
+
+/// Region-default access cost in cycles (GBATEK bus-width table,
+/// default waitstates): "coarse" because sequential/overlapped timing
+/// and WAITCNT are not modeled yet.
+fn access_cycles(bus: &Bus, addr: u32, width: u8) -> u32 {
+    match (bus.region_of(addr), width) {
+        (crate::bus::Region::Ewram, _) => 3,
+        (crate::bus::Region::Rom, 4) => 8,
+        (crate::bus::Region::Rom, 2) => 5,
+        (crate::bus::Region::Rom, _) => 5,
+        (crate::bus::Region::Sram, _) => 5,
+        (crate::bus::Region::Palette | crate::bus::Region::Vram, 4) => 2,
+        _ => 1,
+    }
+}
+
+impl Cpu {
+    /// Executes one ARM instruction at `self.pc`, accumulating coarse
+    /// cycles. Undefined encodings take the undefined-instruction
+    /// exception; nothing panics.
+    pub fn step(&mut self, bus: &mut Bus) -> u32 {
+        let before = self.cycles;
+        self.cycles += u64::from(access_cycles(bus, self.pc, 4));
+        if self.irq_line && self.cpsr & 0x80 == 0 {
+            // IRQ entry: the not-yet-executed instruction at `self.pc`
+            // is not executed; its address plus 4 is saved (ARM ARM
+            // A2.6) so `subs pc, lr, #4` re-executes it.
+            let lr = self.pc.wrapping_add(4);
+            self.exception(Mode::Irq, lr, 0x18, false);
+            return (self.cycles - before) as u32;
+        }
+        let word = bus.read_u32(self.pc);
+        let start_pc = self.pc;
+        let cond = Condition::from_bits((word >> 28) as u8);
+        let instr = decode_arm(word);
+        let flow = match cond {
+            Some(c) if condition_holds(c, self.cpsr) => self.execute(instr, bus),
+            Some(_) => {
+                // Condition failed: one internal cycle, no effect.
+                self.cycles += 1;
+                Flow::Sequential
+            }
+            None => {
+                // Reserved condition 0b1111: treated as an undefined
+                // instruction (ARM7TDMI marks it UNPREDICTABLE).
+                self.undefined_exception();
+                Flow::Handled
+            }
+        };
+        if matches!(flow, Flow::Sequential) {
+            self.pc = start_pc.wrapping_add(4);
+        }
+        (self.cycles - before) as u32
+    }
+
+    fn undefined_exception(&mut self) {
+        let lr = self.pc.wrapping_add(4);
+        self.exception(Mode::Undefined, lr, 0x04, false);
+    }
+
+    fn execute(&mut self, instr: ArmInstr, bus: &mut Bus) -> Flow {
+        match instr {
+            ArmInstr::DataProcessing {
+                opcode,
+                set_flags,
+                rd,
+                rn,
+                operand2,
+            } => self.exec_data_processing(opcode, set_flags, rd, rn, operand2),
+            ArmInstr::Multiply {
+                accumulate,
+                set_flags,
+                rd,
+                rn,
+                rs,
+                rm,
+            } => {
+                let mut res = self.reg(rm).wrapping_mul(self.reg(rs));
+                if accumulate {
+                    res = res.wrapping_add(self.reg(rn));
+                }
+                self.set_reg(rd, res);
+                if set_flags {
+                    // ARMv4 leaves C and V "destroyed" (GBATEK MUL/MLA
+                    // flags note); modeled as unchanged.
+                    self.set_flags(res & 0x8000_0000 != 0, res == 0, None, None);
+                }
+                self.cycles += 3;
+                Flow::Sequential
+            }
+            ArmInstr::MultiplyLong {
+                unsigned,
+                accumulate,
+                set_flags,
+                rd_hi,
+                rd_lo,
+                rn,
+                rm,
+            } => {
+                let m_val = self.reg(rm);
+                let n_val = self.reg(rn);
+                let m = if unsigned {
+                    u64::from(m_val)
+                } else {
+                    (m_val as i32) as u64
+                };
+                let n = if unsigned {
+                    u64::from(n_val)
+                } else {
+                    (n_val as i32) as u64
+                };
+                let mut prod = m.wrapping_mul(n);
+                if accumulate {
+                    let hi = u64::from(self.reg(rd_hi));
+                    let lo = u64::from(self.reg(rd_lo));
+                    prod = prod.wrapping_add((hi << 32) | lo);
+                }
+                self.set_reg(rd_hi, (prod >> 32) as u32);
+                self.set_reg(rd_lo, prod as u32);
+                if set_flags {
+                    // N from bit 63, Z from the 64-bit result; C and V
+                    // destroyed on ARMv4 (GBATEK MULL/MLAL flags note).
+                    self.set_flags(prod >> 63 == 1, prod == 0, None, None);
+                }
+                self.cycles += 5;
+                Flow::Sequential
+            }
+            ArmInstr::Swap { byte, rd, rn, rm } => {
+                let addr = self.reg(rn);
+                self.cycles += u64::from(access_cycles(bus, addr, if byte { 1 } else { 4 }));
+                if byte {
+                    let tmp = bus.read_u8(addr);
+                    bus.write_u8(addr, self.reg(rm) as u8);
+                    self.set_reg(rd, u32::from(tmp));
+                } else {
+                    let raw = bus.read_u32(addr);
+                    let tmp = raw.rotate_right((addr & 3) * 8);
+                    bus.write_u32(addr, self.reg(rm));
+                    self.set_reg(rd, tmp);
+                }
+                self.cycles += 1;
+                Flow::Sequential
+            }
+            ArmInstr::PsrRead { spsr, rd } => {
+                let value = if spsr {
+                    self.spsr_of_current()
+                } else {
+                    self.cpsr
+                };
+                self.set_reg(rd, value);
+                Flow::Sequential
+            }
+            ArmInstr::PsrWrite {
+                spsr,
+                fields,
+                source,
+            } => {
+                let value = match source {
+                    decode::PsrSource::Register(r) => self.reg(r),
+                    decode::PsrSource::Immediate { rotate, value } => {
+                        u32::from(value).rotate_right(u32::from(rotate) * 2)
+                    }
+                };
+                self.msr(spsr, fields, value);
+                Flow::Sequential
+            }
+            ArmInstr::LoadStore {
+                load,
+                byte,
+                writeback,
+                up,
+                pre_index,
+                rd,
+                rn,
+                offset,
+            } => self.exec_load_store(load, byte, writeback, up, pre_index, rd, rn, offset, bus),
+            ArmInstr::LoadStoreHalfwordSigned {
+                kind,
+                writeback,
+                up,
+                pre_index,
+                rd,
+                rn,
+                offset,
+            } => self.exec_halfword_transfer(kind, writeback, up, pre_index, rd, rn, offset, bus),
+            ArmInstr::BlockTransfer {
+                load,
+                psr_and_force_user,
+                writeback,
+                up,
+                pre_index,
+                rn,
+                registers,
+            } => self.exec_block_transfer(
+                load,
+                psr_and_force_user,
+                writeback,
+                up,
+                pre_index,
+                rn,
+                registers,
+                bus,
+            ),
+            ArmInstr::Branch { link, offset } => {
+                if link {
+                    // Return convention: the branch address plus 4; the
+                    // callee returns with `sub pc, lr, #4`.
+                    self.regs[Register::Lr.bits() as usize] = self.pc.wrapping_add(4);
+                }
+                self.pc = self.pc.wrapping_add(8).wrapping_add(offset as u32);
+                Flow::Handled
+            }
+            ArmInstr::BranchExchange { rn } => {
+                let target = self.reg(rn);
+                if target & 1 == 1 {
+                    self.set_flag_bits(0x20, 0x20); // T = 1, THUMB
+                    self.pc = target & !1;
+                } else {
+                    self.set_flag_bits(0x20, 0);
+                    self.pc = target & !3;
+                }
+                Flow::Handled
+            }
+            ArmInstr::SoftwareInterrupt { .. } => {
+                let lr = self.pc.wrapping_add(4);
+                self.exception(Mode::Supervisor, lr, 0x08, false);
+                Flow::Handled
+            }
+            ArmInstr::Undefined { .. } => {
+                self.undefined_exception();
+                Flow::Handled
+            }
+        }
+    }
+
+    /// Data processing with full shifter and ALU flag semantics.
+    fn exec_data_processing(
+        &mut self,
+        opcode: DataOp,
+        set_flags: bool,
+        rd: Register,
+        rn: Register,
+        operand2: ShifterOperand,
+    ) -> Flow {
+        let a = self.reg(rn);
+        let (b, shift_carry) = self.eval_operand2(operand2);
+        let comparison = matches!(
+            opcode,
+            DataOp::Tst | DataOp::Teq | DataOp::Cmp | DataOp::Cmn
+        );
+        // (result, carry, overflow, is_logical)
+        let (res, c_out, v_out, logical) = match opcode {
+            DataOp::And | DataOp::Tst => (a & b, shift_carry, false, true),
+            DataOp::Eor | DataOp::Teq => (a ^ b, shift_carry, false, true),
+            DataOp::Sub | DataOp::Cmp => {
+                let (res, c, v) = sub_with_borrow(a, b, false);
+                (res, c, v, false)
+            }
+            DataOp::Rsb => {
+                let (res, c, v) = sub_with_borrow(b, a, false);
+                (res, c, v, false)
+            }
+            DataOp::Add | DataOp::Cmn => {
+                let (res, c, v) = add_with_carry(a, b, false);
+                (res, c, v, false)
+            }
+            DataOp::Adc => {
+                let (res, c, v) = add_with_carry(a, b, self.flag_c());
+                (res, c, v, false)
+            }
+            DataOp::Sbc => {
+                let (res, c, v) = sub_with_borrow(a, b, !self.flag_c());
+                (res, c, v, false)
+            }
+            DataOp::Rsc => {
+                let (res, c, v) = sub_with_borrow(b, a, !self.flag_c());
+                (res, c, v, false)
+            }
+            DataOp::Orr => (a | b, shift_carry, false, true),
+            DataOp::Mov => (b, shift_carry, false, true),
+            DataOp::Bic => (a & !b, shift_carry, false, true),
+            DataOp::Mvn => (!b, shift_carry, false, true),
+        };
+        if !comparison {
+            self.set_reg(rd, res);
+        }
+        if set_flags || comparison {
+            let (c, v) = if logical {
+                (Some(c_out), None)
+            } else {
+                (Some(c_out), Some(v_out))
+            };
+            self.set_flags(res & 0x8000_0000 != 0, res == 0, c, v);
+            if !comparison && rd == Register::Pc && self.mode().bank() != Bank::Usr {
+                // `MOVS PC, LR`: restore CPSR from SPSR, which may switch
+                // mode and return to THUMB state (ARM ARM A2.6). User and
+                // System have no SPSR, so only the flags update applies.
+                let spsr = self.spsr_of_current();
+                self.restore_cpsr(spsr);
+            }
+        }
+        if !comparison && rd == Register::Pc {
+            // Data-processing writes to PC do not interwork on ARMv4T:
+            // bits 1:0 are ignored (ARM ARM A2.3).
+            self.pc = res & !3;
+            Flow::Handled
+        } else {
+            Flow::Sequential
+        }
+    }
+
+    /// Second-operand evaluation: value plus shifter carry-out.
+    fn eval_operand2(&self, operand: ShifterOperand) -> (u32, bool) {
+        match operand {
+            ShifterOperand::Immediate { rotate, value } => {
+                let v = u32::from(value).rotate_right(u32::from(rotate) * 2);
+                let carry = if rotate == 0 {
+                    self.flag_c()
+                } else {
+                    v & 0x8000_0000 != 0
+                };
+                (v, carry)
+            }
+            ShifterOperand::Register { rm, shift } => {
+                let raw = self.reg(rm);
+                match shift.amount {
+                    ShiftAmount::Immediate(n) => {
+                        let amount = match shift.kind {
+                            // LSR #0 / ASR #0 encode as 32; RRX is its
+                            // own kind.
+                            ShiftKind::Lsr | ShiftKind::Asr if n == 0 => 32,
+                            _ => u32::from(n),
+                        };
+                        let out = apply_shift(raw, shift.kind, amount, self.flag_c());
+                        (out.value, out.carry)
+                    }
+                    ShiftAmount::Register(rs) => {
+                        let amount = u32::from((self.reg(rs) & 0xFF) as u8);
+                        let out = apply_shift(raw, shift.kind, amount, self.flag_c());
+                        (out.value, out.carry)
+                    }
+                }
+            }
+        }
+    }
+
+    /// `MSR CPSR/SPSR, <op>` with the field mask (bits 19..16: c, x, s,
+    /// f). ARM7TDMI has no S or E bits, so those fields are ignored; in
+    /// User mode only the flags field is writable (ARM ARM A2.6/A4.1.8).
+    fn msr(&mut self, spsr: bool, fields: u8, value: u32) {
+        let user = matches!(self.mode(), Mode::User | Mode::System);
+        if spsr {
+            if !user {
+                let i = bank_index(self.mode().bank());
+                let old = self.spsr[i];
+                self.spsr[i] = self.apply_psr_fields(old, fields, value);
+            }
+            return;
+        }
+        if fields & 0b1000 != 0 {
+            // Flags field: NZCV, writable from any mode.
+            self.set_flag_bits(0xF000_0000, value);
+        }
+        if fields & 0b0001 != 0 && !user {
+            // Control field: I, F, T and the mode bits. A mode write
+            // banks the registers for the following instructions. The
+            // ARMv4T architecture makes T-bit writes via MSR
+            // UNPREDICTABLE (ARM ARM); they are honored here, matching
+            // common de-facto behavior - THUMB entry should use BX.
+            if let Some(m) = Mode::from_bits((value & 0x1F) as u8) {
+                self.switch_mode(m);
+            }
+            self.set_flag_bits(0xE0, value);
+        }
+        // s (0b0100) and x (0b0010): no SPSR S/E bits on ARM7TDMI.
+    }
+
+    /// Masks `value` through `fields` onto `old` (for SPSR writes,
+    /// which have no user-mode restriction on fields).
+    fn apply_psr_fields(&self, old: u32, fields: u8, value: u32) -> u32 {
+        let mut out = old;
+        if fields & 0b1000 != 0 {
+            out = (out & !0xF000_0000) | (value & 0xF000_0000);
+        }
+        if fields & 0b0100 != 0 {
+            out = (out & !0x00FF_FF00) | (value & 0x00FF_FF00);
+        }
+        if fields & 0b0010 != 0 {
+            out = (out & !0x0000_00F0) | (value & 0x0000_00F0);
+        }
+        if fields & 0b0001 != 0 {
+            out = (out & !0x0000_00FF) | (value & 0x0000_00FF);
+        }
+        out
+    }
+
+    /// Full CPSR restore from an SPSR (`MOVS PC` / `LDM .. {pc}^`).
+    /// A corrupt SPSR mode field keeps the current mode (UNPREDICTABLE
+    /// on hardware) and updates the remaining bits.
+    fn restore_cpsr(&mut self, value: u32) {
+        if let Some(m) = Mode::from_bits((value & 0x1F) as u8) {
+            self.switch_mode(m);
+            self.cpsr = value;
+        } else {
+            self.set_flag_bits(0xF000_00E0, value);
+        }
+    }
+
+    /// Single word/byte load-store with pre/post indexing, writeback,
+    /// and the ARM7 quirks: STR of R15 stores the instruction address
+    /// plus 12, unaligned word loads rotate the aligned word, and LDR
+    /// of R15 forces word alignment without interworking.
+    #[allow(clippy::too_many_arguments)]
+    fn exec_load_store(
+        &mut self,
+        load: bool,
+        byte: bool,
+        writeback: bool,
+        up: bool,
+        pre_index: bool,
+        rd: Register,
+        rn: Register,
+        offset: decode::TransferOffset,
+        bus: &mut Bus,
+    ) -> Flow {
+        let base = self.reg(rn);
+        let off = match offset {
+            decode::TransferOffset::Immediate(i) => i,
+            decode::TransferOffset::Register { rm, shift } => {
+                let raw = self.reg(rm);
+                let amount = match shift.amount {
+                    ShiftAmount::Immediate(n) => {
+                        if matches!(shift.kind, ShiftKind::Lsr | ShiftKind::Asr) && n == 0 {
+                            32
+                        } else {
+                            u32::from(n)
+                        }
+                    }
+                    // Register-specified shift amounts are not encodable
+                    // in ARMv4 transfers; treat the register as the
+                    // amount defensively.
+                    ShiftAmount::Register(r) => self.reg(r) & 0xFF,
+                };
+                apply_shift(raw, shift.kind, amount, self.flag_c()).value
+            }
+        };
+        let addr = if pre_index {
+            if up {
+                base.wrapping_add(off)
+            } else {
+                base.wrapping_sub(off)
+            }
+        } else {
+            base
+        };
+        self.cycles += u64::from(access_cycles(bus, addr, if byte { 1 } else { 4 }));
+        let mut flow = Flow::Sequential;
+        if load {
+            let value = if byte {
+                u32::from(bus.read_u8(addr))
+            } else {
+                bus.read_u32(addr & !3).rotate_right((addr & 3) * 8)
+            };
+            if rd == Register::Pc {
+                self.pc = value & !3;
+                flow = Flow::Handled;
+            } else {
+                self.regs[rd.bits() as usize] = value;
+            }
+        } else {
+            let value = if rd == Register::Pc {
+                self.pc.wrapping_add(12)
+            } else {
+                self.regs[rd.bits() as usize]
+            };
+            if byte {
+                bus.write_u8(addr, value as u8);
+            } else {
+                bus.write_u32(addr, value);
+            }
+        }
+        // Post-indexed forms always write back (the W bit is the T bit
+        // there); pre-indexed write back only with W. A load into the
+        // base register wins over writeback (ARM ARM A4.1.6).
+        let final_base = if pre_index {
+            addr
+        } else if up {
+            base.wrapping_add(off)
+        } else {
+            base.wrapping_sub(off)
+        };
+        if (writeback || !pre_index) && !(load && rn == rd) && rn != Register::Pc {
+            self.regs[rn.bits() as usize] = final_base;
+        }
+        flow
+    }
+
+    /// Halfword and signed-byte transfers (STRH/LDRH/LDRSB/LDRSH).
+    #[allow(clippy::too_many_arguments)]
+    fn exec_halfword_transfer(
+        &mut self,
+        kind: HalfwordKind,
+        writeback: bool,
+        up: bool,
+        pre_index: bool,
+        rd: Register,
+        rn: Register,
+        offset: decode::HalfwordOffset,
+        bus: &mut Bus,
+    ) -> Flow {
+        let base = self.reg(rn);
+        let off = match offset {
+            decode::HalfwordOffset::Immediate(i) => u32::from(i),
+            decode::HalfwordOffset::Register(r) => self.reg(r),
+        };
+        let addr = if pre_index {
+            if up {
+                base.wrapping_add(off)
+            } else {
+                base.wrapping_sub(off)
+            }
+        } else {
+            base
+        };
+        self.cycles += u64::from(access_cycles(bus, addr, 2));
+        let mut flow = Flow::Sequential;
+        match kind {
+            HalfwordKind::Strh => {
+                let value = if rd == Register::Pc {
+                    self.pc.wrapping_add(12)
+                } else {
+                    self.regs[rd.bits() as usize]
+                };
+                bus.write_u16(addr, value as u16);
+            }
+            HalfwordKind::Ldrh => {
+                // ARM7 quirk (GBATEK "Mis-aligned LDRH,LDRSH"): an odd
+                // address reads the aligned halfword rotated right by
+                // 8, scattering the bytes into bits 0..7 and 24..31.
+                let value = if addr & 1 == 1 {
+                    u32::from(bus.read_u16(addr & !1)).rotate_right(8)
+                } else {
+                    u32::from(bus.read_u16(addr))
+                };
+                if rd == Register::Pc {
+                    self.pc = value & !3;
+                    flow = Flow::Handled;
+                } else {
+                    self.regs[rd.bits() as usize] = value;
+                }
+            }
+            HalfwordKind::Ldrsb => {
+                let value = bus.read_u8(addr) as i8 as i32 as u32;
+                if rd == Register::Pc {
+                    self.pc = value & !3;
+                    flow = Flow::Handled;
+                } else {
+                    self.regs[rd.bits() as usize] = value;
+                }
+            }
+            HalfwordKind::Ldrsh => {
+                // Odd addresses sign-expand the single addressed byte
+                // instead (ARM7 quirk, same GBATEK note).
+                let value = if addr & 1 == 1 {
+                    bus.read_u8(addr) as i8 as i32 as u32
+                } else {
+                    bus.read_u16(addr) as i16 as i32 as u32
+                };
+                if rd == Register::Pc {
+                    self.pc = value & !3;
+                    flow = Flow::Handled;
+                } else {
+                    self.regs[rd.bits() as usize] = value;
+                }
+            }
+        }
+        let final_base = if pre_index {
+            addr
+        } else if up {
+            base.wrapping_add(off)
+        } else {
+            base.wrapping_sub(off)
+        };
+        if (writeback || !pre_index)
+            && !(matches!(
+                kind,
+                HalfwordKind::Ldrh | HalfwordKind::Ldrsb | HalfwordKind::Ldrsh
+            ) && rn == rd)
+            && rn != Register::Pc
+        {
+            self.regs[rn.bits() as usize] = final_base;
+        }
+        flow
+    }
+
+    /// Block transfer (LDM/STM) with the S-bit user-bank force and
+    /// exception-return forms, plus the ARM7 de-facto register-list
+    /// quirks (GBATEK "Strange Effects on Invalid Rlist's"): an empty
+    /// list transfers only R15 and moves the base by 0x40; with the
+    /// base inside the list, STM stores the old base only when the base
+    /// is the first list entry and the new base otherwise, while LDM
+    /// performs no writeback at all (ARMv4).
+    #[allow(clippy::too_many_arguments)]
+    fn exec_block_transfer(
+        &mut self,
+        load: bool,
+        psr_and_force_user: bool,
+        writeback: bool,
+        up: bool,
+        pre_index: bool,
+        rn: Register,
+        registers: RegisterList,
+        bus: &mut Bus,
+    ) -> Flow {
+        let base = self.reg(rn);
+        let empty = registers.is_empty();
+        let total = if empty { 0x40 } else { registers.len() * 4 };
+        let first = if up {
+            if pre_index {
+                base.wrapping_add(4)
+            } else {
+                base
+            }
+        } else if pre_index {
+            // DB: transfer at base-total..base-4.
+            base.wrapping_sub(total)
+        } else {
+            // DA: transfer at base..base-total+4.
+            base.wrapping_sub(total).wrapping_add(4)
+        };
+        let pc_in_list = empty || registers.contains(Register::Pc);
+        let exception_return =
+            load && psr_and_force_user && pc_in_list && self.mode().bank() != Bank::Usr;
+        // Lowest-numbered register of the list: the first entry stored.
+        let first_entry = (0u8..16)
+            .map(Register::from_bits)
+            .find(|r| !empty && registers.contains(*r));
+        let mut addr = first;
+        let mut loaded_pc = None;
+        for index in 0u8..16 {
+            let r = Register::from_bits(index);
+            let transfer = if empty {
+                r == Register::Pc
+            } else {
+                registers.contains(r)
+            };
+            if !transfer {
+                continue;
+            }
+            self.cycles += u64::from(access_cycles(bus, addr, 4));
+            if load {
+                let value = bus.read_u32(addr);
+                if r == Register::Pc {
+                    loaded_pc = Some(value & !3);
+                } else if psr_and_force_user && !pc_in_list {
+                    self.set_reg_user(r, value);
+                } else {
+                    self.set_reg(r, value);
+                }
+            } else {
+                // STM of R15 stores the instruction address plus 12 on
+                // ARM7, like STR. With the base in the list, the base
+                // slot receives the old base only when it is the first
+                // list entry, otherwise the post-writeback value.
+                let value = if r == Register::Pc {
+                    self.pc.wrapping_add(12)
+                } else if r == rn && Some(r) != first_entry {
+                    if up {
+                        base.wrapping_add(total)
+                    } else {
+                        base.wrapping_sub(total)
+                    }
+                } else if psr_and_force_user {
+                    self.reg_user(r)
+                } else {
+                    self.reg(r)
+                };
+                bus.write_u32(addr, value);
+            }
+            addr = addr.wrapping_add(4);
+        }
+        let final_base = if up {
+            base.wrapping_add(total)
+        } else {
+            base.wrapping_sub(total)
+        };
+        let base_in_list = !empty && registers.contains(rn);
+        let do_writeback = if empty {
+            true // empty list always adjusts the base by 0x40
+        } else if load && base_in_list {
+            false // ARMv4: no writeback when the base is loaded
+        } else {
+            writeback && rn != Register::Pc
+        };
+        if do_writeback {
+            self.regs[rn.bits() as usize] = final_base;
+        }
+        if let Some(target) = loaded_pc {
+            if exception_return {
+                // Restore CPSR from the current mode's SPSR; this may
+                // switch mode and return to THUMB state.
+                let spsr = self.spsr_of_current();
+                self.restore_cpsr(spsr);
+            }
+            self.pc = target;
+            return Flow::Handled;
+        }
+        Flow::Sequential
+    }
+}
