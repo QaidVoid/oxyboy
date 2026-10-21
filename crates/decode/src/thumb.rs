@@ -614,16 +614,22 @@ impl ThumbInstr {
     /// True when the encoding is architecturally UNPREDICTABLE on the
     /// ARM7TDMI.
     ///
-    /// Currently this covers push/pop and load/store multiple with an
-    /// empty register list or with the base register in the list (ARM ARM
-    /// A7.7; GBATEK THUMB.15 documents only the ARM7's de facto "Strange
-    /// Effects on Invalid Rlist's" behavior: an empty list transfers R15
-    /// and adds 40h to the base, and a list containing the base stores or
-    /// skips writeback depending on position).
+    /// Currently this covers PUSH/POP with an empty register list and no
+    /// LR/PC bit (`push {lr}` and `pop {pc}` with an otherwise empty
+    /// list are defined), and load/store multiple with an empty list or
+    /// with the base register in the list (ARM ARM A7.7; GBATEK THUMB.15
+    /// documents only the ARM7's de facto "Strange Effects on Invalid
+    /// Rlist's" behavior: an empty list transfers R15 and adds 40h to
+    /// the base, and a list containing the base stores or skips
+    /// writeback depending on position).
     #[must_use]
     pub fn is_unpredictable(&self) -> bool {
         match self {
-            ThumbInstr::PushPop { registers, .. } => *registers == 0,
+            ThumbInstr::PushPop {
+                include_pc_or_lr,
+                registers,
+                ..
+            } => *registers == 0 && !include_pc_or_lr,
             ThumbInstr::LoadStoreMultiple { rb, registers, .. } => {
                 *registers == 0 || u16::from(*registers) & (1u16 << rb.bits()) != 0
             }

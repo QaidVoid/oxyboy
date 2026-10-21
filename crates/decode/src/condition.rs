@@ -88,4 +88,27 @@ impl Condition {
             Self::Al => 0xE,
         }
     }
+
+    /// The GNU assembler condition mnemonic ("eq", "ne", ...), lower
+    /// case, for use as an instruction suffix.
+    #[must_use]
+    pub fn mnemonic(self) -> &'static str {
+        match self {
+            Self::Eq => "eq",
+            Self::Ne => "ne",
+            Self::Cs => "cs",
+            Self::Cc => "cc",
+            Self::Mi => "mi",
+            Self::Pl => "pl",
+            Self::Vs => "vs",
+            Self::Vc => "vc",
+            Self::Hi => "hi",
+            Self::Ls => "ls",
+            Self::Ge => "ge",
+            Self::Lt => "lt",
+            Self::Gt => "gt",
+            Self::Le => "le",
+            Self::Al => "al",
+        }
+    }
 }

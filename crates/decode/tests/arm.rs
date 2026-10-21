@@ -180,8 +180,9 @@ fn multiply_and_accumulate() {
 
 #[test]
 fn multiply_long_all_four_forms() {
-    // umull r2, r3, r4, r5
-    match decode_arm(0xE0C2_3495) {
+    // umull r2, r3, r4, r5 (U = 0 selects unsigned; verified against
+    // GNU as encodings)
+    match decode_arm(0xE082_3495) {
         ArmInstr::MultiplyLong {
             unsigned,
             accumulate,
@@ -200,27 +201,27 @@ fn multiply_long_all_four_forms() {
         }
         other => panic!("{other:?}"),
     }
-    // umlal: A=1
+    // umlal: U = 0, A = 1
     assert!(matches!(
-        decode_arm(0xE0E2_3495),
+        decode_arm(0xE0A2_3495),
         ArmInstr::MultiplyLong {
             unsigned: true,
             accumulate: true,
             ..
         }
     ));
-    // smull: U=0
+    // smull: U = 1
     assert!(matches!(
-        decode_arm(0xE082_3495),
+        decode_arm(0xE0C2_3495),
         ArmInstr::MultiplyLong {
             unsigned: false,
             accumulate: false,
             ..
         }
     ));
-    // smlal: U=0, A=1
+    // smlal: U = 1, A = 1
     assert!(matches!(
-        decode_arm(0xE0A2_3495),
+        decode_arm(0xE0E2_3495),
         ArmInstr::MultiplyLong {
             unsigned: false,
             accumulate: true,

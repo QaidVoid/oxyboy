@@ -29,6 +29,7 @@
 pub mod arm;
 pub mod condition;
 pub mod register;
+pub mod text;
 pub mod thumb;
 
 pub use arm::{
@@ -37,6 +38,7 @@ pub use arm::{
 };
 pub use condition::Condition;
 pub use register::{Register, RegisterList};
+pub use text::{arm_text, thumb_text};
 pub use thumb::{
     ThumbAluOp, ThumbHiOp, ThumbImmOp, ThumbInstr, ThumbMemOp, ThumbShift, ThumbSignedMemOp,
     decode_thumb,

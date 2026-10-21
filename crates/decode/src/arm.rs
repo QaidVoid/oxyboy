@@ -190,10 +190,11 @@ fn decode_multiply_space(word: u32) -> ArmInstr {
         };
     }
     if bits(word, 27, 23) == 0b00001 {
-        // Long multiplies: U selects UMULL/UMLAL vs SMULL/SMLAL, A selects
-        // accumulate. Included in ARMv4T (ARMv3M and up).
+        // Long multiplies: U selects UMULL/UMLAL (U = 0) vs SMULL/SMLAL
+        // (U = 1), A selects accumulate. Included in ARMv4T (ARMv3M and
+        // up); the polarity is confirmed against GNU as encodings.
         return ArmInstr::MultiplyLong {
-            unsigned: bit(word, 22) == 1,
+            unsigned: bit(word, 22) == 0,
             accumulate: bit(word, 21) == 1,
             set_flags: bit(word, 20) == 1,
             rd_hi: Register::from_bits(bits(word, 19, 16) as u8),
@@ -366,7 +367,8 @@ pub enum ArmInstr {
     },
     /// UMULL/UMLAL/SMULL/SMLAL, 64-bit multiply.
     MultiplyLong {
-        /// U bit: unsigned when set.
+        /// U bit: signed when set; the unsigned forms encode U = 0
+        /// (GBATEK ARM "MULL/MLAL": U = 0 selects UMULL/UMLAL).
         unsigned: bool,
         /// A bit: accumulate.
         accumulate: bool,
@@ -498,6 +500,13 @@ impl ArmInstr {
     ///   R15 (ARM ARM A4.1.3 "Data-processing operands": the shift
     ///   amount register Rs must not be R15; Rm = R15 is legal and reads
     ///   the instruction address plus 8).
+    /// - Data processing with a comparison opcode (TST, TEQ, CMP, CMN)
+    ///   and S clear: those opcodes are only defined with S set, and
+    ///   with S clear the encoding area belongs to the PSR transfers
+    ///   (ARM ARM A5.4); anything not matching MRS/MSR exactly is
+    ///   UNPREDICTABLE.
+    /// - MSR with an empty field mask (ARM ARM A7.7 "MSR (register)" /
+    ///   "MSR (immediate)": field mask `0b0000` is UNPREDICTABLE).
     /// - Halfword/signed transfers with post-indexing and the W bit set
     ///   (GBATEK "Halfword, Doubleword, and Signed Data Transfer": bit
     ///   21 "Not used, must be zero" when P = 0; the T form exists only
@@ -509,6 +518,12 @@ impl ArmInstr {
     #[must_use]
     pub fn is_unpredictable(&self) -> bool {
         match self {
+            ArmInstr::DataProcessing {
+                opcode: DataOp::Tst | DataOp::Teq | DataOp::Cmp | DataOp::Cmn,
+                set_flags: false,
+                ..
+            } => true,
+            ArmInstr::PsrWrite { fields: 0, .. } => true,
             ArmInstr::DataProcessing {
                 operand2:
                     ShifterOperand::Register {
