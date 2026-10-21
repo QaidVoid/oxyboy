@@ -4,6 +4,8 @@ use std::path::PathBuf;
 
 use clap::{ArgAction, Args, Parser, Subcommand};
 
+mod commands;
+
 /// GBA analyzer, decompiler, and runtime.
 #[derive(Debug, Parser)]
 #[command(name = "oxyboy", version, propagate_version = true)]
@@ -16,7 +18,13 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Print header fields, hashes, and identification for a ROM.
-    Info(RomArgs),
+    Info {
+        #[command(flatten)]
+        rom: RomArgs,
+        /// Path to a JSON ROM database used for identification.
+        #[arg(long, value_name = "FILE", env = "OXYBOY_ROM_DB")]
+        db: Option<PathBuf>,
+    },
     /// Emit matching, re-assemblable assembly from a ROM.
     Disasm(RomArgs),
     /// Recover code and data layout and function boundaries.
@@ -43,14 +51,18 @@ struct RomArgs {
 
 fn main() {
     let cli = Cli::parse();
-    let name = match cli.command {
-        Command::Info(_) => "info",
-        Command::Disasm(_) => "disasm",
-        Command::Analyze(_) => "analyze",
-        Command::Lift(_) => "lift",
-        Command::Recomp(_) => "recomp",
-        Command::Run(_) => "run",
+    let code = match cli.command {
+        Command::Info { rom, db } => commands::info::run(rom, db),
+        Command::Disasm(_) => not_implemented("disasm"),
+        Command::Analyze(_) => not_implemented("analyze"),
+        Command::Lift(_) => not_implemented("lift"),
+        Command::Recomp(_) => not_implemented("recomp"),
+        Command::Run(_) => not_implemented("run"),
     };
+    std::process::exit(code);
+}
+
+fn not_implemented(name: &str) -> i32 {
     eprintln!("oxyboy {name}: not implemented yet");
-    std::process::exit(1);
+    1
 }

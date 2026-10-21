@@ -1,0 +1,14 @@
+file: demo.gba
+size: 512 bytes (multiple of 4)
+kind: cart
+entry point: 0x08000000
+title: GOLDEN
+game code: GOLD
+maker code: 00
+unit code: 0x96
+device type: 0x00
+version: 0x00
+checksum: valid (0x2B)
+md5: 62c5ae4f2058efa761919ed3e83021d0
+sha1: 345d2009de7922aed4fae142ab64d0770898728e
+identification: Golden Demo (Homebrew)

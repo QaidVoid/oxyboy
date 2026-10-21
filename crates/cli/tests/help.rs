@@ -6,6 +6,7 @@ use std::process::Command;
 use testutil::golden::assert_matches;
 
 const SUBCOMMANDS: [&str; 6] = ["info", "disasm", "analyze", "lift", "recomp", "run"];
+const UNIMPLEMENTED: [&str; 5] = ["disasm", "analyze", "lift", "recomp", "run"];
 
 fn oxyboy() -> Command {
     Command::new(env!("CARGO_BIN_EXE_oxyboy"))
@@ -45,8 +46,19 @@ fn every_subcommand_has_accurate_help() {
 }
 
 #[test]
+fn info_help_documents_database_flag() {
+    let output = oxyboy()
+        .args(["info", "--help"])
+        .output()
+        .expect("run oxyboy");
+    let stdout = String::from_utf8(output.stdout).expect("utf-8 help");
+    assert!(stdout.contains("--db <FILE>"), "stdout: {stdout}");
+    assert!(stdout.contains("OXYBOY_ROM_DB"), "stdout: {stdout}");
+}
+
+#[test]
 fn unimplemented_subcommands_fail_loudly() {
-    for name in SUBCOMMANDS {
+    for name in UNIMPLEMENTED {
         let output = oxyboy()
             .args([name, "--rom", "unused.gba"])
             .output()

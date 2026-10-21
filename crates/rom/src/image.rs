@@ -3,8 +3,9 @@
 //! An [`Image`] owns the raw bytes plus the parsed [`Header`] and a
 //! heuristic [`ImageKind`] classification.
 
-use std::fmt;
 use std::path::Path;
+
+use thiserror::Error;
 
 use crate::header::{Header, HeaderError};
 
@@ -23,51 +24,22 @@ const EWRAM: std::ops::Range<u32> = 0x0200_0000..0x0204_0000;
 const MULTIBOOT_BASE: u32 = 0x0200_0000;
 
 /// Errors produced while loading an image.
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum LoadError {
     /// Filesystem access failed.
-    Io(std::io::Error),
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
+
     /// The image exceeds [`MAX_ROM_SIZE`].
+    #[error("image is {size} bytes; the limit is {MAX_ROM_SIZE}")]
     TooLarge {
         /// Size of the image in bytes.
         size: usize,
     },
+
     /// The header could not be parsed.
-    Header(HeaderError),
-}
-
-impl fmt::Display for LoadError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            LoadError::Io(e) => write!(f, "io error: {e}"),
-            LoadError::TooLarge { size } => {
-                write!(f, "image is {size} bytes; the limit is {MAX_ROM_SIZE}")
-            }
-            LoadError::Header(e) => write!(f, "bad header: {e}"),
-        }
-    }
-}
-
-impl std::error::Error for LoadError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            LoadError::Io(e) => Some(e),
-            LoadError::Header(e) => Some(e),
-            LoadError::TooLarge { .. } => None,
-        }
-    }
-}
-
-impl From<std::io::Error> for LoadError {
-    fn from(e: std::io::Error) -> Self {
-        LoadError::Io(e)
-    }
-}
-
-impl From<HeaderError> for LoadError {
-    fn from(e: HeaderError) -> Self {
-        LoadError::Header(e)
-    }
+    #[error("bad header: {0}")]
+    Header(#[from] HeaderError),
 }
 
 /// Shape of a loaded image.

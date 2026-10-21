@@ -7,7 +7,7 @@
 //! device type at `0x0B4`, seven reserved bytes at `0x0B5..0x0BC`,
 //! software version at `0x0BC`, and the complement checksum at `0x0BD`.
 
-use std::fmt;
+use thiserror::Error;
 
 /// Length of the header in bytes.
 const HEADER_LEN: usize = 0x100;
@@ -63,26 +63,15 @@ pub struct Header {
 }
 
 /// Errors produced while parsing a header.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum HeaderError {
     /// The image is shorter than the 256-byte header.
+    #[error("image is {len} bytes; the header needs 256")]
     TooShort {
         /// Number of bytes the image actually has.
         len: usize,
     },
 }
-
-impl fmt::Display for HeaderError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            HeaderError::TooShort { len } => {
-                write!(f, "image is {len} bytes; the header needs 256")
-            }
-        }
-    }
-}
-
-impl std::error::Error for HeaderError {}
 
 impl Header {
     /// Parses the header from the first 256 bytes of a full image.

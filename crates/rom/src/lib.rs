@@ -14,8 +14,12 @@
 //! assert_eq!(&image.bytes()[0x100..0x103], &[1, 2, 3]);
 //! ```
 
+pub mod db;
+pub mod hash;
 pub mod header;
 pub mod image;
 
+pub use db::{Database, DatabaseEntry, DatabaseError};
+pub use hash::Hashes;
 pub use header::Header;
 pub use image::{Image, ImageKind, LoadError, MAX_ROM_SIZE};
