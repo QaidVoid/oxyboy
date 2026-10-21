@@ -416,7 +416,7 @@ pub enum ArmInstr {
         /// B bit: byte when set.
         byte: bool,
         /// Bit 21: the W bit when pre-indexed; the T bit (force user
-        /// access) when post-indexed. Post-indexing always writes back.
+        /// access) when post-indexed, which still writes back.
         writeback: bool,
         /// U bit: add the offset when set.
         up: bool,
@@ -492,10 +492,16 @@ impl ArmInstr {
     /// True when the encoding is architecturally UNPREDICTABLE on the
     /// ARM7TDMI.
     ///
-    /// Currently this covers data processing with a register-specified
-    /// shift amount held in R15 (ARM ARM A4.1.3 "Data-processing
-    /// operands": the shift amount register Rs must not be R15; Rm = R15
-    /// is legal and reads the instruction address plus 8).
+    /// Currently this covers:
+    ///
+    /// - Data processing with a register-specified shift amount held in
+    ///   R15 (ARM ARM A4.1.3 "Data-processing operands": the shift
+    ///   amount register Rs must not be R15; Rm = R15 is legal and reads
+    ///   the instruction address plus 8).
+    /// - Halfword/signed transfers with post-indexing and the W bit set
+    ///   (GBATEK "Halfword, Doubleword, and Signed Data Transfer": bit
+    ///   21 "Not used, must be zero" when P = 0; the T form exists only
+    ///   in the word/byte transfer space).
     #[must_use]
     pub fn is_unpredictable(&self) -> bool {
         matches!(
@@ -508,6 +514,10 @@ impl ArmInstr {
                     },
                     ..
                 },
+                ..
+            } | ArmInstr::LoadStoreHalfwordSigned {
+                pre_index: false,
+                writeback: true,
                 ..
             }
         )

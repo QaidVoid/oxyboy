@@ -711,3 +711,143 @@ fn r15_as_shift_amount_is_flagged_but_r15_as_operand_is_not() {
     assert!(!decode_arm(0xE591_0004).is_unpredictable());
     assert!(!decode_arm(0xEA00_0002).is_unpredictable());
 }
+
+#[test]
+fn single_transfer_all_addressing_modes() {
+    // LDR/STR/LDRB/STRB over every P/U/B/W/L combination, with both the
+    // immediate and the register offset form.
+    for pre_index in [false, true] {
+        for up in [false, true] {
+            for byte in [false, true] {
+                for writeback in [false, true] {
+                    for load in [false, true] {
+                        let flags = u32::from(pre_index) << 24
+                            | u32::from(up) << 23
+                            | u32::from(byte) << 22
+                            | u32::from(writeback) << 21
+                            | u32::from(load) << 20;
+                        let base = 0xE000_0000 | 0x0400_0000 | flags | (0x5 << 16) | (0x3 << 12);
+
+                        let imm_word = base | 0x42;
+                        assert_eq!(
+                            decode_arm(imm_word),
+                            ArmInstr::LoadStore {
+                                load,
+                                byte,
+                                writeback,
+                                up,
+                                pre_index,
+                                rd: Register::R3,
+                                rn: Register::R5,
+                                offset: TransferOffset::Immediate(0x42),
+                            },
+                            "P={pre_index} U={up} B={byte} W={writeback} L={load} imm"
+                        );
+
+                        // Register offset: class 011 with bit 4 clear and
+                        // an LSL #2 shift on R2.
+                        let reg_word = base | 0x0600_0000 | (2 << 7) | 0x2;
+                        assert_eq!(
+                            decode_arm(reg_word),
+                            ArmInstr::LoadStore {
+                                load,
+                                byte,
+                                writeback,
+                                up,
+                                pre_index,
+                                rd: Register::R3,
+                                rn: Register::R5,
+                                offset: TransferOffset::Register {
+                                    rm: Register::R2,
+                                    shift: RegisterShift {
+                                        kind: ShiftKind::Lsl,
+                                        amount: ShiftAmount::Immediate(2),
+                                    },
+                                },
+                            },
+                            "P={pre_index} U={up} B={byte} W={writeback} L={load} reg"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn post_indexed_user_mode_t_form_is_defined() {
+    // P=0 with bit 21 set is LDRT/STRT/LDRBT/STRBT: defined on ARMv4T
+    // (GBATEK "Single Data Transfer": bit 21 = T when P=0) and decodes
+    // with writeback set, but is not flagged unpredictable.
+    let word = 0xE6F5_2001; // ldrbt r2, [r5], #-1 (class 011, P=0, U, B, T, L)
+    match decode_arm(word) {
+        ArmInstr::LoadStore {
+            load,
+            byte,
+            writeback,
+            pre_index,
+            ..
+        } => {
+            assert!(load);
+            assert!(byte);
+            assert!(writeback);
+            assert!(!pre_index);
+            assert!(!decode_arm(word).is_unpredictable());
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn halfword_post_indexing_with_writeback_is_flagged() {
+    // P=0 with W=1 in the halfword space: bit 21 must be zero
+    // (GBATEK); decodable but flagged unpredictable.
+    let word = 0xE0B1_00B2; // strh with P=0, U=1, W=1
+    match decode_arm(word) {
+        ArmInstr::LoadStoreHalfwordSigned {
+            pre_index,
+            writeback,
+            ..
+        } => {
+            assert!(!pre_index);
+            assert!(writeback);
+            assert!(decode_arm(word).is_unpredictable());
+        }
+        other => panic!("{other:?}"),
+    }
+    // Every other P/W combination is fine.
+    for (pre_index, writeback) in [(false, false), (true, false), (true, true)] {
+        let flags = u32::from(pre_index) << 24 | u32::from(writeback) << 21;
+        let word = 0xE180_0000 | 0x0080_0000 | flags | 0xB2;
+        assert!(
+            !decode_arm(word).is_unpredictable(),
+            "P={pre_index} W={writeback}"
+        );
+    }
+}
+
+#[test]
+fn halfword_sh_zero_overlap_resolves_to_swap_or_undefined() {
+    // SH = 00 with L = 0 is where SWP lives (GBATEK halfword section:
+    // "Reserved for SWP instruction"). Words with the full SWP bit
+    // pattern decode as Swap; everything else is undefined.
+    // swp r0, r1, [r2]
+    assert!(matches!(
+        decode_arm(0xE102_0091),
+        ArmInstr::Swap { byte: false, .. }
+    ));
+    // Same shape but with L set: SWP has no load form.
+    assert_eq!(
+        decode_arm(0xE112_0091),
+        ArmInstr::Undefined {
+            encoding: 0xE112_0091
+        }
+    );
+    // SH = 00 without the SWP bits 11..4 pattern.
+    assert_eq!(
+        decode_arm(0xE181_0090),
+        ArmInstr::Undefined {
+            encoding: 0xE181_0090
+        }
+    );
+}
