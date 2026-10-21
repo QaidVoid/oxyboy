@@ -2,11 +2,20 @@
 //!
 //! Shared by the analyzer and the runtime. Depends on no other workspace
 //! crate.
+//!
+//! # Examples
+//!
+//! ```
+//! use testutil::synthetic::RomBuilder;
+//!
+//! let bytes = RomBuilder::new().title("DEMO").payload(&[1, 2, 3]).build();
+//! let image = rom::Image::from_bytes(bytes).unwrap();
+//! assert_eq!(image.header().title_str(), Some("DEMO"));
+//! assert_eq!(&image.bytes()[0x100..0x103], &[1, 2, 3]);
+//! ```
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn workspace_wiring() {
-        assert_eq!(env!("CARGO_PKG_NAME"), "rom");
-    }
-}
+pub mod header;
+pub mod image;
+
+pub use header::Header;
+pub use image::{Image, ImageKind, LoadError, MAX_ROM_SIZE};

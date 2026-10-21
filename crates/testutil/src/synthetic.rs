@@ -41,9 +41,9 @@ impl RomBuilder {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            title: fit("OXYBOY", 12).try_into().expect("fixed 12-byte field"),
-            game_code: fit("OTST", 4).try_into().expect("fixed 4-byte field"),
-            maker_code: fit("00", 2).try_into().expect("fixed 2-byte field"),
+            title: fit_into::<12>("OXYBOY"),
+            game_code: fit_into::<4>("OTST"),
+            maker_code: fit_into::<2>("00"),
             entry: 0x0800_0000,
             payload: Vec::new(),
             min_size: 512,
@@ -54,7 +54,7 @@ impl RomBuilder {
     /// bytes and NUL padded.
     #[must_use]
     pub fn title(mut self, title: &str) -> Self {
-        self.title = fit(title, 12).try_into().expect("fixed 12-byte field");
+        self.title = fit_into::<12>(title);
         self
     }
 
@@ -62,7 +62,7 @@ impl RomBuilder {
     /// and NUL padded.
     #[must_use]
     pub fn game_code(mut self, game_code: &str) -> Self {
-        self.game_code = fit(game_code, 4).try_into().expect("fixed 4-byte field");
+        self.game_code = fit_into::<4>(game_code);
         self
     }
 
@@ -70,7 +70,7 @@ impl RomBuilder {
     /// and NUL padded.
     #[must_use]
     pub fn maker_code(mut self, maker_code: &str) -> Self {
-        self.maker_code = fit(maker_code, 2).try_into().expect("fixed 2-byte field");
+        self.maker_code = fit_into::<2>(maker_code);
         self
     }
 
@@ -131,9 +131,9 @@ fn complement_checksum(header: &[u8]) -> u8 {
     (0x100u32.wrapping_sub(sum) & 0xFF) as u8
 }
 
-/// Copies `s` into a `width`-byte buffer, truncating and NUL padding.
-fn fit(s: &str, width: usize) -> Vec<u8> {
-    let mut out = vec![0u8; width];
+/// Copies `s` into a fixed-width buffer, truncating and NUL padding.
+fn fit_into<const N: usize>(s: &str) -> [u8; N] {
+    let mut out = [0u8; N];
     for (out_byte, src_byte) in out.iter_mut().zip(s.bytes()) {
         *out_byte = src_byte;
     }
