@@ -666,9 +666,10 @@ fn mem_name(kind: ThumbMemOp) -> &'static str {
 
 /// A THUMB branch as a dot expression: the target is the instruction's
 /// own address plus the 4-byte pipeline displacement plus the encoded
-/// offset, so the printed displacement is `4 + offset`.
+/// halfword offset doubled to bytes, so the printed displacement is
+/// `4 + offset * 2`.
 fn branch_text(base: &str, cond: &str, offset: i32) -> String {
-    let displacement = offset + 4;
+    let displacement = offset * 2 + 4;
     format!("{base}{cond} .{}{}", sign(displacement), displacement.abs())
 }
 

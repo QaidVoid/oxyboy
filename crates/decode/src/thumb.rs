@@ -282,7 +282,7 @@ fn decode_conditional_branch_or_swi(first: u16) -> ThumbInstr {
         _ => match Condition::from_bits(cond_bits) {
             Some(cond) => ThumbInstr::ConditionalBranch {
                 cond,
-                offset: (sign_extend(thumb_bits(first, 7, 0) as u32, 8) << 1) as i16,
+                offset: sign_extend(thumb_bits(first, 7, 0) as u32, 8) as i16,
             },
             None => ThumbInstr::Undefined { encoding: first },
         },
@@ -292,7 +292,7 @@ fn decode_conditional_branch_or_swi(first: u16) -> ThumbInstr {
 /// Format 18: unconditional branch.
 fn decode_unconditional_branch(first: u16) -> ThumbInstr {
     ThumbInstr::UnconditionalBranch {
-        offset: (sign_extend(thumb_bits(first, 10, 0) as u32, 11) << 1) as i16,
+        offset: sign_extend(thumb_bits(first, 10, 0) as u32, 11) as i16,
     }
 }
 
@@ -309,16 +309,17 @@ fn decode_long_branch_with_link(first: u16, next: u16) -> ThumbInstr {
             let imm_hi = thumb_bits(first, 10, 0) as u32;
             let imm_lo = thumb_bits(next, 10, 0) as u32;
             ThumbInstr::LongBranchWithLink {
-                // Target = PC + 4 + offset; offset is 23-bit sign
-                // extended, halfword units.
-                offset: sign_extend((imm_hi << 12) | (imm_lo << 1), 23),
+                // Target = PC + 4 + offset; offset is a 22-bit
+                // sign-extended value in halfword units (the executor
+                // applies the *2 byte step).
+                offset: sign_extend((imm_hi << 11) | imm_lo, 22),
             }
         }
         // Standalone second half: branch to LR + offset with link
         // (GBATEK THUMB.19 note: "Using only the 2nd half of BL as 'BL
         // LR+imm' is possible").
         (0b11111, _) => ThumbInstr::LongBranchWithLinkFromLr {
-            offset: (sign_extend(thumb_bits(first, 10, 0) as u32, 11) << 1) as i16,
+            offset: sign_extend(thumb_bits(first, 10, 0) as u32, 11) as i16,
         },
         _ => ThumbInstr::Undefined { encoding: first },
     }
@@ -492,7 +493,7 @@ pub enum ThumbInstr {
     },
     /// Format 19: BL pair. Target = PC + 4 + offset.
     LongBranchWithLink {
-        /// 23-bit sign-extended offset, halfword units.
+        /// 22-bit sign-extended offset, halfword units.
         offset: i32,
     },
     /// Format 19 second halfword standing alone: branch to LR + offset

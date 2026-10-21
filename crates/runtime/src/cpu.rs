@@ -9,7 +9,8 @@
 use crate::bus::Bus;
 use decode::{
     ArmInstr, Condition, DataOp, HalfwordKind, Register, RegisterList, ShiftAmount, ShiftKind,
-    ShifterOperand, decode_arm,
+    ShifterOperand, ThumbAluOp, ThumbHiOp, ThumbImmOp, ThumbInstr, ThumbMemOp, ThumbShift,
+    ThumbSignedMemOp, decode_arm, decode_thumb,
 };
 
 /// A CPU operating mode (ARM ARM A2.2, GBATEK "CPU Modes").
@@ -491,20 +492,33 @@ fn access_cycles(bus: &Bus, addr: u32, width: u8) -> u32 {
 }
 
 impl Cpu {
-    /// Executes one ARM instruction at `self.pc`, accumulating coarse
-    /// cycles. Undefined encodings take the undefined-instruction
-    /// exception; nothing panics.
+    /// Executes one instruction at `self.pc` in the state selected by
+    /// the T bit, accumulating coarse cycles. Undefined encodings take
+    /// the undefined-instruction exception; nothing panics.
     pub fn step(&mut self, bus: &mut Bus) -> u32 {
         let before = self.cycles;
-        self.cycles += u64::from(access_cycles(bus, self.pc, 4));
         if self.irq_line && self.cpsr & 0x80 == 0 {
             // IRQ entry: the not-yet-executed instruction at `self.pc`
-            // is not executed; its address plus 4 is saved (ARM ARM
-            // A2.6) so `subs pc, lr, #4` re-executes it.
-            let lr = self.pc.wrapping_add(4);
-            self.exception(Mode::Irq, lr, 0x18, false);
+            // is not executed. The return address is saved in ARM-style
+            // form in both states (ARM ARM A2.6, GBATEK "Actions
+            // performed by CPU when entering an exception") so
+            // `subs pc, lr, #4` re-executes it.
+            let width = if self.cpsr & 0x20 != 0 { 2 } else { 4 };
+            self.cycles += u64::from(access_cycles(bus, self.pc, width));
+            self.exception(Mode::Irq, self.pc.wrapping_add(4), 0x18, false);
             return (self.cycles - before) as u32;
         }
+        if self.cpsr & 0x20 != 0 {
+            self.step_thumb(bus);
+        } else {
+            self.step_arm(bus);
+        }
+        (self.cycles - before) as u32
+    }
+
+    /// One ARM-state instruction.
+    fn step_arm(&mut self, bus: &mut Bus) {
+        self.cycles += u64::from(access_cycles(bus, self.pc, 4));
         let word = bus.read_u32(self.pc);
         let start_pc = self.pc;
         let cond = Condition::from_bits((word >> 28) as u8);
@@ -526,7 +540,30 @@ impl Cpu {
         if matches!(flow, Flow::Sequential) {
             self.pc = start_pc.wrapping_add(4);
         }
-        (self.cycles - before) as u32
+    }
+
+    /// One THUMB-state instruction: a 16-bit fetch (plus the following
+    /// halfword, which only BL consumes) decoded by [`decode_thumb`].
+    fn step_thumb(&mut self, bus: &mut Bus) {
+        self.cycles += u64::from(access_cycles(bus, self.pc, 2));
+        let first = bus.read_u16(self.pc);
+        let next = bus.read_u16(self.pc.wrapping_add(2));
+        let start_pc = self.pc;
+        let instr = decode_thumb(first, next);
+        let flow = self.execute_thumb(instr, bus);
+        if matches!(flow, Flow::Sequential) {
+            self.pc = start_pc.wrapping_add(2);
+        }
+    }
+
+    /// Reads a register with THUMB pipeline semantics: R15 reads as the
+    /// instruction address plus 4 (GBATEK THUMB.5 note), unlike the
+    /// ARM-state plus-8.
+    fn reg_thumb(&self, r: Register) -> u32 {
+        match r {
+            Register::Pc => self.pc.wrapping_add(4),
+            _ => self.regs[r.bits() as usize],
+        }
     }
 
     fn undefined_exception(&mut self) {
@@ -1180,6 +1217,553 @@ impl Cpu {
             }
             self.pc = target;
             return Flow::Handled;
+        }
+        Flow::Sequential
+    }
+
+    /// Executes one decoded THUMB instruction (GBATEK "THUMB Opcodes").
+    /// Undefined encodings raise the undefined-instruction exception;
+    /// nothing panics.
+    fn execute_thumb(&mut self, instr: ThumbInstr, bus: &mut Bus) -> Flow {
+        match instr {
+            ThumbInstr::ShiftedImmediate { kind, rd, rm, imm5 } => {
+                let shift_kind = match kind {
+                    ThumbShift::Lsl => ShiftKind::Lsl,
+                    ThumbShift::Lsr => ShiftKind::Lsr,
+                    ThumbShift::Asr => ShiftKind::Asr,
+                };
+                // A zero immediate encodes a 32-place shift.
+                let amount = match kind {
+                    ThumbShift::Lsr | ThumbShift::Asr if imm5 == 0 => 32,
+                    _ => u32::from(imm5),
+                };
+                let out = apply_shift(self.reg(rm), shift_kind, amount, self.flag_c());
+                self.set_reg(rd, out.value);
+                self.set_flags(
+                    out.value & 0x8000_0000 != 0,
+                    out.value == 0,
+                    Some(out.carry),
+                    None,
+                );
+                self.cycles += 1; // 1I
+                Flow::Sequential
+            }
+            ThumbInstr::AddSubtract {
+                subtract,
+                immediate,
+                rn_or_imm3,
+                rs,
+                rd,
+            } => {
+                let b = if immediate {
+                    u32::from(rn_or_imm3)
+                } else {
+                    self.reg(Register::from_bits(rn_or_imm3))
+                };
+                let a = self.reg(rs);
+                let (res, c, v) = if subtract {
+                    sub_with_borrow(a, b, false)
+                } else {
+                    add_with_carry(a, b, false)
+                };
+                self.set_reg(rd, res);
+                self.set_flags(res & 0x8000_0000 != 0, res == 0, Some(c), Some(v));
+                Flow::Sequential
+            }
+            ThumbInstr::ImmediateOperation { op, rd, imm8 } => {
+                let b = u32::from(imm8);
+                match op {
+                    ThumbImmOp::Mov => {
+                        self.set_reg(rd, b);
+                        self.set_flags(b & 0x8000_0000 != 0, b == 0, None, None);
+                    }
+                    ThumbImmOp::Cmp => {
+                        let (res, c, v) = sub_with_borrow(self.reg(rd), b, false);
+                        self.set_flags(res & 0x8000_0000 != 0, res == 0, Some(c), Some(v));
+                    }
+                    ThumbImmOp::Add => {
+                        let (res, c, v) = add_with_carry(self.reg(rd), b, false);
+                        self.set_reg(rd, res);
+                        self.set_flags(res & 0x8000_0000 != 0, res == 0, Some(c), Some(v));
+                    }
+                    ThumbImmOp::Sub => {
+                        let (res, c, v) = sub_with_borrow(self.reg(rd), b, false);
+                        self.set_reg(rd, res);
+                        self.set_flags(res & 0x8000_0000 != 0, res == 0, Some(c), Some(v));
+                    }
+                }
+                Flow::Sequential
+            }
+            ThumbInstr::AluOperation { op, rd, rs } => {
+                let a = self.reg(rd);
+                let b = self.reg(rs);
+                let logical = |cpu: &mut Self, res: u32| {
+                    // AND/EOR/TST/ORR/BIC/MVN set N and Z only (GBATEK
+                    // THUMB.4 flags table).
+                    cpu.set_flags(res & 0x8000_0000 != 0, res == 0, None, None);
+                };
+                match op {
+                    ThumbAluOp::Adc => {
+                        let (res, c, v) = add_with_carry(a, b, self.flag_c());
+                        self.set_reg(rd, res);
+                        self.set_flags(res & 0x8000_0000 != 0, res == 0, Some(c), Some(v));
+                    }
+                    ThumbAluOp::Sbc => {
+                        let (res, c, v) = sub_with_borrow(a, b, !self.flag_c());
+                        self.set_reg(rd, res);
+                        self.set_flags(res & 0x8000_0000 != 0, res == 0, Some(c), Some(v));
+                    }
+                    ThumbAluOp::Neg => {
+                        let (res, c, v) = sub_with_borrow(0, b, false);
+                        self.set_reg(rd, res);
+                        self.set_flags(res & 0x8000_0000 != 0, res == 0, Some(c), Some(v));
+                    }
+                    ThumbAluOp::Cmp => {
+                        let (res, c, v) = sub_with_borrow(a, b, false);
+                        self.set_flags(res & 0x8000_0000 != 0, res == 0, Some(c), Some(v));
+                    }
+                    ThumbAluOp::Cmn => {
+                        let (res, c, v) = add_with_carry(a, b, false);
+                        self.set_flags(res & 0x8000_0000 != 0, res == 0, Some(c), Some(v));
+                    }
+                    ThumbAluOp::Mul => {
+                        let res = a.wrapping_mul(b);
+                        self.set_reg(rd, res);
+                        // ARMv4: N,Z set, "carry flag destroyed" (GBATEK
+                        // THUMB.4); modeled as unchanged.
+                        self.set_flags(res & 0x8000_0000 != 0, res == 0, None, None);
+                        self.cycles += 3;
+                    }
+                    ThumbAluOp::Lsl | ThumbAluOp::Lsr | ThumbAluOp::Asr | ThumbAluOp::Ror => {
+                        let kind = match op {
+                            ThumbAluOp::Lsl => ShiftKind::Lsl,
+                            ThumbAluOp::Lsr => ShiftKind::Lsr,
+                            ThumbAluOp::Asr => ShiftKind::Asr,
+                            _ => ShiftKind::Ror,
+                        };
+                        let out = apply_shift(a, kind, b & 0xFF, self.flag_c());
+                        self.set_reg(rd, out.value);
+                        self.set_flags(
+                            out.value & 0x8000_0000 != 0,
+                            out.value == 0,
+                            Some(out.carry),
+                            None,
+                        );
+                        self.cycles += 1; // 1I
+                    }
+                    ThumbAluOp::And => {
+                        let res = a & b;
+                        self.set_reg(rd, res);
+                        logical(self, res);
+                    }
+                    ThumbAluOp::Eor => {
+                        let res = a ^ b;
+                        self.set_reg(rd, res);
+                        logical(self, res);
+                    }
+                    ThumbAluOp::Orr => {
+                        let res = a | b;
+                        self.set_reg(rd, res);
+                        logical(self, res);
+                    }
+                    ThumbAluOp::Bic => {
+                        let res = a & !b;
+                        self.set_reg(rd, res);
+                        logical(self, res);
+                    }
+                    ThumbAluOp::Mvn => {
+                        let res = !b;
+                        self.set_reg(rd, res);
+                        logical(self, res);
+                    }
+                    ThumbAluOp::Tst => {
+                        logical(self, a & b);
+                    }
+                }
+                Flow::Sequential
+            }
+            ThumbInstr::HighRegisterOperation { op, rd, rs } => match op {
+                ThumbHiOp::Bx => {
+                    if rs == Register::Pc {
+                        // BX PC: switches to ARM; PC = ($+4) AND NOT 2
+                        // (GBATEK THUMB.5).
+                        self.cpsr &= !0x20;
+                        self.pc = self.pc.wrapping_add(4) & !2;
+                    } else {
+                        let target = self.reg(rs);
+                        self.cpsr = (self.cpsr & !0x20) | ((target & 1) << 5);
+                        self.pc = target & !1;
+                    }
+                    Flow::Handled
+                }
+                ThumbHiOp::Add => {
+                    let res = self.reg_thumb(rd).wrapping_add(self.reg_thumb(rs));
+                    if rd == Register::Pc {
+                        // Data-op writes to PC do not interwork on
+                        // ARMv4T: bit 0 is ignored.
+                        self.pc = res & !1;
+                        Flow::Handled
+                    } else {
+                        self.regs[rd.bits() as usize] = res;
+                        Flow::Sequential
+                    }
+                }
+                ThumbHiOp::Mov => {
+                    let res = self.reg_thumb(rs);
+                    if rd == Register::Pc {
+                        self.pc = res & !1;
+                        Flow::Handled
+                    } else {
+                        self.regs[rd.bits() as usize] = res;
+                        Flow::Sequential
+                    }
+                }
+                ThumbHiOp::Cmp => {
+                    let (res, c, v) =
+                        sub_with_borrow(self.reg_thumb(rd), self.reg_thumb(rs), false);
+                    self.set_flags(res & 0x8000_0000 != 0, res == 0, Some(c), Some(v));
+                    Flow::Sequential
+                }
+            },
+            ThumbInstr::PcRelativeLoad { rd, offset } => {
+                let addr = ((self.pc.wrapping_add(4)) & !3) + u32::from(offset) * 4;
+                self.cycles += u64::from(access_cycles(bus, addr, 4)) + 1;
+                self.regs[rd.bits() as usize] = bus.read_u32(addr);
+                Flow::Sequential
+            }
+            ThumbInstr::LoadStoreRegisterOffset { kind, rd, rb, ro } => {
+                let addr = self.reg(rb).wrapping_add(self.reg(ro));
+                self.thumb_word_byte_transfer(bus, kind, addr, rd);
+                Flow::Sequential
+            }
+            ThumbInstr::LoadStoreSignedRegisterOffset { kind, rd, rb, ro } => {
+                let addr = self.reg(rb).wrapping_add(self.reg(ro));
+                self.thumb_halfword_transfer(bus, kind, addr, rd);
+                Flow::Sequential
+            }
+            ThumbInstr::LoadStoreImmediateOffset {
+                kind,
+                rd,
+                rb,
+                offset,
+            } => {
+                let scale = if matches!(kind, ThumbMemOp::Str | ThumbMemOp::Ldr) {
+                    4
+                } else {
+                    1
+                };
+                let addr = self.reg(rb).wrapping_add(u32::from(offset) * scale);
+                self.thumb_word_byte_transfer(bus, kind, addr, rd);
+                Flow::Sequential
+            }
+            ThumbInstr::LoadStoreHalfwordImmediate {
+                load,
+                rd,
+                rb,
+                offset,
+            } => {
+                let addr = self.reg(rb).wrapping_add(u32::from(offset) * 2);
+                let kind = if load {
+                    ThumbSignedMemOp::Ldrh
+                } else {
+                    ThumbSignedMemOp::Strh
+                };
+                self.thumb_halfword_transfer(bus, kind, addr, rd);
+                Flow::Sequential
+            }
+            ThumbInstr::LoadStoreStack { load, rd, offset } => {
+                let addr = self.reg(Register::Sp).wrapping_add(u32::from(offset) * 4);
+                let kind = if load {
+                    ThumbMemOp::Ldr
+                } else {
+                    ThumbMemOp::Str
+                };
+                self.thumb_word_byte_transfer(bus, kind, addr, rd);
+                Flow::Sequential
+            }
+            ThumbInstr::LoadAddress { to_sp, rd, offset } => {
+                let res = if to_sp {
+                    self.reg(Register::Sp).wrapping_add(u32::from(offset) * 4)
+                } else {
+                    ((self.pc.wrapping_add(4)) & !3) + u32::from(offset) * 4
+                };
+                self.set_reg(rd, res);
+                Flow::Sequential
+            }
+            ThumbInstr::AdjustStackPointer { subtract, offset } => {
+                let off = u32::from(offset) * 4;
+                let sp = self.reg(Register::Sp);
+                self.regs[Register::Sp.bits() as usize] = if subtract {
+                    sp.wrapping_sub(off)
+                } else {
+                    sp.wrapping_add(off)
+                };
+                Flow::Sequential
+            }
+            ThumbInstr::PushPop {
+                pop,
+                include_pc_or_lr,
+                registers,
+            } => self.exec_thumb_push_pop(pop, include_pc_or_lr, registers, bus),
+            ThumbInstr::LoadStoreMultiple {
+                load,
+                rb,
+                registers,
+            } => self.exec_thumb_load_store_multiple(load, rb, registers, bus),
+            ThumbInstr::ConditionalBranch { cond, offset } => {
+                if condition_holds(cond, self.cpsr) {
+                    self.pc = self
+                        .pc
+                        .wrapping_add(4)
+                        .wrapping_add((i32::from(offset) * 2) as u32);
+                    Flow::Handled
+                } else {
+                    Flow::Sequential
+                }
+            }
+            ThumbInstr::SoftwareInterrupt { value: _ } => {
+                // THUMB SWI: R14_svc = PC+2, vector 0x08, F unchanged
+                // (GBATEK THUMB.17 "Execution SWI/BKPT").
+                self.exception(Mode::Supervisor, self.pc.wrapping_add(2), 0x08, false);
+                Flow::Handled
+            }
+            ThumbInstr::UnconditionalBranch { offset } => {
+                self.pc = self
+                    .pc
+                    .wrapping_add(4)
+                    .wrapping_add((i32::from(offset) * 2) as u32);
+                Flow::Handled
+            }
+            ThumbInstr::LongBranchWithLink { offset } => {
+                // One 32-bit instruction: target = $+4+offset*2 and
+                // LR = ($+4) with the THUMB bit set (GBATEK THUMB.19,
+                // "Second Instruction - PC = LR + (nn SHL 1), and
+                // LR = PC+2 OR 1").
+                self.regs[Register::Lr.bits() as usize] = (self.pc.wrapping_add(4)) | 1;
+                self.pc = self.pc.wrapping_add(4).wrapping_add((offset * 2) as u32) & !1;
+                self.cycles += 2; // second fetch + 1N
+                Flow::Handled
+            }
+            ThumbInstr::LongBranchWithLinkFromLr { offset } => {
+                // The second BL halfword standing alone: PC = LR+nn*2,
+                // LR = $+2 with the THUMB bit set (GBATEK THUMB.19
+                // note; Mario Golf Advance Tour uses F800h).
+                let target = self
+                    .reg(Register::Lr)
+                    .wrapping_add((i32::from(offset) * 2) as u32)
+                    & !1;
+                self.regs[Register::Lr.bits() as usize] = (self.pc.wrapping_add(2)) | 1;
+                self.pc = target;
+                self.cycles += 1;
+                Flow::Handled
+            }
+            ThumbInstr::Undefined { encoding: _ } => {
+                // The ARM7TDMI has no documented behavior for undefined
+                // THUMB halfwords; raise the undefined-instruction
+                // exception with the THUMB pipeline offset (mirrors the
+                // SWI PC+2 rule in GBATEK THUMB.17).
+                self.exception(Mode::Undefined, self.pc.wrapping_add(2), 0x04, false);
+                Flow::Handled
+            }
+        }
+    }
+
+    /// THUMB word/byte transfer with the ARM7 misalignment rules (the
+    /// same quirks as the ARM single-transfer path: unaligned word
+    /// loads rotate the aligned word; byte transfers use the exact
+    /// address).
+    fn thumb_word_byte_transfer(
+        &mut self,
+        bus: &mut Bus,
+        kind: ThumbMemOp,
+        addr: u32,
+        rd: Register,
+    ) {
+        match kind {
+            ThumbMemOp::Str => {
+                self.cycles += u64::from(access_cycles(bus, addr, 4));
+                bus.write_u32(addr, self.regs[rd.bits() as usize]);
+            }
+            ThumbMemOp::Ldr => {
+                self.cycles += u64::from(access_cycles(bus, addr, 4));
+                self.regs[rd.bits() as usize] =
+                    bus.read_u32(addr & !3).rotate_right((addr & 3) * 8);
+            }
+            ThumbMemOp::Strb => {
+                self.cycles += u64::from(access_cycles(bus, addr, 1));
+                bus.write_u8(addr, self.regs[rd.bits() as usize] as u8);
+            }
+            ThumbMemOp::Ldrb => {
+                self.cycles += u64::from(access_cycles(bus, addr, 1));
+                self.regs[rd.bits() as usize] = u32::from(bus.read_u8(addr));
+            }
+        }
+    }
+
+    /// THUMB halfword and signed-byte transfer with the ARM7 quirks:
+    /// LDRH from an odd address returns the aligned halfword rotated
+    /// right by 8, and LDSH from an odd address sign-extends the single
+    /// addressed byte (GBATEK "Mis-aligned LDRH,LDRSH").
+    fn thumb_halfword_transfer(
+        &mut self,
+        bus: &mut Bus,
+        kind: ThumbSignedMemOp,
+        addr: u32,
+        rd: Register,
+    ) {
+        match kind {
+            ThumbSignedMemOp::Strh => {
+                self.cycles += u64::from(access_cycles(bus, addr, 2));
+                bus.write_u16(addr, self.regs[rd.bits() as usize] as u16);
+            }
+            ThumbSignedMemOp::Ldrh => {
+                self.cycles += u64::from(access_cycles(bus, addr, 2));
+                let value = if addr & 1 == 1 {
+                    u32::from(bus.read_u16(addr & !1)).rotate_right(8)
+                } else {
+                    u32::from(bus.read_u16(addr))
+                };
+                self.regs[rd.bits() as usize] = value;
+            }
+            ThumbSignedMemOp::Ldsb => {
+                self.cycles += u64::from(access_cycles(bus, addr, 1));
+                self.regs[rd.bits() as usize] = bus.read_u8(addr) as i8 as i32 as u32;
+            }
+            ThumbSignedMemOp::Ldsh => {
+                self.cycles += u64::from(access_cycles(bus, addr, 2));
+                let value = if addr & 1 == 1 {
+                    bus.read_u8(addr) as i8 as i32 as u32
+                } else {
+                    bus.read_u16(addr) as i16 as i32 as u32
+                };
+                self.regs[rd.bits() as usize] = value;
+            }
+        }
+    }
+
+    /// THUMB PUSH/POP (GBATEK THUMB.14). The stack is full descending;
+    /// PUSH writes LR highest, POP reads PC highest. POP {PC} ignores
+    /// bit 0 and stays in THUMB state on ARMv4 (GBATEK THUMB.14 note).
+    /// An empty list transfers R15 and moves SP by 0x40 (GBATEK
+    /// "Strange Effects on Invalid Rlist's", ARMv4 column).
+    fn exec_thumb_push_pop(
+        &mut self,
+        pop: bool,
+        include_pc_or_lr: bool,
+        registers: u8,
+        bus: &mut Bus,
+    ) -> Flow {
+        let empty = registers == 0 && !include_pc_or_lr;
+        let count = registers.count_ones() + u32::from(include_pc_or_lr);
+        // ARMv4 empty-list quirk: the base moves by 0x40 regardless.
+        let total = if empty { 0x40 } else { count * 4 };
+        let sp0 = self.reg(Register::Sp);
+        let mut addr = if pop { sp0 } else { sp0.wrapping_sub(total) };
+        for i in 0..8u16 {
+            if registers & (1 << i) == 0 {
+                continue;
+            }
+            let r = Register::from_bits(i as u8);
+            self.cycles += u64::from(access_cycles(bus, addr, 4));
+            if pop {
+                self.regs[r.bits() as usize] = bus.read_u32(addr);
+            } else {
+                bus.write_u32(addr, self.regs[r.bits() as usize]);
+            }
+            addr = addr.wrapping_add(4);
+        }
+        let mut flow = Flow::Sequential;
+        if empty {
+            // ARMv4: R15 is transferred (stored/loaded at the start
+            // address), reading as $+4 like any THUMB operand.
+            self.cycles += u64::from(access_cycles(bus, addr, 4));
+            if pop {
+                self.pc = bus.read_u32(addr) & !1;
+                flow = Flow::Handled;
+            } else {
+                bus.write_u32(addr, self.pc.wrapping_add(4));
+            }
+        } else if include_pc_or_lr {
+            let tail = if pop { Register::Pc } else { Register::Lr };
+            self.cycles += u64::from(access_cycles(bus, addr, 4));
+            if pop {
+                // POP {PC} ignores bit 0 and stays in THUMB state
+                // (GBATEK THUMB.14 note).
+                self.pc = bus.read_u32(addr) & !1;
+                flow = Flow::Handled;
+            } else {
+                bus.write_u32(addr, self.regs[tail.bits() as usize]);
+            }
+        }
+        self.regs[Register::Sp.bits() as usize] = if pop {
+            sp0.wrapping_add(total)
+        } else {
+            sp0.wrapping_sub(total)
+        };
+        flow
+    }
+
+    /// THUMB LDMIA/STMIA (GBATEK THUMB.15): ascending transfers with
+    /// ARMv4 de-facto behavior for invalid lists (empty list transfers
+    /// R15 and bumps the base by 0x40; a list containing the base
+    /// stores the old base on STM when the base is the first entry, and
+    /// never writes back on LDM).
+    fn exec_thumb_load_store_multiple(
+        &mut self,
+        load: bool,
+        rb: Register,
+        registers: u8,
+        bus: &mut Bus,
+    ) -> Flow {
+        let empty = registers == 0;
+        let count = registers.count_ones();
+        let total = if empty { 0x40 } else { count * 4 };
+        let base = self.reg(rb);
+        let mut addr = base;
+        let first_entry = (0..8u16)
+            .map(|i| (i, Register::from_bits(i as u8)))
+            .find(|(i, _)| !empty && registers & (1 << i) != 0)
+            .map(|(_, r)| r);
+        for i in 0..8u16 {
+            if registers & (1 << i) == 0 {
+                continue;
+            }
+            let r = Register::from_bits(i as u8);
+            self.cycles += u64::from(access_cycles(bus, addr, 4));
+            if load {
+                let value = bus.read_u32(addr);
+                if r == rb {
+                    // The loaded base wins; no writeback afterwards.
+                    self.regs[rb.bits() as usize] = value;
+                } else {
+                    self.regs[r.bits() as usize] = value;
+                }
+            } else {
+                // With the base in the list, the base slot receives the
+                // old base only when it is the first list entry,
+                // otherwise the post-transfer value (ARMv4).
+                let value = if r == rb && Some(r) != first_entry {
+                    base.wrapping_add(total)
+                } else {
+                    self.regs[r.bits() as usize]
+                };
+                bus.write_u32(addr, value);
+            }
+            addr = addr.wrapping_add(4);
+        }
+        if empty {
+            // ARMv4: R15 is transferred at the start address, reading
+            // as $+4 like any THUMB operand; the base moves by 0x40.
+            self.cycles += u64::from(access_cycles(bus, addr, 4));
+            if load {
+                self.pc = bus.read_u32(addr) & !1;
+            } else {
+                bus.write_u32(addr, self.pc.wrapping_add(4));
+            }
+        }
+        let base_in_list = !empty && registers & (1 << u16::from(rb.bits())) != 0;
+        if empty || !(load && base_in_list) {
+            self.regs[rb.bits() as usize] = base.wrapping_add(total);
         }
         Flow::Sequential
     }

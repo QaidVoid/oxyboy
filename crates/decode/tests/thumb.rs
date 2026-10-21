@@ -470,22 +470,22 @@ fn load_store_multiple() {
 #[test]
 fn conditional_branch_all_conditions() {
     for (index, cond) in CONDITIONS.iter().enumerate() {
-        // b<cond> +2 with a variable condition.
+        // b<cond> with offset 1 halfword (target = $+6).
         let halfword = 0xD000 | ((index as u16) << 8) | 1;
         assert_eq!(
             decode_thumb(halfword, 0),
             ThumbInstr::ConditionalBranch {
                 cond: *cond,
-                offset: 2
+                offset: 1
             }
         );
     }
-    // beq -4
+    // beq -2 halfwords (target = $-2).
     assert_eq!(
         decode_thumb(0xD0FE, 0),
         ThumbInstr::ConditionalBranch {
             cond: Condition::Eq,
-            offset: -4
+            offset: -2
         }
     );
 }
@@ -502,23 +502,23 @@ fn software_interrupt() {
 fn unconditional_branch() {
     assert_eq!(
         decode_thumb(0xE002, 0),
-        ThumbInstr::UnconditionalBranch { offset: 4 }
+        ThumbInstr::UnconditionalBranch { offset: 2 }
     );
     assert_eq!(
         decode_thumb(0xE7FE, 0),
-        ThumbInstr::UnconditionalBranch { offset: -4 }
+        ThumbInstr::UnconditionalBranch { offset: -2 }
     );
 }
 
 #[test]
 fn long_branch_with_link() {
-    // bl first=(hi=1), second=(lo=2): offset = (1 << 12) | (2 << 1).
+    // bl first=(hi=1), second=(lo=2): offset = (1 << 11) | 2.
     assert_eq!(
         decode_thumb(0xF001, 0xF802),
-        ThumbInstr::LongBranchWithLink { offset: 4100 }
+        ThumbInstr::LongBranchWithLink { offset: 2050 }
     );
     // Negative offset: hi has bit 10 set.
-    let first = 0xF400; // hi11 = 0x400 sets bit 22 of the pair.
+    let first = 0xF400; // hi11 = 0x400 sets bit 21 of the pair.
     let next = 0xF800;
     match decode_thumb(first, next) {
         ThumbInstr::LongBranchWithLink { offset } => assert!(offset < 0),

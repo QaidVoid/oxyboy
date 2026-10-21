@@ -44,16 +44,16 @@ fn standalone_bl_second_half_decodes_distinctly() {
     );
     assert_eq!(
         decode_thumb(0xF801, 0),
-        ThumbInstr::LongBranchWithLinkFromLr { offset: 2 }
+        ThumbInstr::LongBranchWithLinkFromLr { offset: 1 }
     );
     assert_eq!(
         decode_thumb(0xFFFE, 0),
-        ThumbInstr::LongBranchWithLinkFromLr { offset: -4 }
+        ThumbInstr::LongBranchWithLinkFromLr { offset: -2 }
     );
     // Any next halfword is consumed without affecting the decode.
     assert_eq!(
         decode_thumb(0xFFFF, 0x1234),
-        ThumbInstr::LongBranchWithLinkFromLr { offset: -2 }
+        ThumbInstr::LongBranchWithLinkFromLr { offset: -1 }
     );
 }
 
@@ -92,11 +92,11 @@ fn bl_pair_is_one_instruction() {
     // The pair decodes once; the second halfword is consumed.
     assert_eq!(
         decode_thumb(0xF001, 0xF802),
-        ThumbInstr::LongBranchWithLink { offset: 4100 }
+        ThumbInstr::LongBranchWithLink { offset: 2050 }
     );
     // The same second halfword alone is the standalone form instead.
     assert_eq!(
         decode_thumb(0xF802, 0xF001),
-        ThumbInstr::LongBranchWithLinkFromLr { offset: 4 }
+        ThumbInstr::LongBranchWithLinkFromLr { offset: 2 }
     );
 }
