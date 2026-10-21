@@ -851,3 +851,127 @@ fn halfword_sh_zero_overlap_resolves_to_swap_or_undefined() {
         }
     );
 }
+
+#[test]
+fn block_transfer_all_modes() {
+    // LDM/STM over every P/U/S/W/L combination.
+    for pre_index in [false, true] {
+        for up in [false, true] {
+            for psr in [false, true] {
+                for writeback in [false, true] {
+                    for load in [false, true] {
+                        let flags = u32::from(pre_index) << 24
+                            | u32::from(up) << 23
+                            | u32::from(psr) << 22
+                            | u32::from(writeback) << 21
+                            | u32::from(load) << 20;
+                        let word = 0xE000_0000 | 0x0800_0000 | flags | (0x7 << 16) | 0x0082; // {r1, r7}: includes the base R7
+                        match decode_arm(word) {
+                            ArmInstr::BlockTransfer {
+                                load: l,
+                                psr_and_force_user: s,
+                                writeback: w,
+                                up: u,
+                                pre_index: p,
+                                rn,
+                                registers,
+                            } => {
+                                assert_eq!(l, load);
+                                assert_eq!(s, psr);
+                                assert_eq!(w, writeback);
+                                assert_eq!(u, up);
+                                assert_eq!(p, pre_index);
+                                assert_eq!(rn, Register::R7);
+                                assert_eq!(registers, RegisterList::from_bits(0x0082));
+                            }
+                            other => panic!("{word:#010X} decoded as {other:?}"),
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn block_transfer_base_in_list_with_writeback_is_flagged() {
+    // ldmia r7!, {r1, r7}: base in list plus writeback.
+    let word = 0xE8B7_0082;
+    assert!(decode_arm(word).is_unpredictable());
+    // Without writeback the combination is not flagged.
+    assert!(!decode_arm(0xE897_0082).is_unpredictable());
+    // Base not in the list is fine even with writeback.
+    assert!(!decode_arm(0xE8B7_0002).is_unpredictable());
+}
+
+#[test]
+fn swap_all_forms() {
+    for (byte, word) in [(false, 0xE102_0091), (true, 0xE142_0091)] {
+        match decode_arm(word) {
+            ArmInstr::Swap {
+                byte: b,
+                rd,
+                rn,
+                rm,
+            } => {
+                assert_eq!(b, byte);
+                assert_eq!(rd, Register::R0);
+                assert_eq!(rn, Register::R2);
+                assert_eq!(rm, Register::R1);
+            }
+            other => panic!("{word:#010X} decoded as {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn bx_mask_fields_are_enforced() {
+    // bx r3 under a condition (bits 11..4 must be 11110001).
+    assert_eq!(
+        decode_arm(0x012F_FF13),
+        ArmInstr::BranchExchange { rn: Register::R3 }
+    );
+    // Same space but bits 11..4 != 11110001 falls through to data
+    // processing rather than decoding as BX.
+    assert!(matches!(
+        decode_arm(0x012F_FF20),
+        ArmInstr::DataProcessing { .. }
+    ));
+}
+
+#[test]
+fn psr_forms_and_swi_cover_s04_classes() {
+    // MRS/MSR immediate and register forms (both R settings).
+    assert!(matches!(
+        decode_arm(0xE10F_0000),
+        ArmInstr::PsrRead { spsr: false, .. }
+    ));
+    assert!(matches!(
+        decode_arm(0xE14F_0000),
+        ArmInstr::PsrRead { spsr: true, .. }
+    ));
+    assert!(matches!(
+        decode_arm(0xE129_F000),
+        ArmInstr::PsrWrite {
+            source: PsrSource::Register(_),
+            ..
+        }
+    ));
+    assert!(matches!(
+        decode_arm(0xE32F_F000),
+        ArmInstr::PsrWrite {
+            source: PsrSource::Immediate { .. },
+            ..
+        }
+    ));
+    // MUL/MLA/SWP/B/BL/SWI decode (fields asserted in dedicated tests).
+    assert!(matches!(decode_arm(0xE000_0291), ArmInstr::Multiply { .. }));
+    assert!(matches!(decode_arm(0xE020_3291), ArmInstr::Multiply { .. }));
+    assert!(matches!(decode_arm(0xE102_0091), ArmInstr::Swap { .. }));
+    assert!(matches!(decode_arm(0xEA00_0002), ArmInstr::Branch { .. }));
+    assert!(matches!(decode_arm(0xEB00_0002), ArmInstr::Branch { .. }));
+    assert!(matches!(
+        decode_arm(0xEF00_0000),
+        ArmInstr::SoftwareInterrupt { .. }
+    ));
+}

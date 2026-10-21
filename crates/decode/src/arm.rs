@@ -502,25 +502,38 @@ impl ArmInstr {
     ///   (GBATEK "Halfword, Doubleword, and Signed Data Transfer": bit
     ///   21 "Not used, must be zero" when P = 0; the T form exists only
     ///   in the word/byte transfer space).
+    /// - Block transfers with writeback and the base register in the
+    ///   register list (ARM ARM A4.1.5/A4.1.9 "Load and Store Multiple":
+    ///   the result is UNPREDICTABLE; GBATEK documents only the ARM7's
+    ///   de facto "Strange Effects on Invalid Rlists" behavior).
     #[must_use]
     pub fn is_unpredictable(&self) -> bool {
-        matches!(
-            self,
+        match self {
             ArmInstr::DataProcessing {
-                operand2: ShifterOperand::Register {
-                    shift: RegisterShift {
-                        amount: ShiftAmount::Register(Register::Pc),
+                operand2:
+                    ShifterOperand::Register {
+                        shift:
+                            RegisterShift {
+                                amount: ShiftAmount::Register(Register::Pc),
+                                ..
+                            },
                         ..
                     },
-                    ..
-                },
                 ..
-            } | ArmInstr::LoadStoreHalfwordSigned {
+            }
+            | ArmInstr::LoadStoreHalfwordSigned {
                 pre_index: false,
                 writeback: true,
                 ..
-            }
-        )
+            } => true,
+            ArmInstr::BlockTransfer {
+                writeback,
+                rn,
+                registers,
+                ..
+            } => *writeback && registers.contains(*rn),
+            _ => false,
+        }
     }
 }
 
