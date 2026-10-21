@@ -522,3 +522,192 @@ fn decode_is_total_and_preserves_encoding() {
         word = word.wrapping_mul(0x9E37_79B1).wrapping_add(0x3);
     }
 }
+
+#[test]
+fn every_opcode_with_every_operand_form() {
+    // Three shifter forms per opcode: immediate, register with immediate
+    // shift, register with register-specified shift.
+    let immediate = |code: u32| 0xE200_0000 | (code << 21);
+    let reg_imm_shift = |code: u32| 0xE000_0000 | (code << 21) | (0x202);
+    let reg_reg_shift = |code: u32| 0xE000_0000 | (code << 21) | 0x312;
+
+    for (code, op) in DATA_OPS {
+        for (word, form) in [
+            (immediate(code), "immediate"),
+            (reg_imm_shift(code), "register immediate shift"),
+            (reg_reg_shift(code), "register specified shift"),
+        ] {
+            match decode_arm(word) {
+                ArmInstr::DataProcessing { opcode, .. } => assert_eq!(opcode, op, "{form}"),
+                other => panic!("{word:#010X} ({form}) decoded as {other:?}"),
+            }
+        }
+    }
+}
+
+#[test]
+fn immediate_rotation_is_captured() {
+    // add r0, r1, #0xFF, ROR #16 -> rotate field 8.
+    match decode_arm(0xE281_08FF) {
+        ArmInstr::DataProcessing {
+            operand2: ShifterOperand::Immediate { rotate, value },
+            ..
+        } => {
+            assert_eq!(rotate, 8);
+            assert_eq!(value, 0xFF);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn register_shift_captures_each_type() {
+    // op2 = r2 shifted by r3; shift type varies over bits 6..5.
+    let word = |shift_type: u32| 0xE081_0002 | (0x300) | (shift_type << 5) | 0x10;
+    for (shift_type, kind) in [
+        (0b00, ShiftKind::Lsl),
+        (0b01, ShiftKind::Lsr),
+        (0b10, ShiftKind::Asr),
+        (0b11, ShiftKind::Ror),
+    ] {
+        match decode_arm(word(shift_type)) {
+            ArmInstr::DataProcessing {
+                operand2:
+                    ShifterOperand::Register {
+                        rm,
+                        shift:
+                            RegisterShift {
+                                kind: decoded,
+                                amount: ShiftAmount::Register(rs),
+                            },
+                    },
+                ..
+            } => {
+                assert_eq!(rm, Register::R2);
+                assert_eq!(decoded, kind);
+                assert_eq!(rs, Register::R3);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+}
+
+#[test]
+fn immediate_shift_captures_each_type() {
+    // op2 = r2 shifted by an immediate; shift type varies over bits 6..5.
+    let word = |shift_type: u32, amount: u32| 0xE081_0002 | (amount << 7) | (shift_type << 5);
+    for (shift_type, kind) in [
+        (0b00, ShiftKind::Lsl),
+        (0b01, ShiftKind::Lsr),
+        (0b10, ShiftKind::Asr),
+    ] {
+        match decode_arm(word(shift_type, 4)) {
+            ArmInstr::DataProcessing {
+                operand2:
+                    ShifterOperand::Register {
+                        shift:
+                            RegisterShift {
+                                kind: decoded,
+                                amount: ShiftAmount::Immediate(amount),
+                            },
+                        ..
+                    },
+                ..
+            } => {
+                assert_eq!(decoded, kind);
+                assert_eq!(amount, 4);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    // ROR with nonzero immediate decodes as Ror; ROR with zero immediate
+    // is RRX.
+    assert!(matches!(
+        decode_arm(word(0b11, 5)),
+        ArmInstr::DataProcessing {
+            operand2: ShifterOperand::Register {
+                shift: RegisterShift {
+                    kind: ShiftKind::Ror,
+                    ..
+                },
+                ..
+            },
+            ..
+        }
+    ));
+    assert!(matches!(
+        decode_arm(word(0b11, 0)),
+        ArmInstr::DataProcessing {
+            operand2: ShifterOperand::Register {
+                shift: RegisterShift {
+                    kind: ShiftKind::Rrx,
+                    ..
+                },
+                ..
+            },
+            ..
+        }
+    ));
+}
+
+#[test]
+fn s_bit_is_captured() {
+    // adds vs add: bit 20 only.
+    for (word, set_flags) in [(0xE081_0202u32, false), (0xE091_0202, true)] {
+        match decode_arm(word) {
+            ArmInstr::DataProcessing {
+                set_flags: flags, ..
+            } => {
+                assert_eq!(flags, set_flags);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+}
+
+#[test]
+fn r15_registers_are_recorded_as_pc() {
+    // add pc, pc, pc, lsl pc is legal to encode: Rn = Rd = Rm = R15 read
+    // as PC, and the shifter is unpredictable because the shift amount
+    // register is R15.
+    let word = 0xE08F_FF1F;
+    match decode_arm(word) {
+        ArmInstr::DataProcessing {
+            rd,
+            rn,
+            operand2:
+                ShifterOperand::Register {
+                    rm,
+                    shift:
+                        RegisterShift {
+                            amount: ShiftAmount::Register(rs),
+                            ..
+                        },
+                },
+            ..
+        } => {
+            assert_eq!(rd, Register::Pc);
+            assert_eq!(rn, Register::Pc);
+            assert_eq!(rm, Register::Pc);
+            assert_eq!(rs, Register::Pc);
+            assert!(decode_arm(word).is_unpredictable());
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn r15_as_shift_amount_is_flagged_but_r15_as_operand_is_not() {
+    // mov r0, pc, lsl r1: Rm = R15 is legal (reads PC + 8), shift amount
+    // register is R1.
+    let legal = 0xE1A0_011F;
+    assert!(!decode_arm(legal).is_unpredictable());
+
+    // mov r0, r1, lsl pc: shift amount register is R15, UNPREDICTABLE.
+    let unpredictable = 0xE1A0_0F11;
+    assert!(decode_arm(unpredictable).is_unpredictable());
+
+    // Unpredictability does not leak into unrelated variants.
+    assert!(!decode_arm(0xE591_0004).is_unpredictable());
+    assert!(!decode_arm(0xEA00_0002).is_unpredictable());
+}

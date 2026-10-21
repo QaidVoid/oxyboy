@@ -488,6 +488,32 @@ pub enum ArmInstr {
     },
 }
 
+impl ArmInstr {
+    /// True when the encoding is architecturally UNPREDICTABLE on the
+    /// ARM7TDMI.
+    ///
+    /// Currently this covers data processing with a register-specified
+    /// shift amount held in R15 (ARM ARM A4.1.3 "Data-processing
+    /// operands": the shift amount register Rs must not be R15; Rm = R15
+    /// is legal and reads the instruction address plus 8).
+    #[must_use]
+    pub fn is_unpredictable(&self) -> bool {
+        matches!(
+            self,
+            ArmInstr::DataProcessing {
+                operand2: ShifterOperand::Register {
+                    shift: RegisterShift {
+                        amount: ShiftAmount::Register(Register::Pc),
+                        ..
+                    },
+                    ..
+                },
+                ..
+            }
+        )
+    }
+}
+
 /// Data-processing opcode, bits 24..21 (GBATEK "Data Processing (ALU)").
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DataOp {
@@ -538,7 +564,7 @@ pub enum ShifterOperand {
     /// Register, optionally shifted. An unshifted register decodes as
     /// `LSL #0`, the encoding the assembler emits for a plain `Rm`.
     Register {
-        /// The operand register.
+        /// The operand register; R15 is legal and reads PC + 8.
         rm: Register,
         /// The shift applied to `rm`.
         shift: RegisterShift,
@@ -577,7 +603,9 @@ pub enum ShiftKind {
 pub enum ShiftAmount {
     /// Immediate amount, 0..31 (0 has per-kind special meanings).
     Immediate(u8),
-    /// Register-specified amount (bottom byte of the register).
+    /// Register-specified amount (bottom byte of the register). R15 here
+    /// is UNPREDICTABLE (ARM ARM A4.1.3); see
+    /// [`ArmInstr::is_unpredictable`].
     Register(Register),
 }
 
