@@ -26,6 +26,13 @@ mkdir -p "$out_dir"
 
 for src in "$src_dir"/*.s; do
     name=$(basename "${src%.s}")
+    # ROMs prefixed mb- are linked at the multiboot execution base so
+    # canonical addresses, pool literals, and the analysis base agree;
+    # everything else is a cart image linked at the cart base.
+    case "$name" in
+        mb-*) text_base=0x02000000 ;;
+        *)    text_base=0x08000000 ;;
+    esac
     elf="$out_dir/$name.elf"
     bin="$out_dir/$name.gba"
 
@@ -33,7 +40,7 @@ for src in "$src_dir"/*.s; do
     # Entry defaults to the .text start when -e cannot resolve; passing it
     # explicitly makes a misplaced .global fail the build instead of booting
     # from the wrong address.
-    arm-none-eabi-ld -Ttext=0x08000000 -e start -o "$elf" "$out_dir/$name.o"
+    arm-none-eabi-ld -Ttext="$text_base" -e start -o "$elf" "$out_dir/$name.o"
     arm-none-eabi-objcopy -O binary "$elf" "$bin"
     rm -f "$out_dir/$name.o" "$elf"
 

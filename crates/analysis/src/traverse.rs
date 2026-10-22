@@ -528,7 +528,14 @@ impl PathWalk<'_, '_> {
                         self.stop(addr, state, StopReason::Undefined);
                         return;
                     }
-                    self.mark(addr, 2, state, Flags::EXEC | Flags::WORD);
+                    // A BL pair is a single 4-byte instruction; mark both
+                    // halfwords or the emitter sees a truncated span.
+                    let size = if matches!(instr, ThumbInstr::LongBranchWithLink { .. }) {
+                        4
+                    } else {
+                        2
+                    };
+                    self.mark(addr, size, state, Flags::EXEC | Flags::WORD);
                     match instr {
                         ThumbInstr::ConditionalBranch { cond: _, offset } => {
                             let target = addr

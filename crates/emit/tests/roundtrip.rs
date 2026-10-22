@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use analysis::{FlagMap, Thresholds, analyze};
-use emit::emit;
+use emit::emit_with_warnings;
 use rom::Image;
 use testutil::testrom;
 
@@ -40,7 +40,10 @@ fn round_trip(name: &str) {
         "{name}: analysis marked no code; the harness would not exercise \
          emission"
     );
-    let asm = emit(&image, &map);
+    let (asm, warnings) = emit_with_warnings(&image, &map);
+    for warning in &warnings {
+        println!("  {} warning: {}", name, warning.message);
+    }
 
     let out_dir = emitted_dir();
     std::fs::create_dir_all(&out_dir).expect("create emitted dir");
@@ -66,6 +69,11 @@ fn mode3_round_trips_byte_identically() {
 #[test]
 fn thumbmix_round_trips_byte_identically() {
     round_trip("thumbmix");
+}
+
+#[test]
+fn mb_thumbptr_round_trips_byte_identically() {
+    round_trip("mb-thumbptr");
 }
 
 /// The binutils toolchain, when present.
