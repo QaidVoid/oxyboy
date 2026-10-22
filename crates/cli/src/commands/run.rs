@@ -1,10 +1,11 @@
 //! The `run` subcommand: execute a ROM in the GBA runtime.
 //!
-//! Headless mode runs a fixed number of frames and can dump the final
-//! frame as a PNG; this is the mode tests and scripting use. Without
-//! `--headless` a minifb window presents each rendered frame until the
-//! window closes or Escape is pressed (manual verification only; not
-//! test-gated).
+//! Images are validated through the `rom` loader first, then handed to
+//! the runtime. Headless mode runs a fixed number of frames and can dump
+//! the final frame as a PNG; this is the mode tests and scripting use.
+//! Without `--headless` a minifb window presents each rendered frame
+//! until the window closes or Escape is pressed (manual verification
+//! only; not test-gated).
 //!
 //! The machine boots directly at 0x08000000 with no BIOS reset, the
 //! documented boot decision. Standard crt0 places
@@ -14,6 +15,7 @@ use std::fs::File;
 use std::io::BufWriter;
 use std::path::Path;
 
+use rom::Image;
 use runtime::ppu::{VISIBLE_LINES, WIDTH};
 use runtime::system::System;
 
@@ -43,14 +45,14 @@ pub struct RunArgs {
 
 /// Runs `oxyboy run` and returns the process exit code.
 pub fn run(args: RunArgs) -> i32 {
-    let bytes = match std::fs::read(&args.rom.rom) {
-        Ok(bytes) => bytes,
+    let image = match Image::from_file(&args.rom.rom) {
+        Ok(image) => image,
         Err(e) => {
             eprintln!("oxyboy run: {}: {e}", args.rom.rom.display());
             return 1;
         }
     };
-    let mut system = System::new(bytes, CART_BASE);
+    let mut system = System::new(image.bytes().to_vec(), CART_BASE);
     if args.headless {
         for _ in 0..args.frames {
             system.step_frame();
