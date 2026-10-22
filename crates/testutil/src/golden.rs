@@ -67,3 +67,43 @@ pub fn assert_matches(path: impl AsRef<Path>, actual: &str) {
         );
     }
 }
+
+/// Asserts that `actual` matches the binary golden file at `path`.
+///
+/// Behaves like [`assert_matches`] for non-text output: with
+/// `OXYBOY_UPDATE_GOLDEN=1` the file is created or overwritten with
+/// `actual`; otherwise the file is read and compared byte for byte.
+///
+/// # Panics
+///
+/// Panics when the golden file cannot be read, does not exist, or its
+/// bytes differ from `actual`.
+pub fn assert_bytes_matches(path: impl AsRef<Path>, actual: &[u8]) {
+    let path = path.as_ref();
+    if update_golden() {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap_or_else(|e| {
+                panic!("failed to create golden dir {}: {e}", parent.display())
+            });
+        }
+        fs::write(path, actual)
+            .unwrap_or_else(|e| panic!("failed to write golden file {}: {e}", path.display()));
+        return;
+    }
+    let expected = fs::read(path).unwrap_or_else(|e| {
+        panic!(
+            "failed to read golden file {}: {e}\nRun with OXYBOY_UPDATE_GOLDEN=1 to create it",
+            path.display()
+        )
+    });
+    if expected != actual {
+        panic!(
+            "golden mismatch in {}: expected {} bytes, got {} bytes \
+             (files differ)\n\
+             Run with OXYBOY_UPDATE_GOLDEN=1 to regenerate",
+            path.display(),
+            expected.len(),
+            actual.len()
+        );
+    }
+}

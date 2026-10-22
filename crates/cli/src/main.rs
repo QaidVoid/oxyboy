@@ -34,7 +34,7 @@ enum Command {
     /// Statically recompile a ROM to host code.
     Recomp(RomArgs),
     /// Execute a ROM in the GBA runtime.
-    Run(RomArgs),
+    Run(commands::run::RunArgs),
 }
 
 /// Arguments shared by every subcommand.
@@ -57,7 +57,7 @@ fn main() {
         Command::Analyze(_) => not_implemented("analyze"),
         Command::Lift(_) => not_implemented("lift"),
         Command::Recomp(_) => not_implemented("recomp"),
-        Command::Run(_) => not_implemented("run"),
+        Command::Run(args) => commands::run::run(args),
     };
     std::process::exit(code);
 }
