@@ -16,6 +16,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use analysis::config::sanitize_identifier;
 use analysis::{Canonical, Config, FlagMap, Flags};
 use decode::{ArmInstr, Condition, ThumbInstr, arm_text, decode_arm, decode_thumb, thumb_text};
 use rom::Image;
@@ -54,6 +55,10 @@ pub enum Fallback {
     /// code that carries no label; the literal is kept because a
     /// symbolic reference would not be provably safe.
     WordReferenceNotProvable,
+    /// A config name was not a valid assembler identifier and was
+    /// rewritten (e.g. `my-func` to `my_func`); the config keeps the
+    /// original spelling.
+    NameSanitized,
 }
 
 impl Fallback {
@@ -66,7 +71,45 @@ impl Fallback {
             Self::MisalignedThumbFunction => "misaligned-thumb-function",
             Self::UnpredictableEncoding => "unpredictable-encoding",
             Self::WordReferenceNotProvable => "word-reference-not-provable",
+            Self::NameSanitized => "name-sanitized",
         }
+    }
+}
+
+/// Applies config names over the generated label map: a named config
+/// function renames (or creates) the label at its canonical address.
+/// Names that are not valid assembler identifiers are sanitized, with a
+/// [`Fallback::NameSanitized`] warning per changed name.
+fn apply_config_names(
+    labels: &mut BTreeMap<u32, String>,
+    config: &Config,
+    canon: Canonical,
+    image_len: usize,
+    warnings: &mut Vec<Warning>,
+) {
+    let end = canon.base() + image_len as u32;
+    for function in &config.functions {
+        let Some(raw) = function.name.as_deref() else {
+            continue;
+        };
+        let Some(addr) = canon.canonicalize(function.addr) else {
+            continue;
+        };
+        if addr < canon.base() || addr >= end {
+            continue;
+        }
+        let name = sanitize_identifier(raw);
+        if name != raw {
+            warnings.push(Warning {
+                addr,
+                fallback: Fallback::NameSanitized,
+                message: format!(
+                    "name-sanitized at 0x{addr:08x}: '{raw}' is not a valid \
+                     assembler identifier; using '{name}'"
+                ),
+            });
+        }
+        labels.insert(addr, name);
     }
 }
 
@@ -77,7 +120,9 @@ impl Fallback {
 /// assembler dialect, and everything else is emitted as data. Labels:
 /// `sub_XXXXXXXX` at FUNC_START bytes, `loc_XXXXXXXX` at branch targets
 /// that land on executed code, `_*XXXXXXXX` at referenced data
-/// (literal pools).
+/// (literal pools). Named config functions rename or create the label
+/// at their address; names that are not valid assembler identifiers
+/// are sanitized, with a [`Fallback::NameSanitized`] warning.
 ///
 /// Whenever rendering an address faithfully would depend on analysis
 /// being right, the emitter falls back to a form that cannot break the
@@ -85,12 +130,13 @@ impl Fallback {
 /// symbolic reference) and records a [`Warning`] naming the address;
 /// the same warnings appear as `@ WARNING:` comments in the assembly.
 #[must_use]
-pub fn emit_with_warnings(image: &Image, map: &FlagMap) -> (String, Vec<Warning>) {
+pub fn emit_with_warnings(image: &Image, map: &FlagMap, config: &Config) -> (String, Vec<Warning>) {
     let bytes = image.bytes();
     let canon = map.canonical();
     let flags = flag_bytes(map, bytes.len());
-    let labels = collect_labels(bytes, &flags, canon.base());
+    let mut labels = collect_labels(bytes, &flags, canon.base());
     let mut warnings = Vec::new();
+    apply_config_names(&mut labels, config, canon, bytes.len(), &mut warnings);
     let mut refs = BTreeSet::new();
     let mut ctx = Ctx {
         bytes,
@@ -110,8 +156,8 @@ pub fn emit_with_warnings(image: &Image, map: &FlagMap) -> (String, Vec<Warning>
 /// Emits assembly, dropping the fallback warnings; see
 /// [`emit_with_warnings`].
 #[must_use]
-pub fn emit(image: &Image, map: &FlagMap) -> String {
-    emit_with_warnings(image, map).0
+pub fn emit(image: &Image, map: &FlagMap, config: &Config) -> String {
+    emit_with_warnings(image, map, config).0
 }
 
 /// Shared state for one emission pass over a byte range.
@@ -269,12 +315,18 @@ pub struct ModuleEmission {
 /// misplacing bytes. Disjoint spans of one stem share the file under
 /// differently numbered sections.
 #[must_use]
-pub fn emit_modules(image: &Image, map: &FlagMap, plan: &ModulePlan) -> ModuleEmission {
+pub fn emit_modules(
+    image: &Image,
+    map: &FlagMap,
+    plan: &ModulePlan,
+    config: &Config,
+) -> ModuleEmission {
     let bytes = image.bytes();
     let canon = map.canonical();
     let flags = flag_bytes(map, bytes.len());
-    let labels = collect_labels(bytes, &flags, canon.base());
+    let mut labels = collect_labels(bytes, &flags, canon.base());
     let mut warnings = Vec::new();
+    apply_config_names(&mut labels, config, canon, bytes.len(), &mut warnings);
     let end = canon.base() + bytes.len() as u32;
 
     // One section per span; a stem with disjoint spans gets numbered
@@ -832,14 +884,14 @@ mod tests {
     #[test]
     fn prelude_precedes_output() {
         let (image, map) = fixture();
-        let asm = emit(&image, &map);
+        let asm = emit(&image, &map, &Config::default());
         assert!(asm.starts_with(".syntax unified\n.cpu arm7tdmi\n.section .text, \"ax\"\n.arm\n"));
     }
 
     #[test]
     fn labels_functions_internal_branches_and_pools() {
         let (image, map) = fixture();
-        let asm = emit(&image, &map);
+        let asm = emit(&image, &map, &Config::default());
         let base = map.canonical().base();
         assert!(asm.contains(&format!("sub_{base:08x}:\n")));
         assert!(asm.contains(&format!("b loc_{:08x}\n", base + 0xC0)));
@@ -850,7 +902,7 @@ mod tests {
     #[test]
     fn instructions_never_bleed_into_byte_runs() {
         let (image, map) = fixture();
-        let asm = emit(&image, &map);
+        let asm = emit(&image, &map, &Config::default());
         for line in asm.lines() {
             if line.starts_with(".byte") {
                 assert!(
@@ -872,7 +924,7 @@ mod tests {
     #[test]
     fn data_runs_stop_at_every_boundary_kind() {
         let (image, map) = fixture();
-        let asm = emit(&image, &map);
+        let asm = emit(&image, &map, &Config::default());
         let lines: Vec<&str> = asm.lines().collect();
         let after_branch = lines
             .iter()
@@ -899,7 +951,7 @@ mod tests {
         let (image, mut map) = fixture();
         let base = map.canonical().base();
         map.mark_range(base + 0xC8, base + 0xD6, Flags::EXEC | Flags::THUMB);
-        let asm = emit(&image, &map);
+        let asm = emit(&image, &map, &Config::default());
         let thumb_at = asm.find(".thumb\n").expect("thumb dialect emitted");
         let code = &asm[thumb_at..];
         assert!(
@@ -917,7 +969,7 @@ mod tests {
         let (image, mut map) = fixture();
         let base = map.canonical().base();
         clear(&mut map, base, 0xC0, 0xC8);
-        let (asm, warnings) = emit_with_warnings(&image, &map);
+        let (asm, warnings) = emit_with_warnings(&image, &map, &Config::default());
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert_eq!(warnings[0].fallback, Fallback::BranchWithoutLabel);
         assert_eq!(warnings[0].addr, base);
@@ -937,7 +989,7 @@ mod tests {
         let (image, mut map) = fixture();
         let base = map.canonical().base();
         clear(&mut map, base, 0xC2, 0xC4);
-        let (asm, warnings) = emit_with_warnings(&image, &map);
+        let (asm, warnings) = emit_with_warnings(&image, &map, &Config::default());
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert_eq!(warnings[0].fallback, Fallback::InstructionOverlapsLabel);
         assert_eq!(warnings[0].addr, base + 0xC0);
@@ -953,7 +1005,7 @@ mod tests {
         // marks, and OR-ing would leave EXEC|WORD|LITERAL instead.
         map.set(base + 0xC2, Flags::WORD | Flags::LITERAL);
         map.set(base + 0xC3, Flags::WORD | Flags::LITERAL);
-        let (asm, warnings) = emit_with_warnings(&image, &map);
+        let (asm, warnings) = emit_with_warnings(&image, &map, &Config::default());
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert_eq!(warnings[0].fallback, Fallback::InstructionOverlapsLabel);
         assert_eq!(warnings[0].addr, base + 0xC0);
@@ -971,7 +1023,7 @@ mod tests {
         let base = map.canonical().base();
         let len = image.bytes().len() as u32;
         map.mark_range(base + len - 2, base + len, Flags::EXEC | Flags::WORD);
-        let (asm, warnings) = emit_with_warnings(&image, &map);
+        let (asm, warnings) = emit_with_warnings(&image, &map, &Config::default());
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert_eq!(warnings[0].fallback, Fallback::InstructionOverlapsLabel);
         assert_eq!(warnings[0].addr, base + len - 2);
@@ -984,7 +1036,7 @@ mod tests {
         let base = map.canonical().base();
         map.mark_range(base + 0xC8, base + 0xD6, Flags::EXEC | Flags::THUMB);
         map.mark(base + 0xC9, Flags::FUNC_START);
-        let (asm, warnings) = emit_with_warnings(&image, &map);
+        let (asm, warnings) = emit_with_warnings(&image, &map, &Config::default());
         assert!(
             warnings.iter().any(
                 |warning| warning.fallback == Fallback::MisalignedThumbFunction
@@ -1013,7 +1065,7 @@ mod tests {
         let base = map.canonical().base();
         map.mark_range(base + 0xC8, base + 0xD6, Flags::EXEC | Flags::THUMB);
         map.mark(base + 0xC8, Flags::FUNC_START);
-        let (asm, warnings) = emit_with_warnings(&image, &map);
+        let (asm, warnings) = emit_with_warnings(&image, &map, &Config::default());
         assert!(warnings.is_empty(), "{warnings:?}");
         assert!(
             asm.contains(&format!(".word sub_{:08x}+1\n", base + 0xC8)),
@@ -1027,7 +1079,7 @@ mod tests {
         let mut map = map;
         let base = map.canonical().base();
         map.mark_range(base + 0xC8, base + 0xD6, Flags::EXEC | Flags::THUMB);
-        let (asm, warnings) = emit_with_warnings(&image, &map);
+        let (asm, warnings) = emit_with_warnings(&image, &map, &Config::default());
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert_eq!(warnings[0].fallback, Fallback::WordReferenceNotProvable);
         assert_eq!(warnings[0].addr, base + 0xD8);
@@ -1037,7 +1089,7 @@ mod tests {
     #[test]
     fn word_reference_stays_literal_when_target_is_offbase() {
         let (image, map) = fixture();
-        let (asm, warnings) = emit_with_warnings(&image, &map);
+        let (asm, warnings) = emit_with_warnings(&image, &map, &Config::default());
         assert!(warnings.is_empty(), "{warnings:?}");
         assert!(asm.contains(".word 0x080000C9\n"), "{asm}");
     }
@@ -1053,7 +1105,7 @@ mod tests {
         let base = map.canonical().base();
         map.mark_range(base, base + 4, Flags::EXEC | Flags::WORD);
         map.mark_range(base + 0xC8, base + 0xCC, Flags::EXEC | Flags::THUMB);
-        let (asm, warnings) = emit_with_warnings(&image, &map);
+        let (asm, warnings) = emit_with_warnings(&image, &map, &Config::default());
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert_eq!(warnings[0].fallback, Fallback::BranchWithoutLabel);
         assert_eq!(warnings[0].addr, base + 0xC8);
@@ -1066,7 +1118,7 @@ mod tests {
         let (image, mut map) = fixture();
         let base = map.canonical().base();
         clear(&mut map, base, 0xC2, 0xC4);
-        let (asm, warnings) = emit_with_warnings(&image, &map);
+        let (asm, warnings) = emit_with_warnings(&image, &map, &Config::default());
         assert_eq!(warnings.len(), 1);
         assert!(
             asm.contains(&format!("@ WARNING: {}\n", warnings[0].message)),
@@ -1134,7 +1186,7 @@ mod tests {
             tables: Vec::new(),
         };
         let plan = ModulePlan::from_config(&config, &image);
-        let emission = emit_modules(&image, &map, &plan);
+        let emission = emit_modules(&image, &map, &plan, &config);
         assert_eq!(emission.files.len(), 2);
         let default_file = &emission.files["default"];
         let code_file = &emission.files["code"];
@@ -1172,11 +1224,89 @@ mod tests {
             tables: Vec::new(),
         };
         let plan = ModulePlan::from_config(&config, &image);
-        let emission = emit_modules(&image, &map, &plan);
+        let emission = emit_modules(&image, &map, &plan, &config);
         for (stem, file) in &emission.files {
             assert!(!file.contains(".global"), "{stem}: {file}");
         }
         // The pool label and word stay inside the code module.
         assert!(emission.files["code"].contains(".word 0x080000C9\n"));
+    }
+
+    #[test]
+    fn config_names_override_generated_labels() {
+        let (image, map) = fixture();
+        let base = map.canonical().base();
+        let config = Config {
+            functions: vec![FunctionSpec {
+                name: Some("entry_loop".to_string()),
+                ..FunctionSpec::bare(base, State::Arm)
+            }],
+            tables: Vec::new(),
+        };
+        let asm = emit(&image, &map, &config);
+        assert!(asm.contains("entry_loop:\n"), "{asm}");
+        assert!(!asm.contains("sub_{base:08x}"), "{asm}");
+    }
+
+    #[test]
+    fn config_names_create_labels_on_data() {
+        let (image, map) = fixture();
+        let base = map.canonical().base();
+        // 0x30 is unmarked filler; the name alone must place a label.
+        let config = Config {
+            functions: vec![FunctionSpec {
+                name: Some("blob".to_string()),
+                ..FunctionSpec::bare(base + 0x30, State::Arm)
+            }],
+            tables: Vec::new(),
+        };
+        let asm = emit(&image, &map, &config);
+        assert!(asm.contains("blob:\n"), "{asm}");
+    }
+
+    #[test]
+    fn illegal_names_are_sanitized_with_a_warning() {
+        let (image, map) = fixture();
+        let base = map.canonical().base();
+        let config = Config {
+            functions: vec![FunctionSpec {
+                name: Some("9my-func".to_string()),
+                ..FunctionSpec::bare(base, State::Arm)
+            }],
+            tables: Vec::new(),
+        };
+        let (asm, warnings) = emit_with_warnings(&image, &map, &config);
+        assert!(asm.contains("_9my_func:\n"), "{asm}");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert_eq!(warnings[0].fallback, Fallback::NameSanitized);
+        assert_eq!(warnings[0].addr, base);
+        assert!(warnings[0].message.contains("_9my_func"), "{warnings:?}");
+    }
+
+    #[test]
+    fn modules_use_sanitized_config_names() {
+        let (image, map) = fixture();
+        let base = map.canonical().base();
+        let mut function = claimed(base + 0xC0, "code");
+        function.name = Some("my-func".to_string());
+        let config = Config {
+            functions: vec![function],
+            tables: Vec::new(),
+        };
+        let plan = ModulePlan::from_config(&config, &image);
+        let emission = emit_modules(&image, &map, &plan, &config);
+        assert!(
+            emission.files["code"].contains(".global my_func\n"),
+            "{:#?}",
+            emission.files
+        );
+        assert!(
+            emission
+                .warnings
+                .iter()
+                .any(|warning| warning.fallback == Fallback::NameSanitized),
+            "{:?}",
+            emission.warnings
+        );
     }
 }

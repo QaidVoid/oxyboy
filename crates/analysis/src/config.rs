@@ -239,18 +239,10 @@ fn parse_function(tokens: &[&str], line: usize) -> Result<FunctionSpec, ConfigEr
         text: (*addr_token).to_string(),
     })?;
     cursor += 1;
-    let name = match tokens.get(cursor) {
-        None => None,
-        Some(name) => {
-            if !is_identifier(name) {
-                return Err(ConfigError::Name {
-                    line,
-                    text: (*name).to_string(),
-                });
-            }
-            Some((*name).to_string())
-        }
-    };
+    // Any whitespace-free token is accepted as a name here; characters
+    // illegal in assembler identifiers are sanitized when the name is
+    // applied to emitted labels, with a warning.
+    let name = tokens.get(cursor).map(|name| (*name).to_string());
     if tokens.len() > cursor + 1 {
         return Err(ConfigError::Syntax { line });
     }
@@ -279,6 +271,29 @@ fn is_identifier(token: &str) -> bool {
         _ => return false,
     }
     chars.all(|rest| rest.is_ascii_alphanumeric() || rest == '_')
+}
+
+/// Rewrites `raw` into a valid assembler identifier: every character
+/// outside `[A-Za-z0-9_]` becomes `_`, and a leading digit gains a `_`
+/// prefix. The result is never empty.
+#[must_use]
+pub fn sanitize_identifier(raw: &str) -> String {
+    let mut out: String = raw
+        .chars()
+        .map(|c| if is_identifier_char(c) { c } else { '_' })
+        .collect();
+    if out.starts_with(|c: char| c.is_ascii_digit()) {
+        out.insert(0, '_');
+    }
+    if out.is_empty() {
+        out.push('_');
+    }
+    out
+}
+
+/// Whether `c` may appear in an assembler identifier.
+fn is_identifier_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
 }
 
 impl fmt::Display for Config {

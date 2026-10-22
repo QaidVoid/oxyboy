@@ -12,7 +12,7 @@ use std::process::Command;
 
 use analysis::config::Config;
 use analysis::{FlagMap, FunctionSpec, Thresholds, analyze};
-use emit::{ModulePlan, emit_modules, emit_with_warnings};
+use emit::{Fallback, ModulePlan, emit_modules, emit_with_warnings};
 use rom::Image;
 use testutil::testrom;
 
@@ -41,7 +41,7 @@ fn round_trip(name: &str) {
         "{name}: analysis marked no code; the harness would not exercise \
          emission"
     );
-    let (asm, warnings) = emit_with_warnings(&image, &map);
+    let (asm, warnings) = emit_with_warnings(&image, &map, &Config::default());
     for warning in &warnings {
         println!("  {} warning: {}", name, warning.message);
     }
@@ -85,22 +85,25 @@ struct Tools {
 }
 
 /// The module split each corpus ROM round-trips with: everything from
-/// the claimed address on lands in a second module.
-const MODULE_SPLITS: &[(&str, &str)] = &[
-    ("mode3", "split.s thumb 0x020000C0\n"),
-    ("mb-thumbptr", "split.s thumb 0x020000E4\n"),
+/// the claimed address on lands in a second module, and the mb-thumbptr
+/// claim carries a name that must be sanitized on the way out.
+const MODULE_SPLITS: &[(&str, &str, bool)] = &[
+    ("mode3", "split.s thumb 0x020000C0\n", false),
+    ("mb-thumbptr", "split.s thumb 0x020000E4 my-fn\n", true),
 ];
 
 #[test]
 fn multi_module_round_trips_byte_identically() {
-    for &(name, config_text) in MODULE_SPLITS {
-        module_round_trip(name, config_text);
+    for &(name, config_text, sanitized) in MODULE_SPLITS {
+        module_round_trip(name, config_text, sanitized);
     }
 }
 
 /// Splits one corpus ROM into modules, then rebuilds it from the
-/// separate objects and requires byte equality.
-fn module_round_trip(name: &str, config_text: &str) {
+/// separate objects and requires byte equality. When `sanitized` is
+/// set, the config name is not a valid assembler identifier and the
+/// emission must report the rewrite.
+fn module_round_trip(name: &str, config_text: &str, sanitized: bool) {
     let Some(rom_path) = testrom::require(name) else {
         return;
     };
@@ -131,7 +134,19 @@ fn module_round_trip(name: &str, config_text: &str) {
         &config.tables,
     );
     let plan = ModulePlan::from_config(&config, &image);
-    let emission = emit_modules(&image, &map, &plan);
+    let emission = emit_modules(&image, &map, &plan, &config);
+    assert_eq!(
+        emission
+            .warnings
+            .iter()
+            .any(|w| w.fallback == Fallback::NameSanitized),
+        sanitized,
+        "{name}: sanitization warnings mismatch"
+    );
+    if sanitized {
+        let split = &emission.files["split"];
+        assert!(split.contains("my_fn:"), "{split}");
+    }
     for warning in &emission.warnings {
         println!("  {name} warning: {}", warning.message);
     }
@@ -203,7 +218,7 @@ fn missing_global_fails_the_link() {
         &config.tables,
     );
     let plan = ModulePlan::from_config(&config, &image);
-    let emission = emit_modules(&image, &map, &plan);
+    let emission = emit_modules(&image, &map, &plan, &config);
 
     let out_dir = emitted_dir().join("mode3-noglobal");
     std::fs::create_dir_all(&out_dir).expect("create module dir");

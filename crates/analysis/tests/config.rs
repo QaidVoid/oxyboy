@@ -106,12 +106,14 @@ fn invalid_lines_produce_typed_errors() {
             other => panic!("expected address error for {case:?}, got {other:?}"),
         }
     }
-    for case in ["arm_func 0x08000000 9bad", ".s 0x08000000"] {
-        match Config::parse(&format!("{case}\n")) {
-            Err(ConfigError::Name { line: 1, .. }) => {}
-            other => panic!("expected name error for {case:?}, got {other:?}"),
-        }
+    match Config::parse(".s 0x08000000\n") {
+        Err(ConfigError::Name { line: 1, .. }) => {}
+        other => panic!("expected name error, got {other:?}"),
     }
+    // A function name may be any whitespace-free token; assembler
+    // identifier rules are applied later, at emission, with a warning.
+    let loose = Config::parse("arm_func 0x08000000 9bad-name\n").expect("loose name parses");
+    assert_eq!(loose.functions[0].name.as_deref(), Some("9bad-name"));
     // Line numbers survive leading blank and comment lines.
     match Config::parse("# comment\n\nnope\n") {
         Err(ConfigError::Syntax { line: 3 }) => {}
@@ -149,4 +151,26 @@ fn load_and_save_round_trip_through_a_file() {
     let loaded = Config::load(&path).expect("load");
     assert_eq!(loaded, config);
     std::fs::remove_file(&path).expect("cleanup");
+}
+
+#[test]
+fn sanitize_identifier_rewrites_illegal_characters() {
+    use analysis::config::sanitize_identifier;
+    assert_eq!(sanitize_identifier("my-func"), "my_func");
+    assert_eq!(sanitize_identifier("9bad"), "_9bad");
+    assert_eq!(sanitize_identifier("we ird"), "we_ird");
+    assert_eq!(sanitize_identifier("dot.name"), "dot_name");
+    assert_eq!(sanitize_identifier("_ok2"), "_ok2");
+    assert_eq!(sanitize_identifier(""), "_");
+}
+
+#[test]
+fn names_and_modules_survive_the_config_round_trip() {
+    let config =
+        Config::parse("split.s thumb 0x020000e4 my-func\narm_func 0x08000000 x\n").expect("parse");
+    let text = config.to_string();
+    let reloaded = Config::parse(&text).expect("reparse");
+    assert_eq!(reloaded, config);
+    assert_eq!(reloaded.functions[0].name.as_deref(), Some("my-func"));
+    assert_eq!(reloaded.functions[0].module.as_deref(), Some("split"));
 }

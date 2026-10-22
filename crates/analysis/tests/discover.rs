@@ -136,7 +136,16 @@ fn config_out_reload_produces_no_new_discoveries() {
         functions: first
             .functions
             .iter()
-            .map(|f| FunctionSpec::bare(f.addr, f.state))
+            .enumerate()
+            .map(|(index, f)| FunctionSpec {
+                addr: f.addr,
+                state: f.state,
+                // Names and modules ride along: config-out writes
+                // them, and the reload must converge on the same
+                // discovery result regardless.
+                name: Some(format!("fn_{index}")),
+                module: Some("out".to_string()),
+            })
             .collect(),
         tables: Vec::new(),
     };
