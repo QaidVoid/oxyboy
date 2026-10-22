@@ -78,6 +78,44 @@ pub struct SwiCall {
     pub number: u8,
 }
 
+/// One detected copy of code into EWRAM: a call matching the
+/// CpuSet/CpuFastSet register convention (r0 source, r1 destination in
+/// EWRAM, r2 control word, GBATEK "BIOS Memory Copy") followed by a BX
+/// into the copied region. A "dynamically copied code" note consumed
+/// by the hybrid fallback.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CopyHint {
+    /// Canonical address of the jump that entered the copied region.
+    pub site: u32,
+    /// Proven source address passed to the copy call.
+    pub source: u32,
+    /// Proven EWRAM destination of the copy.
+    pub dest: u32,
+    /// Copy size in bytes (control word count times 4).
+    pub bytes: u32,
+}
+
+/// EWRAM, where multiboot images execute and cart code is copied to
+/// (GBATEK "GBA Memory Map").
+const EWRAM: std::ops::Range<u32> = 0x0200_0000..0x0204_0000;
+
+/// Call arguments of an in-flight CpuSet/CpuFastSet, carried on the
+/// fallthrough path after the call until a BX consumes them.
+#[derive(Clone, Copy, Debug)]
+struct CopyArgs {
+    source: u32,
+    dest: u32,
+    words: u32,
+}
+
+/// One path waiting to be walked.
+struct Path {
+    addr: u32,
+    state: State,
+    regs: [Option<u32>; 16],
+    pending: Option<CopyArgs>,
+}
+
 /// Result of a full traversal.
 #[derive(Debug, Default)]
 pub struct Traversal {
@@ -89,6 +127,8 @@ pub struct Traversal {
     /// but never terminal: the BIOS routine returns to the instruction
     /// after the SWI (GBATEK "How BIOS Processes SWIs").
     pub swi_calls: Vec<SwiCall>,
+    /// Every detected copy-then-jump into EWRAM, in discovery order.
+    pub copy_hints: Vec<CopyHint>,
 }
 
 /// Controls what a [`walk`] treats as a path boundary and whether it
@@ -132,12 +172,17 @@ pub fn walk(image: &Image, map: &mut FlagMap, seeds: &[Seed], options: WalkOptio
     let canon = map.canonical();
     let mut out = Traversal::default();
     let mut visited = HashSet::new();
-    let mut work: Vec<(u32, State, [Option<u32>; 16])> = seeds
+    let mut work: Vec<Path> = seeds
         .iter()
-        .map(|seed| (seed.addr, seed.state, [None; 16]))
+        .map(|seed| Path {
+            addr: seed.addr,
+            state: seed.state,
+            regs: [None; 16],
+            pending: None,
+        })
         .collect();
-    while let Some((addr, state, regs)) = work.pop() {
-        let mut path = PathWalk {
+    while let Some(path) = work.pop() {
+        let mut walk = PathWalk {
             bytes,
             canon,
             map,
@@ -145,8 +190,9 @@ pub fn walk(image: &Image, map: &mut FlagMap, seeds: &[Seed], options: WalkOptio
             visited: &mut visited,
             work: &mut work,
             out: &mut out,
+            pending: path.pending,
         };
-        path.visit(addr, state, regs);
+        walk.visit(path.addr, path.state, path.regs);
     }
     out
 }
@@ -158,11 +204,49 @@ struct PathWalk<'a, 'm> {
     map: &'m mut FlagMap,
     options: WalkOptions,
     visited: &'a mut HashSet<(u32, State)>,
-    work: &'a mut Vec<(u32, State, [Option<u32>; 16])>,
+    work: &'a mut Vec<Path>,
     out: &'a mut Traversal,
+    /// Copy arguments of an in-flight CpuSet/CpuFastSet call, if the
+    /// path just returned from one.
+    pending: Option<CopyArgs>,
 }
 
 impl PathWalk<'_, '_> {
+    /// Call arguments for a copy hint when `r0..r2` match the
+    /// CpuSet/CpuFastSet convention with an EWRAM destination.
+    fn copy_args(&self, regs: &[Option<u32>; 16]) -> Option<CopyArgs> {
+        let (Some(source), Some(dest), Some(control)) = (regs[0], regs[1], regs[2]) else {
+            return None;
+        };
+        if !EWRAM.contains(&dest) || control == 0 {
+            return None;
+        }
+        Some(CopyArgs {
+            source,
+            dest,
+            // Control bits 0..20 hold the word count; bit 24 selects the
+            // transfer width (GBATEK "BIOS Memory Copy").
+            words: control & 0x001F_FFFF,
+        })
+    }
+
+    /// Records a copy hint when this jump enters the region an
+    /// in-flight copy call would have filled.
+    fn enter_copied_region(&mut self, site: u32, target: u32) {
+        if let Some(copy) = self.pending.take()
+            && EWRAM.contains(&target)
+            && target >= copy.dest
+            && target < copy.dest + copy.words * 4
+        {
+            self.out.copy_hints.push(CopyHint {
+                site,
+                source: copy.source,
+                dest: copy.dest,
+                bytes: copy.words * 4,
+            });
+        }
+    }
+
     /// Reads `size` bytes at a GBA address.
     fn read(&self, addr: u32, size: usize) -> Option<u32> {
         let offset = self.canon.offset(addr)?;
@@ -178,10 +262,23 @@ impl PathWalk<'_, '_> {
         self.read(addr, 4)
     }
 
-    /// Enqueues a path continuation if it has not been visited.
-    fn fork(&mut self, addr: u32, state: State, regs: [Option<u32>; 16]) {
+    /// Enqueues a path continuation if it has not been visited. The
+    /// fork inherits the copy arguments: they belong to the caller's
+    /// argument registers, which survive a call return.
+    fn fork(
+        &mut self,
+        addr: u32,
+        state: State,
+        regs: [Option<u32>; 16],
+        pending: Option<CopyArgs>,
+    ) {
         if self.visited.insert((addr, state)) {
-            self.work.push((addr, state, regs));
+            self.work.push(Path {
+                addr,
+                state,
+                regs,
+                pending,
+            });
         }
     }
 
@@ -245,11 +342,14 @@ impl PathWalk<'_, '_> {
                                     state,
                                     target,
                                 });
-                                self.fork(addr.wrapping_add(4), state, regs);
+                                let args = self.copy_args(&regs);
+                                self.fork(addr.wrapping_add(4), state, regs, args);
                             } else if cond != Some(Condition::Al) {
-                                self.fork(addr.wrapping_add(4), state, regs);
+                                let pending = self.pending;
+                                self.fork(addr.wrapping_add(4), state, regs, pending);
                             }
                             regs = [None; 16];
+                            self.pending = None;
                             if !self.jump(target, state) {
                                 return;
                             }
@@ -267,7 +367,9 @@ impl PathWalk<'_, '_> {
                                     } else {
                                         State::Arm
                                     };
+                                    self.enter_copied_region(addr, value & !1);
                                     regs = [None; 16];
+                                    self.pending = None;
                                     if !self.jump(value & !1, state) {
                                         return;
                                     }
@@ -304,6 +406,7 @@ impl PathWalk<'_, '_> {
                             ..
                         } => {
                             regs = [None; 16];
+                            self.pending = None;
                             let target = u32::from(value).rotate_right(u32::from(rotate) * 2);
                             if !self.jump(target, state) {
                                 return;
@@ -336,6 +439,7 @@ impl PathWalk<'_, '_> {
                             match regs[rm.bits() as usize] {
                                 Some(value) => {
                                     regs = [None; 16];
+                                    self.pending = None;
                                     let target = value & !3;
                                     if !self.jump(target, state) {
                                         return;
@@ -423,8 +527,10 @@ impl PathWalk<'_, '_> {
                             let target = addr
                                 .wrapping_add(4)
                                 .wrapping_add((i32::from(offset) * 2) as u32);
-                            self.fork(addr.wrapping_add(2), state, regs);
+                            let pending = self.pending;
+                            self.fork(addr.wrapping_add(2), state, regs, pending);
                             regs = [None; 16];
+                            self.pending = None;
                             if !self.jump(target, state) {
                                 return;
                             }
@@ -435,6 +541,7 @@ impl PathWalk<'_, '_> {
                                 .wrapping_add(4)
                                 .wrapping_add((i32::from(offset) * 2) as u32);
                             regs = [None; 16];
+                            self.pending = None;
                             if !self.jump(target, state) {
                                 return;
                             }
@@ -451,8 +558,10 @@ impl PathWalk<'_, '_> {
                                 addr = addr.wrapping_add(4);
                                 continue;
                             }
-                            self.fork(addr.wrapping_add(4), state, regs);
+                            let args = self.copy_args(&regs);
+                            self.fork(addr.wrapping_add(4), state, regs, args);
                             regs = [None; 16];
+                            self.pending = None;
                             if !self.jump(target, state) {
                                 return;
                             }
@@ -484,7 +593,9 @@ impl PathWalk<'_, '_> {
                                     } else {
                                         State::Arm
                                     };
+                                    self.enter_copied_region(addr, value & !1);
                                     regs = [None; 16];
+                                    self.pending = None;
                                     if !self.jump(value & !1, state) {
                                         return;
                                     }
@@ -508,6 +619,7 @@ impl PathWalk<'_, '_> {
                             match regs[rs.bits() as usize] {
                                 Some(value) => {
                                     regs = [None; 16];
+                                    self.pending = None;
                                     let target = value & !1;
                                     if !self.jump(target, state) {
                                         return;

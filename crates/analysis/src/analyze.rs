@@ -14,7 +14,7 @@ use crate::config::TableHint;
 use crate::discover::{Discovery, Thresholds, discover};
 use crate::flags::{FlagMap, Seed};
 use crate::switch::{JumpTable, find_tables, mark_tables};
-use crate::traverse::{Stop, StopReason, SwiCall, walk};
+use crate::traverse::{CopyHint, Stop, StopReason, SwiCall, walk};
 
 /// Full analysis result over one image.
 #[derive(Debug, Default)]
@@ -26,6 +26,9 @@ pub struct Analysis {
     /// Every software interrupt the final traversal passed, in site
     /// order: call-like, non-terminal BIOS entries.
     pub swi_calls: Vec<SwiCall>,
+    /// Every detected copy-then-jump into EWRAM: dynamically copied
+    /// code notes for the hybrid fallback.
+    pub copy_hints: Vec<CopyHint>,
     /// `UnknownTarget` stops at indirect jumps no table explains.
     pub unresolved: Vec<Stop>,
 }
@@ -50,9 +53,11 @@ pub fn analyze(
     let mut tables: Vec<JumpTable> = Vec::new();
     let mut unresolved = Vec::new();
     let mut swi_calls = Vec::new();
+    let mut copy_hints = Vec::new();
     for _ in 0..MAX_PASSES {
         let traversal = walk(image, map, &paths, crate::traverse::WalkOptions::global());
         swi_calls = traversal.swi_calls;
+        copy_hints = traversal.copy_hints;
         unresolved = traversal
             .stops
             .iter()
@@ -98,6 +103,7 @@ pub fn analyze(
         discovery,
         tables,
         swi_calls,
+        copy_hints,
         unresolved,
     }
 }
