@@ -36,6 +36,7 @@ use testutil::synthetic::RomBuilder;
 
 const E: Flags = Flags::EXEC;
 const W: Flags = Flags::WORD;
+const T: Flags = Flags::THUMB;
 const L: Flags = Flags::LITERAL;
 const F: Flags = Flags::FUNC_START;
 
@@ -120,9 +121,9 @@ fn golden_layout_matches_the_expected_map() {
         (0x28, 0x2C, Flags::EMPTY),
         (0x2C, 0x3C, E | W),
         (0x3C, 0x40, Flags::EMPTY),
-        (0x40, 0x46, E | W),
+        (0x40, 0x46, E | W | T),
         (0x46, 0x4C, Flags::EMPTY),
-        (0x4C, 0x50, E | W),
+        (0x4C, 0x50, E | W | T),
         (0x50, 0x54, Flags::EMPTY),
         (0x54, 0x5C, E | W),
         (0x5C, 0x200, Flags::EMPTY),
@@ -147,8 +148,8 @@ fn bx_bit_zero_selects_thumb_state() {
     let mut map = FlagMap::from_image(&image);
     let seeds = map.seed(&[]);
     let _ = traverse(&image, &mut map, &seeds);
-    assert_eq!(map.get(0x0800_0040), E | W);
-    assert_eq!(map.get(0x0800_0044), E | W);
+    assert_eq!(map.get(0x0800_0040), E | W | T);
+    assert_eq!(map.get(0x0800_0044), E | W | T);
     assert_eq!(map.get(0x0800_0046), Flags::EMPTY);
 }
 
@@ -291,8 +292,8 @@ fn return_like_exits_record_conventional_returns() {
         state: State::Arm,
         reason: StopReason::Return,
     }));
-    assert_eq!(map.get(0x0800_0040), E | W);
-    assert_eq!(map.get(0x0800_0044), E | W);
+    assert_eq!(map.get(0x0800_0040), E | W | T);
+    assert_eq!(map.get(0x0800_0044), E | W | T);
     assert_eq!(map.get(0x0800_0046), Flags::EMPTY);
 }
 
@@ -394,6 +395,6 @@ fn swi_clobbers_r0_r1_r3_and_thumb_number_is_direct() {
     }));
     // Both SWI sites executed (marked) but did not end their paths.
     assert_eq!(map.get(0x0800_0008), E | W);
-    assert_eq!(map.get(0x0800_0040), E | W);
-    assert_eq!(map.get(0x0800_0042), E | W);
+    assert_eq!(map.get(0x0800_0040), E | W | T);
+    assert_eq!(map.get(0x0800_0042), E | W | T);
 }

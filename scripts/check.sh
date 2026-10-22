@@ -9,6 +9,14 @@ cargo fmt --all --check
 echo "==> cargo clippy"
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+echo "==> build test ROMs"
+if command -v arm-none-eabi-as >/dev/null 2>&1; then
+    scripts/build-test-roms.sh
+else
+    echo "arm-none-eabi-as not found: skipping test ROM build"
+    echo "(round-trip tests will skip; install arm-none-eabi-binutils)"
+fi
+
 echo "==> cargo test"
 cargo test --workspace
 

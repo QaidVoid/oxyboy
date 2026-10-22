@@ -119,6 +119,10 @@ impl Flags {
     pub const DATA: Self = Self(1 << 3);
     /// Byte starts a function.
     pub const FUNC_START: Self = Self(1 << 4);
+    /// Instruction byte executes in THUMB state. Set on every
+    /// instruction mark the traversal makes in THUMB state so emission
+    /// can pick the assembler dialect per run.
+    pub const THUMB: Self = Self(1 << 5);
 
     /// Builds flags from raw cache bits.
     #[must_use]

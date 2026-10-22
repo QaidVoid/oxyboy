@@ -246,6 +246,9 @@ name = "emit"
 version = "0.1.0"
 dependencies = [
  "analysis",
+ "decode",
+ "rom",
+ "testutil",
 ]
 
 [[package]]

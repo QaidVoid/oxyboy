@@ -299,9 +299,16 @@ impl PathWalk<'_, '_> {
         }
     }
 
-    /// Marks `size` bytes of an instruction or pool word.
-    fn mark(&mut self, addr: u32, size: usize, flags: Flags) {
+    /// Marks `size` bytes of an instruction or pool word. Instruction
+    /// marks (`flags` containing EXEC) carry the THUMB state bit so
+    /// emission can pick the assembler dialect per run.
+    fn mark(&mut self, addr: u32, size: usize, state: State, flags: Flags) {
         if self.options.mark {
+            let flags = if flags.contains(Flags::EXEC) && state == State::Thumb {
+                flags | Flags::THUMB
+            } else {
+                flags
+            };
             self.map.mark_range(addr, addr + size as u32, flags);
         }
     }
@@ -323,7 +330,7 @@ impl PathWalk<'_, '_> {
                         return;
                     }
                     let cond = Condition::from_bits((word >> 28) as u8);
-                    self.mark(addr, 4, Flags::EXEC | Flags::WORD);
+                    self.mark(addr, 4, state, Flags::EXEC | Flags::WORD);
                     match decode_arm(word) {
                         ArmInstr::Branch { link, offset } => {
                             let target = addr.wrapping_add(8).wrapping_add(offset as u32);
@@ -395,7 +402,7 @@ impl PathWalk<'_, '_> {
                             } else {
                                 -(imm as i32)
                             });
-                            self.mark(target, 4, Flags::LITERAL | Flags::WORD);
+                            self.mark(target, 4, State::Arm, Flags::LITERAL | Flags::WORD);
                             regs[rd.bits() as usize] = self.read_word(target);
                             addr = addr.wrapping_add(4);
                         }
@@ -521,7 +528,7 @@ impl PathWalk<'_, '_> {
                         self.stop(addr, state, StopReason::Undefined);
                         return;
                     }
-                    self.mark(addr, 2, Flags::EXEC | Flags::WORD);
+                    self.mark(addr, 2, state, Flags::EXEC | Flags::WORD);
                     match instr {
                         ThumbInstr::ConditionalBranch { cond: _, offset } => {
                             let target = addr
@@ -573,7 +580,7 @@ impl PathWalk<'_, '_> {
                         }
                         ThumbInstr::PcRelativeLoad { rd, offset } => {
                             let target = (addr.wrapping_add(4) & !3) + u32::from(offset) * 4;
-                            self.mark(target, 4, Flags::LITERAL | Flags::WORD);
+                            self.mark(target, 4, State::Arm, Flags::LITERAL | Flags::WORD);
                             regs[rd.bits() as usize] = self.read_word(target);
                             addr = addr.wrapping_add(2);
                         }

@@ -14,6 +14,7 @@ use testutil::synthetic::RomBuilder;
 
 const E: Flags = Flags::EXEC;
 const W: Flags = Flags::WORD;
+const T: Flags = Flags::THUMB;
 
 fn analyze_rom(rom: &Image, hints: &[TableHint]) -> (Analysis, FlagMap) {
     let mut map = FlagMap::from_image(rom);
@@ -103,7 +104,7 @@ fn thumb_inline_switch_is_found() {
         }]
     );
     assert_eq!(map.get(0x0800_0024), W);
-    assert_eq!(map.get(0x0800_002C), E | W);
+    assert_eq!(map.get(0x0800_002C), E | W | T);
     assert!(analysis.unresolved.is_empty());
 }
 
@@ -139,7 +140,7 @@ fn thumb_relative_switch_is_found() {
             targets: vec![(0x0800_0024, State::Thumb), (0x0800_0028, State::Thumb)],
         }]
     );
-    assert_eq!(map.get(0x0800_0024), E | W);
+    assert_eq!(map.get(0x0800_0024), E | W | T);
     assert!(analysis.unresolved.is_empty());
 }
 
