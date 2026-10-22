@@ -70,6 +70,8 @@ pub struct Bus {
     /// `next_power_of_two(rom.len()) - 1`, for mirroring beyond the image.
     rom_mask: usize,
     sram: Box<[u8]>,
+    /// 0x04000000: halfword-granular IO register image (1 KiB window).
+    io: Box<[u8]>,
 }
 
 impl Bus {
@@ -92,6 +94,7 @@ impl Bus {
             rom: rom.into_boxed_slice(),
             rom_mask,
             sram: vec![0; SRAM_MAX_SIZE].into_boxed_slice(),
+            io: vec![0; 0x400].into_boxed_slice(),
         }
     }
 
@@ -142,8 +145,7 @@ impl Bus {
             0x00 if a < 0x4000 => self.bios[(a & 0x3FFF) as usize],
             0x02 => self.ewram[(a & 0x0003_FFFF) as usize],
             0x03 => self.iwram[(a & 0x0000_7FFF) as usize],
-            // IO is a stub region for now and reads 0.
-            0x04 if a < 0x0400_0400 => OPEN_BUS_BYTE,
+            0x04 if a < 0x0400_0400 => self.io[(a & 0x3FF) as usize],
             // Palette and OAM sit on 16/32-bit buses with no 8-bit data
             // lane; 8-bit reads return 0 (GBATEK bus-width table).
             0x05 | 0x07 => OPEN_BUS_BYTE,
@@ -201,12 +203,14 @@ impl Bus {
     ///
     /// 8-bit writes are accepted only on 8/32-bit-bus regions: palette,
     /// VRAM, and OAM discard them (GBATEK bus-width table), BIOS and Game
-    /// Pak ROM have no write path, and IO is stubbed for now.
+    /// Pak ROM have no write path, and IO byte writes go through the
+    /// containing halfword's register semantics.
     pub fn write_u8(&mut self, addr: u32, value: u8) {
         let a = addr & 0x0FFF_FFFF;
         match a >> 24 {
             0x02 => self.ewram[(a & 0x0003_FFFF) as usize] = value,
             0x03 => self.iwram[(a & 0x0000_7FFF) as usize] = value,
+            0x04 if a < 0x0400_0400 => self.io_write_byte(a, value),
             0x0E | 0x0F => self.sram[(a & 0x0000_FFFF) as usize] = value,
             _ => {}
         }
@@ -222,6 +226,7 @@ impl Bus {
                 self.write_u8(addr, lo);
                 self.write_u8(addr.wrapping_add(1), hi);
             }
+            0x04 if a < 0x0400_0400 => self.io_write_u16(a & !1, value),
             0x05 => {
                 let i = ((a & 0x0000_03FF) & !1) as usize;
                 self.palette[i] = lo;
@@ -282,6 +287,138 @@ impl Bus {
         }
         Some(off)
     }
+
+    /// Writes one byte of the IO window through the containing
+    /// halfword's register semantics.
+    fn io_write_byte(&mut self, a: u32, value: u8) {
+        let half = a & 0x03FE;
+        let old = halfword(&self.io, half as usize);
+        let merged = if a & 1 == 0 {
+            (old & 0xFF00) | u16::from(value)
+        } else {
+            (old & 0x00FF) | (u16::from(value) << 8)
+        };
+        self.io_write_u16(half, merged);
+    }
+
+    /// Writes an aligned IO halfword with per-register semantics.
+    ///
+    /// Implemented: DISPCNT, GREENSWAP, DISPSTAT, VCOUNT,
+    /// IE, IF, and IME (GBATEK "LCD I/O Registers" and "Interrupt
+    /// Control"). Unimplemented registers are plain storage, which is
+    /// indistinguishable from write-only stubs for now.
+    /// DISPSTAT bits 0-2 are read-only flags maintained by the PPU
+    /// (GBATEK: "(R)" on V-Blank/H-Blank/V-Counter), VCOUNT is
+    /// read-only, and IF acknowledges on written 1 bits.
+    fn io_write_u16(&mut self, half: u32, value: u16) {
+        let off = (half & 0x3FF) as usize;
+        let stored = match off as u32 {
+            Self::DISPSTAT => {
+                let flags = halfword(&self.io, off) & 0x0007;
+                flags | (value & !0x0007)
+            }
+            Self::VCOUNT => return,
+            Self::IF => halfword(&self.io, off) & !value,
+            _ => value,
+        };
+        self.io[off] = stored as u8;
+        self.io[off + 1] = (stored >> 8) as u8;
+    }
+
+    /// The current line (0..=227) as seen through the VCOUNT register.
+    pub fn vcount(&self) -> u16 {
+        halfword(&self.io, Self::VCOUNT as usize)
+    }
+
+    /// The DISPSTAT register image: flags in bits 0-2, IRQ enables in
+    /// bits 3-5, the V-Count match line in bits 8-15.
+    pub fn dispstat(&self) -> u16 {
+        halfword(&self.io, Self::DISPSTAT as usize)
+    }
+
+    /// The DISPCNT register.
+    pub fn dispcnt(&self) -> u16 {
+        halfword(&self.io, Self::DISPCNT as usize)
+    }
+
+    /// The GREENSWAP register (bit 0 swaps green between each two-pixel
+    /// group at output, GBATEK "Green Swap").
+    pub fn greenswap(&self) -> u16 {
+        halfword(&self.io, Self::GREENSWAP as usize)
+    }
+
+    /// Reads a palette halfword by array offset (must be even).
+    pub fn palette_u16(&self, off: u32) -> u16 {
+        halfword(&self.palette, (off & !1) as usize)
+    }
+
+    /// Reads a VRAM halfword by array offset, applying the 96 KiB
+    /// bank mapping of the VRAM window.
+    pub fn vram_u16(&self, off: u32) -> u16 {
+        halfword(&self.vram, (Self::vram_index(off) & !1) as usize)
+    }
+
+    /// Sets or clears DISPSTAT flag bits (bit 0 V-Blank, bit 1
+    /// H-Blank, bit 2 V-Counter) without disturbing the other flags.
+    pub fn set_dispstat_flag(&mut self, mask: u16, set: bool) {
+        let off = Self::DISPSTAT as usize;
+        let cur = halfword(&self.io, off);
+        let mut flags = cur & 0x0007;
+        if set {
+            flags |= mask & 0x0007;
+        } else {
+            flags &= !(mask & 0x0007);
+        }
+        let merged = (cur & !0x0007) | flags;
+        self.io[off] = merged as u8;
+        self.io[off + 1] = (merged >> 8) as u8;
+    }
+
+    /// Publishes the current scanline into the read-only VCOUNT
+    /// register.
+    pub fn set_vcount(&mut self, line: u16) {
+        self.io[Self::VCOUNT as usize] = line as u8;
+        self.io[Self::VCOUNT as usize + 1] = (line >> 8) as u8;
+    }
+
+    /// Raises IF bits (GBATEK: sources set request bits; the CPU sees
+    /// the interrupt when IE selects them and IME is set).
+    pub fn raise_if(&mut self, bits: u16) {
+        let off = Self::IF as usize;
+        let cur = halfword(&self.io, off) | bits;
+        self.io[off] = cur as u8;
+        self.io[off + 1] = (cur >> 8) as u8;
+    }
+
+    /// Whether an interrupt is reaching the CPU: IE selecting a pending
+    /// IF bit and IME set (GBATEK "Interrupt Control").
+    pub fn irq_pending(&self) -> bool {
+        self.ime() != 0 && (self.int_enable() & self.int_flags()) != 0
+    }
+
+    /// The IE register (IRQ enable mask).
+    pub fn int_enable(&self) -> u16 {
+        halfword(&self.io, Self::IE as usize)
+    }
+
+    /// The IF register (pending IRQs).
+    pub fn int_flags(&self) -> u16 {
+        halfword(&self.io, Self::IF as usize)
+    }
+
+    /// The IME register (master IRQ enable).
+    pub fn ime(&self) -> u16 {
+        halfword(&self.io, Self::IME as usize)
+    }
+
+    /// IO window offsets of the implemented registers.
+    const DISPCNT: u32 = 0x000;
+    const GREENSWAP: u32 = 0x002;
+    const DISPSTAT: u32 = 0x004;
+    const VCOUNT: u32 = 0x006;
+    const IE: u32 = 0x200;
+    const IF: u32 = 0x202;
+    const IME: u32 = 0x208;
 }
 
 /// Classifies a logical address into its bus region, applying the
