@@ -1,0 +1,252 @@
+//! Golden traversal over a synthetic ROM with a known layout.
+//!
+//! The ROM (assembled and objdump-verified with Binutils 2.32 from the
+//! listing below) exercises every traversal decision: linear ARM, both
+//! paths of a conditional branch, PC-relative literal pools, BL with a
+//! fallthrough call, BX into THUMB via a pool word with bit 0 set, a
+//! THUMB conditional branch, an undefined encoding, and two BX-LR
+//! returns with unprovable targets.
+//!
+//! ```text
+//!     .arm
+//! 00: mov r0, #1
+//! 04: ldr r1, [pc, #16]     @ pool at 0x1C
+//! 08: bne arm_func          @ target 0x2C, fallthrough 0x0C
+//! 0C: ldr r2, [pc, #16]     @ pool at 0x24
+//! 10: bx r2                 @ pool word 0x08000041 -> THUMB at 0x40
+//! 1C: .word 0x11223344      @ r1 literal
+//! 24: .word thumb_start + 1 @ r2 literal
+//! 2C: mov r3, #7
+//! 30: bl arm_helper         @ target 0x54, fallthrough 0x34
+//! 34: mov r4, #8
+//! 38: bx lr                 @ unknown target
+//! 40: movs r0, #8           @ THUMB
+//! 42: cmp r0, #8
+//! 44: beq thumb_tail        @ target 0x4C, fallthrough 0x46
+//! 46: .hword 0xDE00         @ undefined
+//! 4C: movs r1, #9
+//! 4E: b 4e                  @ self loop
+//! 54: mov r5, #1            @ ARM helper
+//! 58: bx lr                 @ unknown target
+//! ```
+
+use analysis::{FlagMap, Flags, Run, Seed, State, Stop, StopReason, traverse};
+use rom::Image;
+use testutil::synthetic::RomBuilder;
+
+const E: Flags = Flags::EXEC;
+const W: Flags = Flags::WORD;
+const L: Flags = Flags::LITERAL;
+const F: Flags = Flags::FUNC_START;
+
+const PROGRAM: [u8; 0x5C] = [
+    // mov r0,#1; ldr r1,[pc,#16]; bne +0x24; ldr r2,[pc,#16]; bx r2
+    0x01, 0x00, 0xA0, 0xE3, 0x10, 0x10, 0x9F, 0xE5, 0x07, 0x00, 0x00, 0x1A, 0x10, 0x20, 0x9F, 0xE5,
+    0x12, 0xFF, 0x2F, 0xE1, // pads
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // r1 pool; pad
+    0x44, 0x33, 0x22, 0x11, 0x00, 0x00, 0x00, 0x00,
+    // r2 pool (thumb at 0x40 | bit 0); pad
+    0x41, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00,
+    // mov r3,#7; bl 0x54; mov r4,#8; bx lr
+    0x07, 0x30, 0xA0, 0xE3, 0x07, 0x00, 0x00, 0xEB, 0x08, 0x40, 0xA0, 0xE3, 0x1E, 0xFF, 0x2F, 0xE1,
+    // pad before the THUMB block
+    0x00, 0x00, 0x00, 0x00, // movs r0,#8; cmp r0,#8; beq +4; .hword 0xDE00
+    0x08, 0x20, 0x08, 0x28, 0x02, 0xD0, 0x00, 0xDE, // pads
+    0x00, 0x00, 0x00, 0x00, // movs r1,#9; b self
+    0x09, 0x21, 0xFE, 0xE7, // pads
+    0x00, 0x00, 0x00, 0x00, // mov r5,#1; bx lr
+    0x01, 0x50, 0xA0, 0xE3, 0x1E, 0xFF, 0x2F, 0xE1,
+];
+
+fn traversal_rom() -> Image {
+    let mut bytes = RomBuilder::new().title("TRAV").build();
+    bytes[..PROGRAM.len()].copy_from_slice(&PROGRAM);
+    Image::from_bytes(bytes).expect("parse")
+}
+
+#[test]
+fn golden_layout_matches_the_expected_map() {
+    let image = traversal_rom();
+    let mut map = FlagMap::from_image(&image);
+    let seeds = map.seed(&[]);
+    assert_eq!(
+        seeds,
+        vec![Seed {
+            addr: 0x0800_0000,
+            state: State::Arm,
+        }]
+    );
+
+    let traversal = traverse(&image, &mut map, &seeds);
+
+    // The BL is the only call; every other path end is a proven-unknown
+    // BX LR or the undefined THUMB halfword.
+    assert_eq!(traversal.calls, vec![(0x0800_0030, 0x0800_0054)]);
+    assert_eq!(
+        traversal.stops,
+        vec![
+            Stop {
+                addr: 0x0800_0058,
+                state: State::Arm,
+                reason: StopReason::UnknownTarget,
+            },
+            Stop {
+                addr: 0x0800_0038,
+                state: State::Arm,
+                reason: StopReason::UnknownTarget,
+            },
+            Stop {
+                addr: 0x0800_0046,
+                state: State::Thumb,
+                reason: StopReason::Undefined,
+            },
+        ]
+    );
+
+    let expected: Vec<Run> = [
+        (0x00, 0x01, F | E | W),
+        (0x01, 0x14, E | W),
+        (0x14, 0x1C, Flags::EMPTY),
+        (0x1C, 0x20, L | W),
+        (0x20, 0x24, Flags::EMPTY),
+        (0x24, 0x28, L | W),
+        (0x28, 0x2C, Flags::EMPTY),
+        (0x2C, 0x3C, E | W),
+        (0x3C, 0x40, Flags::EMPTY),
+        (0x40, 0x46, E | W),
+        (0x46, 0x4C, Flags::EMPTY),
+        (0x4C, 0x50, E | W),
+        (0x50, 0x54, Flags::EMPTY),
+        (0x54, 0x5C, E | W),
+        (0x5C, 0x200, Flags::EMPTY),
+    ]
+    .iter()
+    .map(|&(start, end, flags)| Run {
+        addr: 0x0800_0000 + start,
+        len: (end - start) as usize,
+        flags,
+    })
+    .collect();
+    let actual: Vec<Run> = map.runs().collect();
+    assert_eq!(actual, expected, "flag map must match the golden layout");
+}
+
+#[test]
+fn bx_bit_zero_selects_thumb_state() {
+    // The BX at 0x10 reads the pool word 0x08000041: bit 0 set, so the
+    // walked target 0x40 is THUMB code. If the state were wrong, the
+    // two-byte instructions 0x40..0x46 would not be marked.
+    let image = traversal_rom();
+    let mut map = FlagMap::from_image(&image);
+    let seeds = map.seed(&[]);
+    let _ = traverse(&image, &mut map, &seeds);
+    assert_eq!(map.get(0x0800_0040), E | W);
+    assert_eq!(map.get(0x0800_0044), E | W);
+    assert_eq!(map.get(0x0800_0046), Flags::EMPTY);
+}
+
+#[test]
+fn bx_bit_clear_stays_in_arm_state() {
+    // Same layout with the pool bit cleared: the target walks as ARM.
+    // The word at 0x40 (0x28082008) is a valid STM but the word at 0x44
+    // (0xDE00D002) is undefined, so the ARM walk marks 0x40..0x43 and
+    // stops at 0x44. The THUMB walk in the golden test instead marks
+    // 0x40..0x45 and stops at 0x46: same bytes, different decode, which
+    // is the bit-0 state switch made observable.
+    let mut bytes = RomBuilder::new().title("TRVA").build();
+    bytes[..PROGRAM.len()].copy_from_slice(&PROGRAM);
+    bytes[0x24..0x28].copy_from_slice(&0x0800_0040u32.to_le_bytes());
+    let image = Image::from_bytes(bytes).expect("parse");
+    let mut map = FlagMap::from_image(&image);
+    let seeds = map.seed(&[]);
+    let traversal = traverse(&image, &mut map, &seeds);
+    assert_eq!(map.get(0x0800_0040), E | W);
+    assert_eq!(map.get(0x0800_0043), E | W);
+    assert_eq!(map.get(0x0800_0044), Flags::EMPTY);
+    assert!(traversal.stops.contains(&Stop {
+        addr: 0x0800_0044,
+        state: State::Arm,
+        reason: StopReason::Undefined,
+    }));
+}
+
+#[test]
+fn adversarial_loops_terminate() {
+    // A mov prefix keeps the loader's multiboot heuristic (which reads a
+    // leading ARM branch as a multiboot entry) away from the ROM; the
+    // b-self loop then ends the only path immediately.
+    let mut bytes = RomBuilder::new().title("LOOP").build();
+    bytes[0..4].copy_from_slice(&0xE3A0_0001u32.to_le_bytes()); // mov r0, #1
+    bytes[4..8].copy_from_slice(&0xEAFF_FFFEu32.to_le_bytes()); // b 0x08000004
+    let image = Image::from_bytes(bytes).expect("parse");
+    let mut map = FlagMap::from_image(&image);
+    let seeds = map.seed(&[]);
+    let traversal = traverse(&image, &mut map, &seeds);
+    assert!(traversal.stops.is_empty());
+    assert_eq!(map.get(0x0800_0000), F | E | W);
+    assert_eq!(map.get(0x0800_0004), E | W);
+    assert_eq!(map.get(0x0800_0008), Flags::EMPTY);
+
+    // Alternating branches between two instructions.
+    let mut bytes = RomBuilder::new().title("PING").build();
+    // 0x00: mov r0, #1; 0x04: b 0x08000008; 0x08: b 0x08000004
+    bytes[0..12].copy_from_slice(&[
+        0x01, 0x00, 0xA0, 0xE3, 0xFF, 0xFF, 0xFF, 0xEA, 0xFD, 0xFF, 0xFF, 0xEA,
+    ]);
+    let image = Image::from_bytes(bytes).expect("parse");
+    let mut map = FlagMap::from_image(&image);
+    let seeds = map.seed(&[]);
+    let traversal = traverse(&image, &mut map, &seeds);
+    assert!(traversal.stops.is_empty());
+    assert_eq!(map.get(0x0800_0000), F | E | W);
+    assert_eq!(map.get(0x0800_0004), E | W);
+    assert_eq!(map.get(0x0800_0008), E | W);
+}
+
+fn branch_into_data_image() -> Image {
+    let mut bytes = RomBuilder::new().title("DATA").build();
+    bytes[0x00..0x04].copy_from_slice(&0xE59F_0008u32.to_le_bytes()); // ldr r0, [pc, #8] -> 0x10
+    bytes[0x04..0x08].copy_from_slice(&0xE12F_FF10u32.to_le_bytes()); // bx r0
+    bytes[0x10..0x14].copy_from_slice(&0x0800_0020u32.to_le_bytes()); // -> 0x20
+    Image::from_bytes(bytes).expect("parse")
+}
+
+#[test]
+fn branch_into_data_marks_code_with_evidence() {
+    // Entry: ldr r0, [pc, #8]; bx r0 with the pool word pointing into a
+    // run of zero bytes. The bytes are only marked because a branch
+    // reaches them.
+    let image = branch_into_data_image();
+    let mut map = FlagMap::from_image(&image);
+    let seeds = map.seed(&[]);
+    let _ = traverse(&image, &mut map, &seeds);
+    assert_eq!(map.get(0x0800_0010), Flags::LITERAL | Flags::WORD);
+    assert_eq!(map.get(0x0800_0020), E | W, "branch evidence marks data");
+    assert_eq!(
+        map.get(0x0800_0018),
+        Flags::EMPTY,
+        "untouched bytes stay empty"
+    );
+}
+
+#[test]
+fn out_of_bounds_branch_is_recorded_not_marked() {
+    let mut bytes = RomBuilder::new().title("OOB").build();
+    // mov r0, #1 (multiboot-heuristic shield), then b 0x08010000, far
+    // past the 512-byte image.
+    bytes[0..4].copy_from_slice(&0xE3A0_0001u32.to_le_bytes());
+    bytes[4..8].copy_from_slice(&0xEA00_3FFDu32.to_le_bytes());
+    let image = Image::from_bytes(bytes).expect("parse");
+    let mut map = FlagMap::from_image(&image);
+    let seeds = map.seed(&[]);
+    let traversal = traverse(&image, &mut map, &seeds);
+    assert_eq!(
+        traversal.stops,
+        vec![Stop {
+            addr: 0x0801_0000,
+            state: State::Arm,
+            reason: StopReason::OutOfBounds,
+        }]
+    );
+    assert_eq!(map.get(0x0801_0000), Flags::EMPTY);
+}
