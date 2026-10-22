@@ -14,7 +14,7 @@ use crate::config::TableHint;
 use crate::discover::{Discovery, Thresholds, discover};
 use crate::flags::{FlagMap, Seed};
 use crate::switch::{JumpTable, find_tables, mark_tables};
-use crate::traverse::{Stop, StopReason, walk};
+use crate::traverse::{Stop, StopReason, SwiCall, walk};
 
 /// Full analysis result over one image.
 #[derive(Debug, Default)]
@@ -23,6 +23,9 @@ pub struct Analysis {
     pub discovery: Discovery,
     /// Every resolved jump table, in site order.
     pub tables: Vec<JumpTable>,
+    /// Every software interrupt the final traversal passed, in site
+    /// order: call-like, non-terminal BIOS entries.
+    pub swi_calls: Vec<SwiCall>,
     /// `UnknownTarget` stops at indirect jumps no table explains.
     pub unresolved: Vec<Stop>,
 }
@@ -46,8 +49,10 @@ pub fn analyze(
     let mut paths = paths.to_vec();
     let mut tables: Vec<JumpTable> = Vec::new();
     let mut unresolved = Vec::new();
+    let mut swi_calls = Vec::new();
     for _ in 0..MAX_PASSES {
         let traversal = walk(image, map, &paths, crate::traverse::WalkOptions::global());
+        swi_calls = traversal.swi_calls;
         unresolved = traversal
             .stops
             .iter()
@@ -92,6 +97,7 @@ pub fn analyze(
     Analysis {
         discovery,
         tables,
+        swi_calls,
         unresolved,
     }
 }

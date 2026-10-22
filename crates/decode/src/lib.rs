@@ -27,6 +27,7 @@
 //! ```
 
 pub mod arm;
+pub mod bios;
 pub mod condition;
 pub mod register;
 pub mod text;
@@ -36,6 +37,7 @@ pub use arm::{
     ArmInstr, DataOp, HalfwordKind, HalfwordOffset, PsrSource, RegisterShift, ShiftAmount,
     ShiftKind, ShiftType, ShifterOperand, TransferOffset, decode_arm,
 };
+pub use bios::{SWI_NAMES, swi_name};
 pub use condition::Condition;
 pub use register::{Register, RegisterList};
 pub use text::{arm_text, thumb_text};

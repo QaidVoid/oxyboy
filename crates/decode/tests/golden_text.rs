@@ -53,7 +53,10 @@ fn arm_golden_text() {
         (0xEBFF_FFFF, "bl .+4"),
         (0xE12F_FF13, "bx r3"),
         // SWI.
-        (0xEF12_3456, "swi #0x123456"),
+        (
+            0xEF12_3456,
+            "swi #0x123456 @ LZ77UnCompReadNormalWrite16bit",
+        ),
         // Undefined spaces keep raw encodings.
         (0xEE00_0000, ".inst 0xEE000000"),
         (0xFF00_0000, ".inst 0xFF000000"),
@@ -153,7 +156,7 @@ fn thumb_golden_text() {
         (0xD1FD, 0, "bne .-2"),
         (0xE7FE, 0, "b .+0"),
         (0xE003, 0, "b .+10"),
-        (0xDF01, 0, "swi #0x01"),
+        (0xDF01, 0, "swi #0x01 @ RegisterRamReset"),
         // 19: long branch with link, and the standalone second half.
         (0xF7FF, 0xFFCE, "bl .-96"),
         (0xF000, 0xF800, "bl .+4"),

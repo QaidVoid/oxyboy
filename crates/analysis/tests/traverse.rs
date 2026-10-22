@@ -30,7 +30,7 @@
 //! 58: bx lr                 @ unknown target
 //! ```
 
-use analysis::{Call, FlagMap, Flags, Run, Seed, State, Stop, StopReason, traverse};
+use analysis::{Call, FlagMap, Flags, Run, Seed, State, Stop, StopReason, SwiCall, traverse};
 use rom::Image;
 use testutil::synthetic::RomBuilder;
 
@@ -294,4 +294,106 @@ fn return_like_exits_record_conventional_returns() {
     assert_eq!(map.get(0x0800_0040), E | W);
     assert_eq!(map.get(0x0800_0044), E | W);
     assert_eq!(map.get(0x0800_0046), Flags::EMPTY);
+}
+
+#[test]
+fn swi_is_recorded_and_registers_survive_it() {
+    // ```text
+    // 00: ldr r2, [pc, #8]   @ pool at 0x10 -> 0x08000020
+    // 04: swi 0x060000       @ Div; r2 must stay proven
+    // 08: mov pc, r2         @ follows the proof: jump to 0x20
+    // 10: .word 0x08000020
+    // 20: bx lr
+    // ```
+    let mut bytes = RomBuilder::new().title("SWIK").build();
+    bytes[0x00..0x24].copy_from_slice(&[
+        0x08, 0x20, 0x9F, 0xE5, 0x00, 0x00, 0x06, 0xEF, 0x02, 0xF0, 0xA0, 0xE1, 0x00, 0x00, 0xA0,
+        0xE1, 0x20, 0x00, 0x00, 0x08, 0x00, 0x00, 0xA0, 0xE1, 0x00, 0x00, 0xA0, 0xE1, 0x00, 0x00,
+        0xA0, 0xE1, 0x1E, 0xFF, 0x2F, 0xE1,
+    ]);
+    let image = Image::from_bytes(bytes).expect("parse");
+    let mut map = FlagMap::from_image(&image);
+    let seeds = map.seed(&[]);
+    let traversal = traverse(&image, &mut map, &seeds);
+    // SWI is call-like: recorded with its BIOS number, and the path
+    // continued past it to the BX-LR.
+    assert_eq!(
+        traversal.swi_calls,
+        vec![SwiCall {
+            site: 0x0800_0004,
+            state: State::Arm,
+            number: 0x06,
+        }]
+    );
+    assert_eq!(
+        traversal.stops,
+        vec![Stop {
+            addr: 0x0800_0020,
+            state: State::Arm,
+            reason: StopReason::Return,
+        }]
+    );
+    assert_eq!(map.get(0x0800_0004), E | W);
+    assert_eq!(map.get(0x0800_0008), E | W);
+    assert_eq!(map.get(0x0800_0020), E | W);
+}
+
+#[test]
+fn swi_clobbers_r0_r1_r3_and_thumb_number_is_direct() {
+    // ARM: `swi 0x060000` returns garbage in r0/r1/r3 (GBATEK), so the
+    // r0 pool proof must not survive it: `mov pc, r0` is an unknown
+    // target. THUMB: the number is the 8-bit halfword directly.
+    let mut bytes = RomBuilder::new().title("SWIX").build();
+    // 0x00 ARM: mov r1,#7; ldr r0,[pc,#8]; swi 0x060000; mov pc, r0
+    // 0x14 pool: 0x08000020
+    bytes[0x00..0x18].copy_from_slice(&[
+        0x07, 0x10, 0xA0, 0xE3, 0x08, 0x00, 0x9F, 0xE5, 0x00, 0x00, 0x06, 0xEF, 0x00, 0xF0, 0xA0,
+        0xE1, 0x20, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00,
+    ]);
+    // 0x40 THUMB: swi #0x06; bx r0
+    bytes[0x40..0x44].copy_from_slice(&[0x06, 0xDF, 0x00, 0x47]);
+    let image = Image::from_bytes(bytes).expect("parse");
+    let mut map = FlagMap::from_image(&image);
+    let seeds = vec![
+        Seed {
+            addr: 0x0800_0000,
+            state: State::Arm,
+        },
+        Seed {
+            addr: 0x0800_0040,
+            state: State::Thumb,
+        },
+    ];
+    let traversal = traverse(&image, &mut map, &seeds);
+    let mut swi_calls = traversal.swi_calls;
+    swi_calls.sort_by_key(|call| call.site);
+    assert_eq!(
+        swi_calls,
+        vec![
+            SwiCall {
+                site: 0x0800_0008,
+                state: State::Arm,
+                number: 0x06,
+            },
+            SwiCall {
+                site: 0x0800_0040,
+                state: State::Thumb,
+                number: 0x06,
+            },
+        ]
+    );
+    assert!(traversal.stops.contains(&Stop {
+        addr: 0x0800_000C,
+        state: State::Arm,
+        reason: StopReason::UnknownTarget,
+    }));
+    assert!(traversal.stops.contains(&Stop {
+        addr: 0x0800_0042,
+        state: State::Thumb,
+        reason: StopReason::UnknownTarget,
+    }));
+    // Both SWI sites executed (marked) but did not end their paths.
+    assert_eq!(map.get(0x0800_0008), E | W);
+    assert_eq!(map.get(0x0800_0040), E | W);
+    assert_eq!(map.get(0x0800_0042), E | W);
 }

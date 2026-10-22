@@ -35,6 +35,7 @@ use crate::arm::{
     ArmInstr, DataOp, HalfwordKind, HalfwordOffset, PsrSource, ShiftAmount, ShiftKind,
     ShifterOperand, TransferOffset, decode_arm,
 };
+use crate::bios::swi_name;
 use crate::condition::Condition;
 use crate::register::{Register, RegisterList};
 use crate::thumb::{
@@ -271,7 +272,11 @@ pub fn arm_text(word: u32) -> String {
             format!("bx{} {}", cond_suffix(word), reg_name(rn))
         }
         ArmInstr::SoftwareInterrupt { imm24 } => {
-            format!("swi{} #0x{imm24:X}", cond_suffix(word))
+            // GBATEK "How BIOS Processes SWIs": ARM state interprets
+            // only the upper 8 bits of the 24-bit comment field.
+            let name = swi_name((imm24 >> 16) as u8);
+            let comment = name.map(|name| format!(" @ {name}")).unwrap_or_default();
+            format!("swi{} #0x{imm24:X}{comment}", cond_suffix(word))
         }
     }
 }
@@ -459,7 +464,10 @@ pub fn thumb_text(first: u16, next: u16) -> String {
             branch_text("b", cond.mnemonic(), i32::from(offset))
         }
         ThumbInstr::SoftwareInterrupt { value } => {
-            format!("swi #0x{value:02X}")
+            let comment = swi_name(value)
+                .map(|name| format!(" @ {name}"))
+                .unwrap_or_default();
+            format!("swi #0x{value:02X}{comment}")
         }
         ThumbInstr::UnconditionalBranch { offset } => branch_text("b", "", i32::from(offset)),
         ThumbInstr::LongBranchWithLink { offset } => branch_text("bl", "", offset),

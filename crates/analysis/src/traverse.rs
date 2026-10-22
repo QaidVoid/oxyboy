@@ -65,6 +65,19 @@ pub struct Call {
     pub target: u32,
 }
 
+/// One recorded software interrupt: a call into the BIOS that returns.
+/// GBATEK "How BIOS Processes SWIs".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SwiCall {
+    /// Canonical address of the SWI instruction.
+    pub site: u32,
+    /// State of the SWI instruction.
+    pub state: State,
+    /// BIOS call number: the 8-bit number in THUMB state, the upper
+    /// 8 bits of the 24-bit comment field in ARM state.
+    pub number: u8,
+}
+
 /// Result of a full traversal.
 #[derive(Debug, Default)]
 pub struct Traversal {
@@ -72,6 +85,10 @@ pub struct Traversal {
     pub stops: Vec<Stop>,
     /// Every BL, in discovery order.
     pub calls: Vec<Call>,
+    /// Every software interrupt, in discovery order. SWI is call-like
+    /// but never terminal: the BIOS routine returns to the instruction
+    /// after the SWI (GBATEK "How BIOS Processes SWIs").
+    pub swi_calls: Vec<SwiCall>,
 }
 
 /// Controls what a [`walk`] treats as a path boundary and whether it
@@ -306,6 +323,32 @@ impl PathWalk<'_, '_> {
                             return;
                         }
                         ArmInstr::DataProcessing {
+                            opcode: DataOp::Mov,
+                            rd: Register::Pc,
+                            operand2: ShifterOperand::Register { rm, .. },
+                            ..
+                        } => {
+                            // MOV to PC branches without interworking:
+                            // ARMv4 data-processing writes to R15 clear
+                            // PC bits 1:0 and never switch state (ARM
+                            // ARM "Data Processing": only BX reads bit
+                            // 0 for state).
+                            match regs[rm.bits() as usize] {
+                                Some(value) => {
+                                    regs = [None; 16];
+                                    let target = value & !3;
+                                    if !self.jump(target, state) {
+                                        return;
+                                    }
+                                    addr = target;
+                                }
+                                None => {
+                                    self.stop(addr, state, StopReason::UnknownTarget);
+                                    return;
+                                }
+                            }
+                        }
+                        ArmInstr::DataProcessing {
                             rd: Register::Pc, ..
                         } => {
                             self.stop(addr, state, StopReason::UnknownTarget);
@@ -325,6 +368,22 @@ impl PathWalk<'_, '_> {
                         } => {
                             regs[rd.bits() as usize] =
                                 Some(u32::from(value).rotate_right(u32::from(rotate) * 2));
+                            addr = addr.wrapping_add(4);
+                        }
+                        ArmInstr::SoftwareInterrupt { imm24 } => {
+                            self.out.swi_calls.push(SwiCall {
+                                site: addr,
+                                state,
+                                // ARM state takes the number from the
+                                // upper 8 bits of the comment field
+                                // (GBATEK "How BIOS Processes SWIs").
+                                number: (imm24 >> 16) as u8,
+                            });
+                            // r0, r1, r3 return garbage or the result;
+                            // all other registers are preserved.
+                            regs[0] = None;
+                            regs[1] = None;
+                            regs[3] = None;
                             addr = addr.wrapping_add(4);
                         }
                         // Any other register-writing instruction produces a
@@ -504,6 +563,17 @@ impl PathWalk<'_, '_> {
                             imm8,
                         } => {
                             regs[rd.bits() as usize] = Some(u32::from(imm8));
+                            addr = addr.wrapping_add(2);
+                        }
+                        ThumbInstr::SoftwareInterrupt { value } => {
+                            self.out.swi_calls.push(SwiCall {
+                                site: addr,
+                                state,
+                                number: value,
+                            });
+                            regs[0] = None;
+                            regs[1] = None;
+                            regs[3] = None;
                             addr = addr.wrapping_add(2);
                         }
                         // Mirror of the ARM rule: instructions that write a
