@@ -6,3 +6,4 @@
 
 pub mod golden;
 pub mod synthetic;
+pub mod testrom;

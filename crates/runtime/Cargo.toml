@@ -7,3 +7,6 @@ license.workspace = true
 [dependencies]
 decode = { version = "0.1.0", path = "../decode" }
 rom = { version = "0.1.0", path = "../rom" }
+
+[dev-dependencies]
+testutil = { path = "../testutil" }
