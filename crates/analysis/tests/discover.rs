@@ -61,7 +61,7 @@ fn discovery_finds_exactly_the_known_functions() {
     let image = discovery_rom();
     let mut map = FlagMap::from_image(&image);
     let seeds = map.seed(&[]);
-    let discovery = discover(&image, &mut map, &seeds, Thresholds::default());
+    let discovery = discover(&image, &mut map, &seeds, &seeds, Thresholds::default());
 
     assert_eq!(
         discovery.functions,
@@ -130,7 +130,7 @@ fn config_out_reload_produces_no_new_discoveries() {
     let image = discovery_rom();
     let mut map = FlagMap::from_image(&image);
     let seeds = map.seed(&[]);
-    let first = discover(&image, &mut map, &seeds, Thresholds::default());
+    let first = discover(&image, &mut map, &seeds, &seeds, Thresholds::default());
 
     let config = Config {
         functions: first
@@ -138,6 +138,7 @@ fn config_out_reload_produces_no_new_discoveries() {
             .iter()
             .map(|f| FunctionSpec::bare(f.addr, f.state))
             .collect(),
+        tables: Vec::new(),
     };
     let reloaded = Config::parse(&config.to_string()).expect("reload");
     let seeds: Vec<Seed> = reloaded
@@ -148,7 +149,7 @@ fn config_out_reload_produces_no_new_discoveries() {
 
     let mut map = FlagMap::from_image(&image);
     let _ = map.seed(&seeds);
-    let second = discover(&image, &mut map, &seeds, Thresholds::default());
+    let second = discover(&image, &mut map, &seeds, &seeds, Thresholds::default());
     assert_eq!(second.functions, first.functions);
     assert_eq!(second.rejected, first.rejected);
     assert_eq!(second.calls.len(), first.calls.len());
@@ -163,7 +164,7 @@ fn provided_functions_are_accepted_without_scoring() {
         state: State::Arm,
     }];
     let seeds = map.seed(&user);
-    let discovery = discover(&image, &mut map, &seeds, Thresholds::default());
+    let discovery = discover(&image, &mut map, &seeds, &seeds, Thresholds::default());
     assert!(discovery.functions.contains(&Function {
         addr: 0x0800_0030,
         state: State::Arm,
@@ -186,7 +187,7 @@ fn push_site_gate_requires_decodable_length() {
     };
     let mut map = FlagMap::from_image(&image);
     let seeds = map.seed(&[]);
-    let loose = discover(&image, &mut map, &seeds, lenient);
+    let loose = discover(&image, &mut map, &seeds, &seeds, lenient);
     assert!(loose.functions.contains(&Function {
         addr: 0x0800_00C0,
         state: State::Thumb,
@@ -199,7 +200,7 @@ fn push_site_gate_requires_decodable_length() {
     };
     let mut map = FlagMap::from_image(&image);
     let seeds = map.seed(&[]);
-    let tight = discover(&image, &mut map, &seeds, strict);
+    let tight = discover(&image, &mut map, &seeds, &seeds, strict);
     assert!(!tight.functions.contains(&Function {
         addr: 0x0800_00C0,
         state: State::Thumb,

@@ -8,6 +8,8 @@
 //! arm_func <addr> [name]
 //! thumb_func <addr> [name]
 //! <module>.s [arm|thumb] <addr> [name]
+//! arm_table <addr> <entries>
+//! thumb_table <addr> <entries>
 //! ```
 //!
 //! `<addr>` is canonical `0x`-prefixed hexadecimal. `arm_func` and
@@ -15,9 +17,12 @@
 //! additionally places the function into an output module (consumed by
 //! module splitting) and takes an optional state token that
 //! defaults to ARM, so the plain `<module>.s <addr> [name]` spelling
-//! parses too. Writing always produces the canonical spelling,
-//! including the explicit state token on module lines, so
-//! `parse(to_string())` round trips exactly.
+//! parses too. `arm_table` / `thumb_table` declare jump-table hints:
+//! `entries` words at `<addr>` are one table whose targets are entered
+//! in the declared state, forcing the transfer bit accordingly.
+//! Writing always produces the canonical spelling, including the
+//! explicit state token on module lines, so `parse(to_string())`
+//! round trips exactly.
 
 use std::fmt;
 use std::path::Path;
@@ -71,6 +76,19 @@ pub struct FunctionSpec {
     pub module: Option<String>,
 }
 
+/// One declared jump table: `entries` words at `addr`, targets entered
+/// in `state`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TableHint {
+    /// Canonical address of the first table entry.
+    pub addr: u32,
+    /// Number of entry words.
+    pub entries: u32,
+    /// State the targets are entered in; the transfer bit is forced
+    /// accordingly (ARM clears it, THUMB sets it).
+    pub state: State,
+}
+
 impl FunctionSpec {
     /// A function with no name and no module.
     #[must_use]
@@ -93,11 +111,14 @@ impl FunctionSpec {
     }
 }
 
-/// A parsed config file: declared functions in file order.
+/// A parsed config file: declared functions and table hints in file
+/// order.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Config {
     /// Every declared function, in declaration order.
     pub functions: Vec<FunctionSpec>,
+    /// Every declared jump-table hint, in declaration order.
+    pub tables: Vec<TableHint>,
 }
 
 impl Config {
@@ -108,15 +129,19 @@ impl Config {
     /// Fails with a [`ConfigError`] naming the first offending line.
     pub fn parse(text: &str) -> Result<Self, ConfigError> {
         let mut functions = Vec::new();
+        let mut tables = Vec::new();
         for (index, raw) in text.lines().enumerate() {
             let line = index + 1;
             let trimmed = raw.trim();
             if trimmed.is_empty() || trimmed.starts_with('#') {
                 continue;
             }
-            functions.push(parse_line(trimmed, line)?);
+            match parse_line(trimmed, line)? {
+                Line::Function(spec) => functions.push(spec),
+                Line::Hint(hint) => tables.push(hint),
+            }
         }
-        Ok(Self { functions })
+        Ok(Self { functions, tables })
     }
 
     /// Loads and parses a config file.
@@ -140,9 +165,47 @@ impl Config {
     }
 }
 
+/// One parsed line: a function declaration or a table hint.
+enum Line {
+    Function(FunctionSpec),
+    Hint(TableHint),
+}
+
 /// Parses one non-comment line.
-fn parse_line(trimmed: &str, line: usize) -> Result<FunctionSpec, ConfigError> {
+fn parse_line(trimmed: &str, line: usize) -> Result<Line, ConfigError> {
     let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+    if matches!(tokens[0], "arm_table" | "thumb_table") {
+        return parse_table_hint(&tokens, line).map(Line::Hint);
+    }
+    parse_function(&tokens, line).map(Line::Function)
+}
+
+/// Parses an `arm_table`/`thumb_table` line.
+fn parse_table_hint(tokens: &[&str], line: usize) -> Result<TableHint, ConfigError> {
+    let state = if tokens[0] == "arm_table" {
+        State::Arm
+    } else {
+        State::Thumb
+    };
+    if tokens.len() != 3 {
+        return Err(ConfigError::Syntax { line });
+    }
+    let addr = parse_addr(tokens[1]).ok_or(ConfigError::Address {
+        line,
+        text: tokens[1].to_string(),
+    })?;
+    let entries = tokens[2]
+        .parse::<u32>()
+        .map_err(|_| ConfigError::Syntax { line })?;
+    Ok(TableHint {
+        addr,
+        entries,
+        state,
+    })
+}
+
+/// Parses one function declaration line.
+fn parse_function(tokens: &[&str], line: usize) -> Result<FunctionSpec, ConfigError> {
     let (mut cursor, state, module) = match tokens[0] {
         "arm_func" => (1usize, State::Arm, None),
         "thumb_func" => (1, State::Thumb, None),
@@ -241,6 +304,13 @@ impl fmt::Display for Config {
                 write!(f, " {name}")?;
             }
             writeln!(f)?;
+        }
+        for hint in &self.tables {
+            let keyword = match hint.state {
+                State::Arm => "arm_table",
+                State::Thumb => "thumb_table",
+            };
+            writeln!(f, "{keyword} {:#010x} {}", hint.addr, hint.entries)?;
         }
         Ok(())
     }

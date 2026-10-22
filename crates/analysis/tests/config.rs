@@ -40,8 +40,48 @@ fn parse_handles_comments_names_and_modules() {
                     module: Some("main".into()),
                 },
             ],
+            tables: Vec::new(),
         }
     );
+}
+
+#[test]
+fn table_hints_parse_and_round_trip() {
+    let text = "# switch hints\narm_table 0x08000100 8\nthumb_table 0x08000200 4\n";
+    let config = Config::parse(text).expect("parse");
+    assert_eq!(
+        config.tables,
+        vec![
+            analysis::TableHint {
+                addr: 0x0800_0100,
+                entries: 8,
+                state: analysis::State::Arm,
+            },
+            analysis::TableHint {
+                addr: 0x0800_0200,
+                entries: 4,
+                state: analysis::State::Thumb,
+            },
+        ]
+    );
+    assert_eq!(
+        config.to_string(),
+        "arm_table 0x08000100 8\nthumb_table 0x08000200 4\n"
+    );
+    assert_eq!(Config::parse(&config.to_string()).expect("reparse"), config);
+    // Bad entry counts and wrong arity are typed errors.
+    match Config::parse("arm_table 0x08000100 xx\n") {
+        Err(ConfigError::Syntax { line: 1 }) => {}
+        other => panic!("expected syntax error, got {other:?}"),
+    }
+    match Config::parse("arm_table 0x08000100\n") {
+        Err(ConfigError::Syntax { line: 1 }) => {}
+        other => panic!("expected syntax error, got {other:?}"),
+    }
+    match Config::parse("thumb_table 0xZZ 4\n") {
+        Err(ConfigError::Address { line: 1, .. }) => {}
+        other => panic!("expected address error, got {other:?}"),
+    }
 }
 
 #[test]

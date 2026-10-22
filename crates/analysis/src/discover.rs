@@ -25,7 +25,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use decode::{ArmInstr, Condition, Register, ThumbHiOp, ThumbInstr, decode_arm, decode_thumb};
 use rom::Image;
 
-use crate::flags::{Canonical, FlagMap, Flags, Seed, State};
+use crate::flags::{Canonical, FlagMap, Flags, Run, Seed, State};
 use crate::traverse::{Call, Stop, StopReason, WalkOptions, walk};
 
 /// Acceptance gates for a candidate function.
@@ -70,27 +70,23 @@ pub struct Discovery {
     pub calls: Vec<Call>,
 }
 
-/// Runs discovery: a marking global traversal from `seeds`, candidate
-/// collection, and gated function-body scoring. Duplicate seeds (the
-/// header entry re-listed in a config, say) are collapsed so their BL
-/// calls are recorded once.
+/// Runs discovery: a marking global traversal from `paths`, candidate
+/// collection, and gated function-body scoring. `provided` functions
+/// (config entries and the seeds) are accepted up front and analyzed
+/// first; their BL targets join the candidate queue until it reaches a
+/// fixpoint. Callers pass `provided` inside `paths` so provided code is
+/// marked. Duplicate seeds (the header entry re-listed by a reloaded
+/// config, say) are collapsed so BL calls are recorded once.
 pub fn discover(
     image: &Image,
     map: &mut FlagMap,
-    seeds: &[Seed],
+    provided: &[Seed],
+    paths: &[Seed],
     thresholds: Thresholds,
 ) -> Discovery {
-    let mut unique: Vec<Seed> = Vec::with_capacity(seeds.len());
-    for seed in seeds {
-        if !unique
-            .iter()
-            .any(|known| known.addr == seed.addr && known.state == seed.state)
-        {
-            unique.push(*seed);
-        }
-    }
-    let seeds = &unique;
-    let traversal = walk(image, map, seeds, WalkOptions::global());
+    let provided = dedup_seeds(provided);
+    let paths = dedup_seeds(paths);
+    let traversal = walk(image, map, &paths, WalkOptions::global());
 
     let mut call_counts: HashMap<(u32, State), u32> = HashMap::new();
     for call in &traversal.calls {
@@ -110,8 +106,8 @@ pub fn discover(
             candidates.insert((site, state));
         }
     }
-    let provided: HashSet<(u32, State)> = seeds.iter().map(|s| (s.addr, s.state)).collect();
-    let mut functions: Vec<Function> = seeds
+    let known: HashSet<(u32, State)> = provided.iter().map(|s| (s.addr, s.state)).collect();
+    let mut functions: Vec<Function> = provided
         .iter()
         .map(|s| Function {
             addr: s.addr,
@@ -120,7 +116,7 @@ pub fn discover(
         .collect();
     let mut rejected: Vec<Function> = Vec::new();
     let mut queue: Vec<(u32, State)> = candidates.into_iter().collect();
-    let mut scored = provided;
+    let mut scored = known;
     while let Some((addr, state)) = queue.pop() {
         if !scored.insert((addr, state)) {
             continue;
@@ -159,6 +155,20 @@ fn body_walk(image: &Image, map: &mut FlagMap, addr: u32, state: State) -> (Vec<
     (out.calls, out.stops)
 }
 
+/// Collapses duplicate seeds, keeping the first occurrence.
+fn dedup_seeds(seeds: &[Seed]) -> Vec<Seed> {
+    let mut unique: Vec<Seed> = Vec::with_capacity(seeds.len());
+    for seed in seeds {
+        if !unique
+            .iter()
+            .any(|known| known.addr == seed.addr && known.state == seed.state)
+        {
+            unique.push(*seed);
+        }
+    }
+    unique
+}
+
 /// Finds `push {.., lr}` prologue sites inside EXEC-marked runs, scanned
 /// in both states; the call-evidence gate in [`discover`] filters sites
 /// scanned in the state callers never use.
@@ -170,8 +180,8 @@ fn push_return_sites(image: &Image, map: &FlagMap) -> Vec<(u32, State)> {
         if !run.flags.contains(Flags::EXEC) {
             continue;
         }
-        let end = run.addr + run.len as u32;
-        let mut word_addr = run.addr;
+        let (start, end) = aligned_run(run, canon, 4);
+        let mut word_addr = start;
         while word_addr + 4 <= end {
             if let Some(word) = read_word(bytes, canon, word_addr)
                 && let ArmInstr::BlockTransfer {
@@ -187,7 +197,8 @@ fn push_return_sites(image: &Image, map: &FlagMap) -> Vec<(u32, State)> {
             }
             word_addr += 4;
         }
-        let mut half_addr = run.addr;
+        let (start, end) = aligned_run(run, canon, 2);
+        let mut half_addr = start;
         while half_addr + 2 <= end {
             if let Some(half) = read_half(bytes, canon, half_addr)
                 && let ThumbInstr::PushPop {
@@ -202,6 +213,15 @@ fn push_return_sites(image: &Image, map: &FlagMap) -> Vec<(u32, State)> {
         }
     }
     sites
+}
+
+/// Instruction-aligned `[start, end)` bounds for scanning a run: runs
+/// split at byte granularity (an interior FUNC_START mark, say), so
+/// scanning must stay aligned to the image base in `step` units.
+fn aligned_run(run: Run, canon: Canonical, step: u32) -> (u32, u32) {
+    let misalign = (run.addr - canon.base()) % step;
+    let start = run.addr + (step - misalign) % step;
+    (start, run.addr + run.len as u32)
 }
 
 /// Counts consecutive decodable instructions from `addr`, stopping at

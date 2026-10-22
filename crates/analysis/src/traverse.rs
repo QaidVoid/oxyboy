@@ -21,7 +21,7 @@ use std::collections::HashSet;
 
 use decode::{
     ArmInstr, Condition, DataOp, Register, ShifterOperand, ThumbHiOp, ThumbImmOp, ThumbInstr,
-    TransferOffset, decode_arm, decode_thumb,
+    ThumbShift, TransferOffset, decode_arm, decode_thumb,
 };
 use rom::Image;
 
@@ -327,6 +327,23 @@ impl PathWalk<'_, '_> {
                                 Some(u32::from(value).rotate_right(u32::from(rotate) * 2));
                             addr = addr.wrapping_add(4);
                         }
+                        // Any other register-writing instruction produces a
+                        // value the traversal does not model, so the
+                        // destination's stale proof is invalidated.
+                        ArmInstr::DataProcessing { rd, .. }
+                        | ArmInstr::Multiply { rd, .. }
+                        | ArmInstr::Swap { rd, .. }
+                        | ArmInstr::PsrRead { rd, .. }
+                        | ArmInstr::LoadStore { rd, .. }
+                        | ArmInstr::LoadStoreHalfwordSigned { rd, .. } => {
+                            regs[rd.bits() as usize] = None;
+                            addr = addr.wrapping_add(4);
+                        }
+                        ArmInstr::MultiplyLong { rd_hi, rd_lo, .. } => {
+                            regs[rd_hi.bits() as usize] = None;
+                            regs[rd_lo.bits() as usize] = None;
+                            addr = addr.wrapping_add(4);
+                        }
                         _ => addr = addr.wrapping_add(4),
                     }
                 }
@@ -396,24 +413,30 @@ impl PathWalk<'_, '_> {
                             op: ThumbHiOp::Bx,
                             rd: _,
                             rs,
-                        } => match regs[rs.bits() as usize] {
-                            Some(value) => {
-                                state = if value & 1 == 1 {
-                                    State::Thumb
-                                } else {
-                                    State::Arm
-                                };
-                                regs = [None; 16];
-                                if !self.jump(value & !1, state) {
-                                    return;
-                                }
-                                addr = value & !1;
-                            }
-                            None => {
-                                self.stop(addr, state, StopReason::UnknownTarget);
+                        } => {
+                            if rs == Register::Lr && regs[rs.bits() as usize].is_none() {
+                                self.stop(addr, state, StopReason::Return);
                                 return;
                             }
-                        },
+                            match regs[rs.bits() as usize] {
+                                Some(value) => {
+                                    state = if value & 1 == 1 {
+                                        State::Thumb
+                                    } else {
+                                        State::Arm
+                                    };
+                                    regs = [None; 16];
+                                    if !self.jump(value & !1, state) {
+                                        return;
+                                    }
+                                    addr = value & !1;
+                                }
+                                None => {
+                                    self.stop(addr, state, StopReason::UnknownTarget);
+                                    return;
+                                }
+                            }
+                        }
                         ThumbInstr::HighRegisterOperation {
                             op: ThumbHiOp::Mov,
                             rd: Register::Pc,
@@ -443,9 +466,7 @@ impl PathWalk<'_, '_> {
                             rd,
                             rs,
                         } if rd != Register::Pc => {
-                            if let Some(value) = regs[rs.bits() as usize] {
-                                regs[rd.bits() as usize] = Some(value);
-                            }
+                            regs[rd.bits() as usize] = regs[rs.bits() as usize];
                             addr = addr.wrapping_add(2);
                         }
                         ThumbInstr::PushPop {
@@ -456,6 +477,27 @@ impl PathWalk<'_, '_> {
                             self.stop(addr, state, StopReason::Return);
                             return;
                         }
+                        ThumbInstr::ShiftedImmediate { kind, rd, rm, imm5 } => {
+                            regs[rd.bits() as usize] =
+                                regs[rm.bits() as usize].map(|value| match kind {
+                                    ThumbShift::Lsl => value << imm5,
+                                    ThumbShift::Lsr => {
+                                        if imm5 == 0 {
+                                            0
+                                        } else {
+                                            value >> imm5
+                                        }
+                                    }
+                                    ThumbShift::Asr => {
+                                        if imm5 == 0 {
+                                            (value as i32 >> 31) as u32
+                                        } else {
+                                            ((value as i32) >> imm5) as u32
+                                        }
+                                    }
+                                });
+                            addr = addr.wrapping_add(2);
+                        }
                         ThumbInstr::ImmediateOperation {
                             op: ThumbImmOp::Mov,
                             rd,
@@ -464,13 +506,37 @@ impl PathWalk<'_, '_> {
                             regs[rd.bits() as usize] = Some(u32::from(imm8));
                             addr = addr.wrapping_add(2);
                         }
-                        ThumbInstr::LoadStoreMultiple {
+                        // Mirror of the ARM rule: instructions that write a
+                        // register without producing a modeled value drop
+                        // its stale proof.
+                        ThumbInstr::AddSubtract { rd, .. }
+                        | ThumbInstr::ImmediateOperation { rd, .. }
+                        | ThumbInstr::AluOperation { rd, .. }
+                        | ThumbInstr::LoadStoreRegisterOffset { rd, .. }
+                        | ThumbInstr::LoadStoreSignedRegisterOffset { rd, .. }
+                        | ThumbInstr::LoadStoreImmediateOffset { rd, .. }
+                        | ThumbInstr::LoadStoreHalfwordImmediate { rd, .. }
+                        | ThumbInstr::LoadStoreStack { rd, .. }
+                        | ThumbInstr::LoadAddress { rd, .. } => {
+                            regs[rd.bits() as usize] = None;
+                            addr = addr.wrapping_add(2);
+                        }
+                        ThumbInstr::PushPop {
+                            pop: true,
+                            include_pc_or_lr: false,
+                            registers,
+                        }
+                        | ThumbInstr::LoadStoreMultiple {
                             load: true,
                             registers,
                             ..
-                        } if registers & (1 << Register::Pc.bits()) != 0 => {
-                            self.stop(addr, state, StopReason::Return);
-                            return;
+                        } => {
+                            for (bit, reg) in regs.iter_mut().enumerate().take(8) {
+                                if registers & (1 << bit) != 0 {
+                                    *reg = None;
+                                }
+                            }
+                            addr = addr.wrapping_add(2);
                         }
                         _ => addr = addr.wrapping_add(2),
                     }
