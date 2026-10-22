@@ -14,9 +14,9 @@
 //! `decode::text`), which assembles differently; handling those is
 //! the fallback work, and the corpus harness pins the invariant.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-use analysis::{Canonical, FlagMap, Flags};
+use analysis::{Canonical, Config, FlagMap, Flags};
 use decode::{ArmInstr, Condition, ThumbInstr, arm_text, decode_arm, decode_thumb, thumb_text};
 use rom::Image;
 
@@ -89,57 +89,21 @@ pub fn emit_with_warnings(image: &Image, map: &FlagMap) -> (String, Vec<Warning>
     let bytes = image.bytes();
     let canon = map.canonical();
     let flags = flag_bytes(map, bytes.len());
-
     let labels = collect_labels(bytes, &flags, canon.base());
     let mut warnings = Vec::new();
-    let mut out = String::new();
-    out.push_str(".syntax unified\n");
-    out.push_str(".cpu arm7tdmi\n");
-    out.push_str(".section .text, \"ax\"\n");
-    let mut dialect = Dialect::Arm;
-    out.push_str(".arm\n");
-
-    let mut index = 0usize;
-    while index < bytes.len() {
-        let addr = canon.base() + index as u32;
-        if let Some(label) = labels.get(&addr) {
-            out.push_str(&format!("{label}:\n"));
-        }
-        let run = Flags::from_bits(flags[index]);
-        if run.contains(Flags::EXEC) {
-            warn_misaligned_thumb_function(addr, run, &mut warnings);
-            let warned = warnings.len();
-            let (step, line) = if run.contains(Flags::THUMB) {
-                if dialect != Dialect::Thumb {
-                    out.push_str(".thumb\n");
-                    dialect = Dialect::Thumb;
-                }
-                emit_thumb(bytes, &flags, index, addr, &labels, &mut warnings)
-            } else {
-                if dialect != Dialect::Arm {
-                    out.push_str(".arm\n");
-                    dialect = Dialect::Arm;
-                }
-                emit_arm(bytes, &flags, index, addr, &labels, &mut warnings)
-            };
-            for warning in &warnings[warned..] {
-                out.push_str(&format!("@ WARNING: {}\n", warning.message));
-            }
-            out.push_str(&line);
-            out.push('\n');
-            index += step;
-        } else {
-            index += emit_data(
-                bytes,
-                &flags,
-                canon,
-                index,
-                &labels,
-                &mut warnings,
-                &mut out,
-            );
-        }
-    }
+    let mut refs = BTreeSet::new();
+    let mut ctx = Ctx {
+        bytes,
+        flags: &flags,
+        canon,
+        labels: &labels,
+        warnings: &mut warnings,
+        refs: &mut refs,
+        limit: bytes.len(),
+    };
+    let mut out = String::from(".syntax unified\n.cpu arm7tdmi\n.section .text, \"ax\"\n.arm\n");
+    let end = canon.base() + bytes.len() as u32;
+    out.push_str(&emit_span_body(&mut ctx, canon.base(), end));
     (out, warnings)
 }
 
@@ -148,6 +112,257 @@ pub fn emit_with_warnings(image: &Image, map: &FlagMap) -> (String, Vec<Warning>
 #[must_use]
 pub fn emit(image: &Image, map: &FlagMap) -> String {
     emit_with_warnings(image, map).0
+}
+
+/// Shared state for one emission pass over a byte range.
+struct Ctx<'a> {
+    bytes: &'a [u8],
+    flags: &'a [u8],
+    canon: Canonical,
+    labels: &'a BTreeMap<u32, String>,
+    warnings: &'a mut Vec<Warning>,
+    /// Addresses of labels referenced while emitting this span.
+    refs: &'a mut BTreeSet<u32>,
+    /// Exclusive byte offset the pass must not size instructions or
+    /// data runs past (the span end, clamped to the image).
+    limit: usize,
+}
+
+impl Ctx<'_> {
+    /// The label at `target`, recording the reference.
+    fn label(&mut self, target: u32) -> Option<&String> {
+        if let Some(name) = self.labels.get(&target) {
+            self.refs.insert(target);
+            Some(name)
+        } else {
+            None
+        }
+    }
+
+    /// Records one fallback warning.
+    fn warn(&mut self, addr: u32, fallback: Fallback, message: String) {
+        self.warnings.push(Warning {
+            addr,
+            fallback,
+            message,
+        });
+    }
+}
+
+/// Emits the bytes of `[start, end)` (canonical addresses). Dialect
+/// switches start from ARM, so every span is a valid file body. The
+/// pass reads at most `end` bytes: an instruction whose span would
+/// cross `end` demotes to raw bytes like any truncated span.
+fn emit_span_body(ctx: &mut Ctx<'_>, start: u32, end: u32) -> String {
+    let base = ctx.canon.base();
+    ctx.limit = ((end - base) as usize).min(ctx.bytes.len());
+    let mut out = String::new();
+    let mut dialect = Dialect::Arm;
+    let mut index = (start - base) as usize;
+    while index < ctx.limit {
+        let addr = base + index as u32;
+        if let Some(label) = ctx.labels.get(&addr) {
+            out.push_str(&format!("{label}:\n"));
+        }
+        let run = Flags::from_bits(ctx.flags[index]);
+        if run.contains(Flags::EXEC) {
+            warn_misaligned_thumb_function(addr, run, ctx.warnings);
+            let warned = ctx.warnings.len();
+            let (step, line) = if run.contains(Flags::THUMB) {
+                if dialect != Dialect::Thumb {
+                    out.push_str(".thumb\n");
+                    dialect = Dialect::Thumb;
+                }
+                emit_thumb(ctx, index, addr)
+            } else {
+                if dialect != Dialect::Arm {
+                    out.push_str(".arm\n");
+                    dialect = Dialect::Arm;
+                }
+                emit_arm(ctx, index, addr)
+            };
+            for warning in &ctx.warnings[warned..] {
+                out.push_str(&format!("@ WARNING: {}\n", warning.message));
+            }
+            out.push_str(&line);
+            out.push('\n');
+            index += step;
+        } else {
+            index += emit_data(ctx, index, &mut out);
+        }
+    }
+    out
+}
+
+/// A module split plan: contiguous address spans, one output file per
+/// stem. Built from config `<module>.s` claims; regions no module
+/// claims belong to the `default` stem.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ModulePlan {
+    spans: Vec<(u32, String)>,
+}
+
+/// Stem of the catch-all module for unclaimed regions.
+const DEFAULT_STEM: &str = "default";
+
+impl ModulePlan {
+    /// Builds a plan from config module claims. Every claimed address
+    /// opens a span owned by its module. Boundaries snap up to
+    /// 4-aligned addresses (claims inside one word collapse) so every
+    /// module section's size is a multiple of the assembler's
+    /// alignment for its contents, which is what keeps the exact
+    /// placement padding-free.
+    #[must_use]
+    pub fn from_config(config: &Config, image: &Image) -> Self {
+        let canon = Canonical::for_kind(image.kind());
+        let base = canon.base();
+        let end = base + image.bytes().len() as u32;
+        let mut boundaries: BTreeMap<u32, String> = BTreeMap::new();
+        for function in &config.functions {
+            let Some(stem) = function.module.as_deref() else {
+                continue;
+            };
+            let Some(addr) = canon.canonicalize(function.addr) else {
+                continue;
+            };
+            let snapped = addr.next_multiple_of(4);
+            if snapped > base && snapped < end {
+                boundaries.insert(snapped, stem.to_string());
+            }
+        }
+        let mut spans: Vec<(u32, String)> = Vec::new();
+        match boundaries.first_key_value() {
+            Some((&first, _)) if first == base => {}
+            _ => spans.push((base, DEFAULT_STEM.to_string())),
+        }
+        spans.extend(boundaries.iter().map(|(&addr, stem)| (addr, stem.clone())));
+        spans.dedup_by(|a, b| a.1 == b.1);
+        Self { spans }
+    }
+
+    /// The spans in address order as `(start, stem)`.
+    #[must_use]
+    pub fn spans(&self) -> &[(u32, String)] {
+        &self.spans
+    }
+}
+
+/// The per-module emission: one assembly file per module stem plus a
+/// GNU ld script placing each module section at its exact image
+/// address, so linking the per-module objects reproduces the image.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModuleEmission {
+    /// Assembly files keyed by module stem.
+    pub files: BTreeMap<String, String>,
+    /// GNU ld script placing every module section.
+    pub script: String,
+    /// Fallback warnings across all modules.
+    pub warnings: Vec<Warning>,
+}
+
+/// Emits one assembly file per [`ModulePlan`] stem and the matching
+/// linker script.
+///
+/// Every label referenced from a module other than its own is declared
+/// `.global` in the defining module's file: without the declaration the
+/// link fails with an undefined reference instead of silently
+/// misplacing bytes. Disjoint spans of one stem share the file under
+/// differently numbered sections.
+#[must_use]
+pub fn emit_modules(image: &Image, map: &FlagMap, plan: &ModulePlan) -> ModuleEmission {
+    let bytes = image.bytes();
+    let canon = map.canonical();
+    let flags = flag_bytes(map, bytes.len());
+    let labels = collect_labels(bytes, &flags, canon.base());
+    let mut warnings = Vec::new();
+    let end = canon.base() + bytes.len() as u32;
+
+    // One section per span; a stem with disjoint spans gets numbered
+    // sections so every output section name stays unique.
+    let mut sections: Vec<(String, String, u32)> = Vec::new();
+    let mut used: BTreeMap<String, u32> = BTreeMap::new();
+    for &(start, ref stem) in plan.spans() {
+        let count = used.entry(stem.clone()).or_default();
+        let section = if *count == 0 {
+            format!(".text.{stem}")
+        } else {
+            format!(".text.{stem}.{count}")
+        };
+        *count += 1;
+        sections.push((stem.clone(), section, start));
+    }
+
+    let mut pass: Vec<(String, String, String, BTreeSet<u32>)> = Vec::new();
+    for i in 0..sections.len() {
+        let span_end = sections.get(i + 1).map_or(end, |next| next.2);
+        let mut refs = BTreeSet::new();
+        let mut ctx = Ctx {
+            bytes,
+            flags: &flags,
+            canon,
+            labels: &labels,
+            warnings: &mut warnings,
+            refs: &mut refs,
+            limit: bytes.len(),
+        };
+        let body = emit_span_body(&mut ctx, sections[i].2, span_end);
+        pass.push((sections[i].0.clone(), sections[i].1.clone(), body, refs));
+    }
+
+    // The module that defines each label.
+    let mut definer: BTreeMap<u32, &str> = BTreeMap::new();
+    for (i, &(ref stem, _, start)) in sections.iter().enumerate() {
+        let span_end = sections.get(i + 1).map_or(end, |next| next.2);
+        for label in labels.range(start..span_end).map(|(&addr, _)| addr) {
+            definer.insert(label, stem);
+        }
+    }
+
+    // Globals: referenced from a foreign module, declared in the
+    // defining module's file.
+    let mut globals: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (stem, _, _, refs) in &pass {
+        for &addr in refs {
+            if let Some(owner) = definer.get(&addr)
+                && *owner != stem
+            {
+                globals
+                    .entry((*owner).to_string())
+                    .or_default()
+                    .insert(labels[&addr].clone());
+            }
+        }
+    }
+
+    let mut files: BTreeMap<String, String> = BTreeMap::new();
+    let mut script = String::from("/* Generated by oxyboy: module placement. */\nSECTIONS\n{\n");
+    for (stem, section, body, _) in pass {
+        let file = files.entry(stem.clone()).or_default();
+        if file.is_empty() {
+            file.push_str(".syntax unified\n.cpu arm7tdmi\n");
+            if let Some(names) = globals.get(&stem) {
+                for name in names {
+                    file.push_str(&format!(".global {name}\n"));
+                }
+            }
+        }
+        file.push_str(&format!(".section {section}, \"ax\"\n.arm\n"));
+        file.push_str(&body);
+        let start = sections
+            .iter()
+            .find(|(_, s, _)| s == &section)
+            .map_or(0, |&(_, _, start)| start);
+        script.push_str(&format!(
+            "    {section} 0x{start:08x} : {{ *({section}) }}\n"
+        ));
+    }
+    script.push_str("}\n");
+
+    ModuleEmission {
+        files,
+        script,
+        warnings,
+    }
 }
 
 /// Warns once per THUMB function label that is not halfword-aligned.
@@ -289,71 +504,55 @@ fn note_target(flags: &[u8], base: u32, target: u32, labels: &mut BTreeMap<u32, 
         labels.insert(target, format!("loc_{target:08x}"));
     }
 }
-
 /// Emits one ARM instruction, returning its byte size. Falls back to
 /// raw bytes when the span is not a clean 4-byte instruction or when
 /// the encoding has no faithful assembly form.
-fn emit_arm(
-    bytes: &[u8],
-    flags: &[u8],
-    index: usize,
-    addr: u32,
-    labels: &BTreeMap<u32, String>,
-    warnings: &mut Vec<Warning>,
-) -> (usize, String) {
-    if !span_ok(flags, index, 4, bytes.len(), false) || label_inside(labels, addr, 4) {
-        return demote(bytes, flags, labels, index, 4, warnings, addr);
+fn emit_arm(ctx: &mut Ctx<'_>, index: usize, addr: u32) -> (usize, String) {
+    if !span_ok(ctx, index, 4, false) || label_inside(ctx.labels, addr, 4) {
+        return demote(ctx, index, 4, addr);
     }
-    let word = word(bytes, index);
+    let word = word(ctx.bytes, index);
     let instr = decode_arm(word);
     if let ArmInstr::Branch { link, offset } = instr {
         let target = addr.wrapping_add(8).wrapping_add(offset as u32);
-        if let Some(label) = labels.get(&target) {
+        if let Some(label) = ctx.label(target) {
             let cond = cond_suffix(word);
             return (
                 4,
                 format!("{}{} {}", if link { "bl" } else { "b" }, cond, label),
             );
         }
-        warnings.push(Warning {
+        ctx.warn(
             addr,
-            fallback: Fallback::BranchWithoutLabel,
-            message: format!(
+            Fallback::BranchWithoutLabel,
+            format!(
                 "branch-without-label at 0x{addr:08x}: target 0x{target:08x} \
                  has no label; emitting raw bytes"
             ),
-        });
-        return (4, raw_bytes(bytes, index, 4));
+        );
+        return (4, raw_bytes(ctx.bytes, index, 4));
     }
     if instr.is_unpredictable() {
-        warnings.push(Warning {
+        ctx.warn(
             addr,
-            fallback: Fallback::UnpredictableEncoding,
-            message: format!(
+            Fallback::UnpredictableEncoding,
+            format!(
                 "unpredictable-encoding at 0x{addr:08x}: word 0x{word:08X} \
                  is UNPREDICTABLE on the ARM7TDMI; emitting raw bytes"
             ),
-        });
-        return (4, raw_bytes(bytes, index, 4));
+        );
+        return (4, raw_bytes(ctx.bytes, index, 4));
     }
     (4, arm_text(word))
 }
-
 /// Emits one THUMB instruction (BL consumes its second halfword),
 /// returning its byte size. Falls back like [`emit_arm`].
-fn emit_thumb(
-    bytes: &[u8],
-    flags: &[u8],
-    index: usize,
-    addr: u32,
-    labels: &BTreeMap<u32, String>,
-    warnings: &mut Vec<Warning>,
-) -> (usize, String) {
-    if !span_ok(flags, index, 2, bytes.len(), true) || label_inside(labels, addr, 2) {
-        return demote(bytes, flags, labels, index, 2, warnings, addr);
+fn emit_thumb(ctx: &mut Ctx<'_>, index: usize, addr: u32) -> (usize, String) {
+    if !span_ok(ctx, index, 2, true) || label_inside(ctx.labels, addr, 2) {
+        return demote(ctx, index, 2, addr);
     }
-    let first = half(bytes, index);
-    let next = half(bytes, index + 2);
+    let first = half(ctx.bytes, index);
+    let next = half(ctx.bytes, index + 2);
     let instr = decode_thumb(first, next);
     let target = match instr {
         ThumbInstr::ConditionalBranch { offset, .. }
@@ -368,24 +567,24 @@ fn emit_thumb(
         // `bl lr+N` pseudo-syntax (GBATEK THUMB.19): no static target
         // and no assembler accepts the text, so raw bytes.
         ThumbInstr::LongBranchWithLinkFromLr { .. } => {
-            warnings.push(Warning {
+            ctx.warn(
                 addr,
-                fallback: Fallback::BranchWithoutLabel,
-                message: format!(
+                Fallback::BranchWithoutLabel,
+                format!(
                     "branch-without-label at 0x{addr:08x}: BL from LR has \
                      no static target; emitting raw bytes"
                 ),
-            });
-            return (4, raw_bytes(bytes, index, 4));
+            );
+            return (4, raw_bytes(ctx.bytes, index, 4));
         }
         _ => None,
     };
     if let Some((size, target)) = target {
-        let size_ok = span_ok(flags, index, size, bytes.len(), true);
-        if !size_ok || label_inside(labels, addr, size as u32) {
-            return demote(bytes, flags, labels, index, size, warnings, addr);
+        let size_ok = span_ok(ctx, index, size, true);
+        if !size_ok || label_inside(ctx.labels, addr, size as u32) {
+            return demote(ctx, index, size, addr);
         }
-        if let Some(label) = labels.get(&target) {
+        if let Some(label) = ctx.label(target) {
             let text = match instr {
                 ThumbInstr::ConditionalBranch { cond, .. } => {
                     format!("b{} {}", cond.mnemonic(), label)
@@ -395,43 +594,38 @@ fn emit_thumb(
             };
             return (size, text);
         }
-        warnings.push(Warning {
+        ctx.warn(
             addr,
-            fallback: Fallback::BranchWithoutLabel,
-            message: format!(
+            Fallback::BranchWithoutLabel,
+            format!(
                 "branch-without-label at 0x{addr:08x}: target \
                  0x{target:08x} has no label; emitting raw bytes"
             ),
-        });
-        return (size, raw_bytes(bytes, index, size));
+        );
+        return (size, raw_bytes(ctx.bytes, index, size));
     }
     if instr.is_unpredictable() {
-        warnings.push(Warning {
+        ctx.warn(
             addr,
-            fallback: Fallback::UnpredictableEncoding,
-            message: format!(
+            Fallback::UnpredictableEncoding,
+            format!(
                 "unpredictable-encoding at 0x{addr:08x}: halfword \
                  0x{first:04X} is UNPREDICTABLE on the ARM7TDMI; emitting \
                  raw bytes"
             ),
-        });
-        return (2, raw_bytes(bytes, index, 2));
+        );
+        return (2, raw_bytes(ctx.bytes, index, 2));
     }
-    if matches!(instr, ThumbInstr::LongBranchWithLink { .. }) {
-        (4, thumb_text(first, next))
-    } else {
-        (2, thumb_text(first, 0))
-    }
+    (2, thumb_text(first, 0))
 }
-
 /// True when `size` bytes from `index` are all executed in the same
-/// state and fit in the image.
-fn span_ok(flags: &[u8], index: usize, size: usize, len: usize, thumb: bool) -> bool {
-    if index + size > len {
+/// state and fit before the pass limit.
+fn span_ok(ctx: &Ctx<'_>, index: usize, size: usize, thumb: bool) -> bool {
+    if index + size > ctx.limit {
         return false;
     }
     (index..index + size).all(|i| {
-        let run = Flags::from_bits(flags[i]);
+        let run = Flags::from_bits(ctx.flags[i]);
         run.contains(Flags::EXEC) && run.contains(Flags::THUMB) == thumb
     })
 }
@@ -459,39 +653,33 @@ fn byte_offset_to_next_label(
         .next()
         .map(|(target, _)| (*target - addr) as usize)
 }
-
 /// Emits up to `max` bytes from `index` as raw bytes and records the
 /// overlap warning. The run stops at the first label strictly inside
 /// the span (so the label still prints) and at non-executed bytes.
 /// Always emits at least one byte so the walk makes progress. Returns
 /// bytes consumed and the raw-bytes line.
-fn demote(
-    bytes: &[u8],
-    flags: &[u8],
-    labels: &BTreeMap<u32, String>,
-    index: usize,
-    max: usize,
-    warnings: &mut Vec<Warning>,
-    addr: u32,
-) -> (usize, String) {
-    warnings.push(Warning {
+fn demote(ctx: &mut Ctx<'_>, index: usize, max: usize, addr: u32) -> (usize, String) {
+    ctx.warn(
         addr,
-        fallback: Fallback::InstructionOverlapsLabel,
-        message: format!(
+        Fallback::InstructionOverlapsLabel,
+        format!(
             "instruction-overlaps-label at 0x{addr:08x}: instruction span \
              contains a label or is truncated; emitting raw bytes"
         ),
-    });
-    let limit = bytes.len().min(index + max);
-    let stop = byte_offset_to_next_label(labels, addr, max as u32)
+    );
+    let limit = ctx.limit.min(index + max);
+    let stop = byte_offset_to_next_label(ctx.labels, addr, max as u32)
         .unwrap_or(max)
         .min(max);
     let mut end = index + 1;
-    while end < limit && end - index < stop && Flags::from_bits(flags[end]).contains(Flags::EXEC) {
+    while end < limit
+        && end - index < stop
+        && Flags::from_bits(ctx.flags[end]).contains(Flags::EXEC)
+    {
         end += 1;
     }
     let step = end - index;
-    (step, raw_bytes(bytes, index, step))
+    (step, raw_bytes(ctx.bytes, index, step))
 }
 
 /// Renders `size` bytes from `index`: `.word` when aligned and whole,
@@ -508,51 +696,40 @@ fn raw_bytes(bytes: &[u8], index: usize, size: usize) -> String {
         .join(", ");
     format!(".byte {list}")
 }
-
 /// Emits data bytes from `index` on: aligned WORD runs as `.word`,
 /// everything else grouped into `.byte` lines. Returns bytes consumed.
 /// Byte runs stop at executed bytes (instructions render their own
-/// text) and at literal-pool starts (labeled and emitted as words).
-/// A word carrying the THUMB bit-0 pattern is emitted as a symbolic
-/// `label+1` reference only when the target is provably a labeled
-/// THUMB code address; otherwise the literal is kept with a warning.
-fn emit_data(
-    bytes: &[u8],
-    flags: &[u8],
-    canon: Canonical,
-    index: usize,
-    labels: &BTreeMap<u32, String>,
-    warnings: &mut Vec<Warning>,
-    out: &mut String,
-) -> usize {
-    let addr = canon.base() + index as u32;
-    if index + 4 <= bytes.len()
+/// text) and at labeled addresses (labels must print on their own
+/// line). A word carrying the THUMB bit-0 pattern is emitted as a
+/// symbolic `label+1` reference only when the target is provably a
+/// labeled THUMB code address; otherwise the literal is kept.
+fn emit_data(ctx: &mut Ctx<'_>, index: usize, out: &mut String) -> usize {
+    let addr = ctx.canon.base() + index as u32;
+    if index + 4 <= ctx.limit
         && index.is_multiple_of(4)
         && (index..index + 4).all(|i| {
-            let run = Flags::from_bits(flags[i]);
+            let run = Flags::from_bits(ctx.flags[i]);
             run.contains(Flags::WORD) && !run.contains(Flags::EXEC)
         })
-        && !label_inside(labels, addr, 4)
+        && !label_inside(ctx.labels, addr, 4)
     {
-        let value = u32::from_le_bytes(bytes[index..index + 4].try_into().expect("in-bounds"));
-        out.push_str(&word_line(
-            bytes, flags, canon, index, value, labels, warnings,
-        ));
+        let value = u32::from_le_bytes(ctx.bytes[index..index + 4].try_into().expect("in-bounds"));
+        out.push_str(&word_line(ctx, index, value));
         return 4;
     }
     let start = index;
-    let base = canon.base();
+    let base = ctx.canon.base();
     // Always emit at least one byte: the start byte itself may carry a
     // boundary flag (e.g. a pool label inside a demoted region).
     let mut end = index + 1;
-    while end < bytes.len()
+    while end < ctx.limit
         && end - start < 12
-        && !Flags::from_bits(flags[end]).contains(Flags::EXEC)
-        && !labels.contains_key(&(base + end as u32))
+        && !Flags::from_bits(ctx.flags[end]).contains(Flags::EXEC)
+        && !ctx.labels.contains_key(&(base + end as u32))
     {
         end += 1;
     }
-    let list = bytes[start..end]
+    let list = ctx.bytes[start..end]
         .iter()
         .map(|byte| format!("0x{byte:02X}"))
         .collect::<Vec<_>>()
@@ -560,38 +737,29 @@ fn emit_data(
     out.push_str(&format!(".byte {list}\n"));
     end - start
 }
-
 /// Renders one emitted word: `label+1` for provably safe THUMB
 /// pointers, the literal otherwise (warning when the target
 /// canonicalizes onto executed THUMB code that has no label).
-fn word_line(
-    bytes: &[u8],
-    flags: &[u8],
-    canon: Canonical,
-    index: usize,
-    value: u32,
-    labels: &BTreeMap<u32, String>,
-    warnings: &mut Vec<Warning>,
-) -> String {
-    let addr = canon.base() + index as u32;
+fn word_line(ctx: &mut Ctx<'_>, index: usize, value: u32) -> String {
+    let addr = ctx.canon.base() + index as u32;
     if value & 1 == 1
         && let Some(target) = value.checked_sub(1)
-        && let Some(offset) = canon.offset(target)
-        && offset < bytes.len()
-        && Flags::from_bits(flags[offset]).contains(Flags::EXEC | Flags::THUMB)
+        && let Some(offset) = ctx.canon.offset(target)
+        && offset < ctx.bytes.len()
+        && Flags::from_bits(ctx.flags[offset]).contains(Flags::EXEC | Flags::THUMB)
     {
-        if let Some(label) = labels.get(&target) {
+        if let Some(label) = ctx.label(target) {
             return format!(".word {label}+1\n");
         }
-        warnings.push(Warning {
+        ctx.warn(
             addr,
-            fallback: Fallback::WordReferenceNotProvable,
-            message: format!(
+            Fallback::WordReferenceNotProvable,
+            format!(
                 "word-reference-not-provable at 0x{addr:08x}: value \
                  0x{value:08X} points at unlabeled THUMB code; keeping the \
                  literal"
             ),
-        });
+        );
     }
     format!(".word 0x{value:08X}\n")
 }
@@ -622,6 +790,7 @@ fn cond_suffix(word: u32) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use analysis::{FunctionSpec, State};
 
     /// Builds a 256-byte multiboot-shaped image and a hand-marked map:
     /// an entry branch to 0xC0, an ARM `ldr`/`bx` pair, a literal pool
@@ -903,5 +1072,111 @@ mod tests {
             asm.contains(&format!("@ WARNING: {}\n", warnings[0].message)),
             "{asm}"
         );
+    }
+
+    /// One config function claimed into `module`.
+    fn claimed(addr: u32, module: &str) -> FunctionSpec {
+        let mut function = FunctionSpec::bare(addr, State::Arm);
+        function.module = Some(module.to_string());
+        function
+    }
+
+    #[test]
+    fn module_plan_snaps_claims_and_merges_adjacent_stems() {
+        let (image, _) = fixture();
+        let base = map_base(&image);
+        let config = Config {
+            functions: vec![
+                claimed(base + 0xC1, "a"),
+                claimed(base + 0xC2, "a"),
+                claimed(base + 0x88, "b"),
+            ],
+            tables: Vec::new(),
+        };
+        let plan = ModulePlan::from_config(&config, &image);
+        assert_eq!(
+            plan.spans(),
+            &[
+                (base, "default".to_string()),
+                (base + 0x88, "b".to_string()),
+                (base + 0xC4, "a".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn module_plan_ignores_claims_outside_the_image() {
+        let (image, _) = fixture();
+        let base = map_base(&image);
+        let len = image.bytes().len() as u32;
+        let config = Config {
+            functions: vec![
+                claimed(0x0300_0000, "nowhere"),
+                claimed(base + 0xC0 + len, "past_end"),
+            ],
+            tables: Vec::new(),
+        };
+        let plan = ModulePlan::from_config(&config, &image);
+        assert_eq!(plan.spans(), &[(base, "default".to_string())]);
+    }
+
+    /// The canonical base of a built image.
+    fn map_base(image: &Image) -> u32 {
+        Canonical::for_kind(image.kind()).base()
+    }
+
+    #[test]
+    fn modules_declare_globals_for_cross_module_references() {
+        let (image, map) = fixture();
+        let base = map.canonical().base();
+        let config = Config {
+            functions: vec![claimed(base + 0xC0, "code")],
+            tables: Vec::new(),
+        };
+        let plan = ModulePlan::from_config(&config, &image);
+        let emission = emit_modules(&image, &map, &plan);
+        assert_eq!(emission.files.len(), 2);
+        let default_file = &emission.files["default"];
+        let code_file = &emission.files["code"];
+        assert!(
+            default_file.contains(&format!("b loc_{:08x}\n", base + 0xC0)),
+            "{default_file}"
+        );
+        assert!(
+            code_file.contains(&format!(".global loc_{:08x}\n", base + 0xC0)),
+            "{code_file}"
+        );
+        assert!(!default_file.contains(".global"), "{default_file}");
+        assert!(
+            emission
+                .script
+                .contains(&format!(".text.default 0x{base:08x}")),
+            "{}",
+            emission.script
+        );
+        assert!(
+            emission
+                .script
+                .contains(&format!(".text.code 0x{:08x}", base + 0xC0)),
+            "{}",
+            emission.script
+        );
+    }
+
+    #[test]
+    fn modules_without_foreign_references_skip_globals() {
+        let (image, map) = fixture();
+        let base = map.canonical().base();
+        let config = Config {
+            functions: vec![claimed(base + 0xC4, "code")],
+            tables: Vec::new(),
+        };
+        let plan = ModulePlan::from_config(&config, &image);
+        let emission = emit_modules(&image, &map, &plan);
+        for (stem, file) in &emission.files {
+            assert!(!file.contains(".global"), "{stem}: {file}");
+        }
+        // The pool label and word stay inside the code module.
+        assert!(emission.files["code"].contains(".word 0x080000C9\n"));
     }
 }
