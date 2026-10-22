@@ -5,7 +5,7 @@
 //! paths of a conditional branch, PC-relative literal pools, BL with a
 //! fallthrough call, BX into THUMB via a pool word with bit 0 set, a
 //! THUMB conditional branch, an undefined encoding, and two BX-LR
-//! returns with unprovable targets.
+//! exits recorded as conventional returns.
 //!
 //! ```text
 //!     .arm
@@ -30,7 +30,7 @@
 //! 58: bx lr                 @ unknown target
 //! ```
 
-use analysis::{FlagMap, Flags, Run, Seed, State, Stop, StopReason, traverse};
+use analysis::{Call, FlagMap, Flags, Run, Seed, State, Stop, StopReason, traverse};
 use rom::Image;
 use testutil::synthetic::RomBuilder;
 
@@ -79,21 +79,28 @@ fn golden_layout_matches_the_expected_map() {
 
     let traversal = traverse(&image, &mut map, &seeds);
 
-    // The BL is the only call; every other path end is a proven-unknown
-    // BX LR or the undefined THUMB halfword.
-    assert_eq!(traversal.calls, vec![(0x0800_0030, 0x0800_0054)]);
+    // The BL is the only call; the two BX-LR exits end as conventional
+    // returns and the undefined THUMB halfword ends the third path.
+    assert_eq!(
+        traversal.calls,
+        vec![Call {
+            site: 0x0800_0030,
+            state: State::Arm,
+            target: 0x0800_0054,
+        }]
+    );
     assert_eq!(
         traversal.stops,
         vec![
             Stop {
                 addr: 0x0800_0058,
                 state: State::Arm,
-                reason: StopReason::UnknownTarget,
+                reason: StopReason::Return,
             },
             Stop {
                 addr: 0x0800_0038,
                 state: State::Arm,
-                reason: StopReason::UnknownTarget,
+                reason: StopReason::Return,
             },
             Stop {
                 addr: 0x0800_0046,
@@ -249,4 +256,42 @@ fn out_of_bounds_branch_is_recorded_not_marked() {
         }]
     );
     assert_eq!(map.get(0x0801_0000), Flags::EMPTY);
+}
+
+#[test]
+fn return_like_exits_record_conventional_returns() {
+    // A THUMB `push {lr}; pop {r0, pc}` body and an ARM `mov pc, lr`
+    // body both end as Return stops: LR is never proven, so these are
+    // conventional function exits, not unknown targets.
+    let mut bytes = RomBuilder::new().title("RETN").build();
+    // 0x40 (THUMB): push {lr}; movs r0, #1; pop {r0, pc}
+    bytes[0x40..0x46].copy_from_slice(&[0xB5, 0x00, 0x01, 0x20, 0x01, 0xBD]);
+    // 0x20 (ARM): mov pc, lr
+    bytes[0x20..0x24].copy_from_slice(&[0x0E, 0xF0, 0xA0, 0xE1]);
+    let image = Image::from_bytes(bytes).expect("parse");
+    let mut map = FlagMap::from_image(&image);
+    let seeds = vec![
+        Seed {
+            addr: 0x0800_0040,
+            state: State::Thumb,
+        },
+        Seed {
+            addr: 0x0800_0020,
+            state: State::Arm,
+        },
+    ];
+    let traversal = traverse(&image, &mut map, &seeds);
+    assert!(traversal.stops.contains(&Stop {
+        addr: 0x0800_0044,
+        state: State::Thumb,
+        reason: StopReason::Return,
+    }));
+    assert!(traversal.stops.contains(&Stop {
+        addr: 0x0800_0020,
+        state: State::Arm,
+        reason: StopReason::Return,
+    }));
+    assert_eq!(map.get(0x0800_0040), E | W);
+    assert_eq!(map.get(0x0800_0044), E | W);
+    assert_eq!(map.get(0x0800_0046), Flags::EMPTY);
 }

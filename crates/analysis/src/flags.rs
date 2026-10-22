@@ -16,7 +16,7 @@ const CART_BASE: u32 = 0x0800_0000;
 const MULTIBOOT_BASE: u32 = 0x0200_0000;
 
 /// Processor state a seeded entry point executes in.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum State {
     /// ARM state (4-byte instructions).
     Arm,

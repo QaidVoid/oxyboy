@@ -1,0 +1,247 @@
+//! Function configuration files: text declarations of known functions,
+//! loadable as analysis input and writable as `--config-out` output.
+//!
+//! Grammar, one function per line; blank lines and `#` comments are
+//! ignored:
+//!
+//! ```text
+//! arm_func <addr> [name]
+//! thumb_func <addr> [name]
+//! <module>.s [arm|thumb] <addr> [name]
+//! ```
+//!
+//! `<addr>` is canonical `0x`-prefixed hexadecimal. `arm_func` and
+//! `thumb_func` name the execution state directly. A `<module>.s` line
+//! additionally places the function into an output module (consumed by
+//! module splitting) and takes an optional state token that
+//! defaults to ARM, so the plain `<module>.s <addr> [name]` spelling
+//! parses too. Writing always produces the canonical spelling,
+//! including the explicit state token on module lines, so
+//! `parse(to_string())` round trips exactly.
+
+use std::fmt;
+use std::path::Path;
+
+use crate::flags::{Seed, State};
+
+/// Configuration parse or I/O failures, carrying the offending line.
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    /// The line is not a valid directive.
+    #[error(
+        "line {line}: expected `arm_func|thumb_func <addr> [name]`, `<module>.s [arm|thumb] <addr> [name]`, a comment, or a blank line"
+    )]
+    Syntax {
+        /// 1-based line number.
+        line: usize,
+    },
+    /// The address field is not `0x`-prefixed hexadecimal in `u32`
+    /// range.
+    #[error("line {line}: `{text}` is not a 0x-prefixed hex address")]
+    Address {
+        /// 1-based line number.
+        line: usize,
+        /// The offending token.
+        text: String,
+    },
+    /// A name or module stem is not a valid assembler identifier.
+    #[error("line {line}: `{text}` is not a valid assembler identifier")]
+    Name {
+        /// 1-based line number.
+        line: usize,
+        /// The offending token.
+        text: String,
+    },
+    /// Reading or writing the file failed.
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+}
+
+/// One declared function: where it lives, in which state, what it is
+/// called, and which output module it belongs to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FunctionSpec {
+    /// Canonical address of the first instruction.
+    pub addr: u32,
+    /// Execution state of the function body.
+    pub state: State,
+    /// Optional symbol name.
+    pub name: Option<String>,
+    /// Optional output module stem (`<module>.s`).
+    pub module: Option<String>,
+}
+
+impl FunctionSpec {
+    /// A function with no name and no module.
+    #[must_use]
+    pub fn bare(addr: u32, state: State) -> Self {
+        Self {
+            addr,
+            state,
+            name: None,
+            module: None,
+        }
+    }
+
+    /// The traversal seed for this function.
+    #[must_use]
+    pub fn to_seed(&self) -> Seed {
+        Seed {
+            addr: self.addr,
+            state: self.state,
+        }
+    }
+}
+
+/// A parsed config file: declared functions in file order.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Config {
+    /// Every declared function, in declaration order.
+    pub functions: Vec<FunctionSpec>,
+}
+
+impl Config {
+    /// Parses config text.
+    ///
+    /// # Errors
+    ///
+    /// Fails with a [`ConfigError`] naming the first offending line.
+    pub fn parse(text: &str) -> Result<Self, ConfigError> {
+        let mut functions = Vec::new();
+        for (index, raw) in text.lines().enumerate() {
+            let line = index + 1;
+            let trimmed = raw.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            functions.push(parse_line(trimmed, line)?);
+        }
+        Ok(Self { functions })
+    }
+
+    /// Loads and parses a config file.
+    ///
+    /// # Errors
+    ///
+    /// Propagates I/O and parse failures.
+    pub fn load(path: &Path) -> Result<Self, ConfigError> {
+        let text = std::fs::read_to_string(path)?;
+        Self::parse(&text)
+    }
+
+    /// Writes the canonical config text to a file.
+    ///
+    /// # Errors
+    ///
+    /// Propagates I/O failures.
+    pub fn save(&self, path: &Path) -> Result<(), ConfigError> {
+        std::fs::write(path, self.to_string())?;
+        Ok(())
+    }
+}
+
+/// Parses one non-comment line.
+fn parse_line(trimmed: &str, line: usize) -> Result<FunctionSpec, ConfigError> {
+    let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+    let (mut cursor, state, module) = match tokens[0] {
+        "arm_func" => (1usize, State::Arm, None),
+        "thumb_func" => (1, State::Thumb, None),
+        head if head.ends_with(".s") => {
+            let stem = &head[..head.len() - 2];
+            if !is_identifier(stem) {
+                return Err(ConfigError::Name {
+                    line,
+                    text: stem.to_string(),
+                });
+            }
+            let mut cursor = 1;
+            let mut state = State::Arm;
+            if matches!(tokens.get(cursor), Some(&"arm") | Some(&"thumb")) {
+                state = if tokens[cursor] == "arm" {
+                    State::Arm
+                } else {
+                    State::Thumb
+                };
+                cursor += 1;
+            }
+            (cursor, state, Some(stem.to_string()))
+        }
+        _ => return Err(ConfigError::Syntax { line }),
+    };
+    let Some(addr_token) = tokens.get(cursor) else {
+        return Err(ConfigError::Syntax { line });
+    };
+    let addr = parse_addr(addr_token).ok_or(ConfigError::Address {
+        line,
+        text: (*addr_token).to_string(),
+    })?;
+    cursor += 1;
+    let name = match tokens.get(cursor) {
+        None => None,
+        Some(name) => {
+            if !is_identifier(name) {
+                return Err(ConfigError::Name {
+                    line,
+                    text: (*name).to_string(),
+                });
+            }
+            Some((*name).to_string())
+        }
+    };
+    if tokens.len() > cursor + 1 {
+        return Err(ConfigError::Syntax { line });
+    }
+    Ok(FunctionSpec {
+        addr,
+        state,
+        name,
+        module,
+    })
+}
+
+/// Parses a `0x`-prefixed hexadecimal `u32` address.
+fn parse_addr(token: &str) -> Option<u32> {
+    let digits = token
+        .strip_prefix("0x")
+        .or_else(|| token.strip_prefix("0X"))?;
+    u32::from_str_radix(digits, 16).ok()
+}
+
+/// Whether `token` is a valid assembler identifier: ASCII alphabetic or
+/// `_` first, then alphanumeric or `_`.
+fn is_identifier(token: &str) -> bool {
+    let mut chars = token.chars();
+    match chars.next() {
+        Some(first) if first.is_ascii_alphabetic() || first == '_' => {}
+        _ => return false,
+    }
+    chars.all(|rest| rest.is_ascii_alphanumeric() || rest == '_')
+}
+
+impl fmt::Display for Config {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for spec in &self.functions {
+            match &spec.module {
+                None => {
+                    let keyword = match spec.state {
+                        State::Arm => "arm_func",
+                        State::Thumb => "thumb_func",
+                    };
+                    write!(f, "{keyword} {:#010x}", spec.addr)?;
+                }
+                Some(module) => {
+                    let state = match spec.state {
+                        State::Arm => "arm",
+                        State::Thumb => "thumb",
+                    };
+                    write!(f, "{module}.s {state} {:#010x}", spec.addr)?;
+                }
+            }
+            if let Some(name) = &spec.name {
+                write!(f, " {name}")?;
+            }
+            writeln!(f)?;
+        }
+        Ok(())
+    }
+}

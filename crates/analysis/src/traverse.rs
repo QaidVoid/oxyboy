@@ -6,13 +6,16 @@
 //! paths, BL sites are recorded as calls, BX and MOV-to-PC follow
 //! register values the path has proven (literal loads and immediate
 //! MOVs), and bit 0 of a BX value switches ARM/THUMB state. Paths end on
-//! undefined encodings, image bounds, and unknown branch targets, each
-//! recorded as a [`Stop`].
+//! undefined encodings, image bounds, return-like exits, and unknown
+//! branch targets, each recorded as a [`Stop`].
 //!
 //! The traversal is conservative on purpose: it only marks bytes reached
 //! by branch evidence, and it never speculates on register values it has
 //! not seen the current path produce. Register proofs are per path and
 //! reset at every taken jump, so a stale value can never cross a branch.
+//! Return-like exits (BX LR, POP/LDM with PC, MOV PC from LR) are
+//! conventionally well-behaved: LR is never proven, so they record
+//! [`StopReason::Return`] instead of an unknown target.
 
 use std::collections::HashSet;
 
@@ -33,6 +36,9 @@ pub enum StopReason {
     OutOfBounds,
     /// A register-indirect branch whose target the path never proved.
     UnknownTarget,
+    /// A return-like exit: BX LR, POP/LDM loading PC, or MOV PC from
+    /// LR. LR is never proven, so the target is conventional.
+    Return,
 }
 
 /// One recorded traversal end.
@@ -47,17 +53,64 @@ pub struct Stop {
     pub reason: StopReason,
 }
 
+/// One recorded BL call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Call {
+    /// Canonical address of the BL.
+    pub site: u32,
+    /// State of the caller (and, since BL preserves state, of the
+    /// target too).
+    pub state: State,
+    /// Canonical address of the call target.
+    pub target: u32,
+}
+
 /// Result of a full traversal.
 #[derive(Debug, Default)]
 pub struct Traversal {
     /// Every recorded path end, in discovery order (duplicates removed).
     pub stops: Vec<Stop>,
-    /// `(call site, target)` pairs for every BL, in discovery order.
-    pub calls: Vec<(u32, u32)>,
+    /// Every BL, in discovery order.
+    pub calls: Vec<Call>,
+}
+
+/// Controls what a [`walk`] treats as a path boundary and whether it
+/// writes marks.
+#[derive(Clone, Copy, Debug)]
+pub struct WalkOptions {
+    /// Follow BL targets as new paths. When false (a function-body
+    /// walk), BL records the call and the path continues at the
+    /// fallthrough without recording an exit.
+    pub follow_calls: bool,
+    /// Write marks into the flag map.
+    pub mark: bool,
+}
+
+impl WalkOptions {
+    /// Global traversal: follow calls, mark the map.
+    pub const fn global() -> Self {
+        Self {
+            follow_calls: true,
+            mark: true,
+        }
+    }
+
+    /// Function-body walk: treat BL as a call boundary, mark nothing.
+    pub const fn function_body() -> Self {
+        Self {
+            follow_calls: false,
+            mark: false,
+        }
+    }
 }
 
 /// Traverses from `seeds`, marking `map`, over `image` bytes.
 pub fn traverse(image: &Image, map: &mut FlagMap, seeds: &[Seed]) -> Traversal {
+    walk(image, map, seeds, WalkOptions::global())
+}
+
+/// Traverses from `seeds` with explicit options.
+pub fn walk(image: &Image, map: &mut FlagMap, seeds: &[Seed], options: WalkOptions) -> Traversal {
     let bytes = image.bytes();
     let canon = map.canonical();
     let mut out = Traversal::default();
@@ -71,6 +124,7 @@ pub fn traverse(image: &Image, map: &mut FlagMap, seeds: &[Seed]) -> Traversal {
             bytes,
             canon,
             map,
+            options,
             visited: &mut visited,
             work: &mut work,
             out: &mut out,
@@ -85,6 +139,7 @@ struct PathWalk<'a, 'm> {
     bytes: &'a [u8],
     canon: crate::flags::Canonical,
     map: &'m mut FlagMap,
+    options: WalkOptions,
     visited: &'a mut HashSet<(u32, State)>,
     work: &'a mut Vec<(u32, State, [Option<u32>; 16])>,
     out: &'a mut Traversal,
@@ -132,7 +187,9 @@ impl PathWalk<'_, '_> {
 
     /// Marks `size` bytes of an instruction or pool word.
     fn mark(&mut self, addr: u32, size: usize, flags: Flags) {
-        self.map.mark_range(addr, addr + size as u32, flags);
+        if self.options.mark {
+            self.map.mark_range(addr, addr + size as u32, flags);
+        }
     }
 
     /// Begins a walk. Returns when the path ends; the walk owns `regs`
@@ -156,8 +213,21 @@ impl PathWalk<'_, '_> {
                     match decode_arm(word) {
                         ArmInstr::Branch { link, offset } => {
                             let target = addr.wrapping_add(8).wrapping_add(offset as u32);
+                            if link && !self.options.follow_calls {
+                                self.out.calls.push(Call {
+                                    site: addr,
+                                    state,
+                                    target,
+                                });
+                                addr = addr.wrapping_add(4);
+                                continue;
+                            }
                             if link {
-                                self.out.calls.push((addr, target));
+                                self.out.calls.push(Call {
+                                    site: addr,
+                                    state,
+                                    target,
+                                });
                                 self.fork(addr.wrapping_add(4), state, regs);
                             } else if cond != Some(Condition::Al) {
                                 self.fork(addr.wrapping_add(4), state, regs);
@@ -168,24 +238,30 @@ impl PathWalk<'_, '_> {
                             }
                             addr = target;
                         }
-                        ArmInstr::BranchExchange { rn } => match regs[rn.bits() as usize] {
-                            Some(value) => {
-                                state = if value & 1 == 1 {
-                                    State::Thumb
-                                } else {
-                                    State::Arm
-                                };
-                                regs = [None; 16];
-                                if !self.jump(value & !1, state) {
-                                    return;
-                                }
-                                addr = value & !1;
-                            }
-                            None => {
-                                self.stop(addr, state, StopReason::UnknownTarget);
+                        ArmInstr::BranchExchange { rn } => {
+                            if rn == Register::Lr && regs[rn.bits() as usize].is_none() {
+                                self.stop(addr, state, StopReason::Return);
                                 return;
                             }
-                        },
+                            match regs[rn.bits() as usize] {
+                                Some(value) => {
+                                    state = if value & 1 == 1 {
+                                        State::Thumb
+                                    } else {
+                                        State::Arm
+                                    };
+                                    regs = [None; 16];
+                                    if !self.jump(value & !1, state) {
+                                        return;
+                                    }
+                                    addr = value & !1;
+                                }
+                                None => {
+                                    self.stop(addr, state, StopReason::UnknownTarget);
+                                    return;
+                                }
+                            }
+                        }
                         ArmInstr::LoadStore {
                             load: true,
                             pre_index: true,
@@ -218,6 +294,18 @@ impl PathWalk<'_, '_> {
                             addr = target;
                         }
                         ArmInstr::DataProcessing {
+                            opcode: DataOp::Mov,
+                            rd: Register::Pc,
+                            operand2:
+                                ShifterOperand::Register {
+                                    rm: Register::Lr, ..
+                                },
+                            ..
+                        } => {
+                            self.stop(addr, state, StopReason::Return);
+                            return;
+                        }
+                        ArmInstr::DataProcessing {
                             rd: Register::Pc, ..
                         } => {
                             self.stop(addr, state, StopReason::UnknownTarget);
@@ -226,6 +314,7 @@ impl PathWalk<'_, '_> {
                         ArmInstr::BlockTransfer {
                             load, registers, ..
                         } if load && registers.contains(Register::Pc) => {
+                            self.stop(addr, state, StopReason::Return);
                             return;
                         }
                         ArmInstr::DataProcessing {
@@ -277,7 +366,15 @@ impl PathWalk<'_, '_> {
                         }
                         ThumbInstr::LongBranchWithLink { offset } => {
                             let target = addr.wrapping_add(4).wrapping_add((offset * 2) as u32);
-                            self.out.calls.push((addr, target));
+                            self.out.calls.push(Call {
+                                site: addr,
+                                state,
+                                target,
+                            });
+                            if !self.options.follow_calls {
+                                addr = addr.wrapping_add(4);
+                                continue;
+                            }
                             self.fork(addr.wrapping_add(4), state, regs);
                             regs = [None; 16];
                             if !self.jump(target, state) {
@@ -321,20 +418,26 @@ impl PathWalk<'_, '_> {
                             op: ThumbHiOp::Mov,
                             rd: Register::Pc,
                             rs,
-                        } => match regs[rs.bits() as usize] {
-                            Some(value) => {
-                                regs = [None; 16];
-                                let target = value & !1;
-                                if !self.jump(target, state) {
-                                    return;
-                                }
-                                addr = target;
-                            }
-                            None => {
-                                self.stop(addr, state, StopReason::UnknownTarget);
+                        } => {
+                            if rs == Register::Lr && regs[rs.bits() as usize].is_none() {
+                                self.stop(addr, state, StopReason::Return);
                                 return;
                             }
-                        },
+                            match regs[rs.bits() as usize] {
+                                Some(value) => {
+                                    regs = [None; 16];
+                                    let target = value & !1;
+                                    if !self.jump(target, state) {
+                                        return;
+                                    }
+                                    addr = target;
+                                }
+                                None => {
+                                    self.stop(addr, state, StopReason::UnknownTarget);
+                                    return;
+                                }
+                            }
+                        }
                         ThumbInstr::HighRegisterOperation {
                             op: ThumbHiOp::Mov | ThumbHiOp::Add,
                             rd,
@@ -349,7 +452,10 @@ impl PathWalk<'_, '_> {
                             pop: true,
                             include_pc_or_lr: true,
                             ..
-                        } => return,
+                        } => {
+                            self.stop(addr, state, StopReason::Return);
+                            return;
+                        }
                         ThumbInstr::ImmediateOperation {
                             op: ThumbImmOp::Mov,
                             rd,
@@ -362,7 +468,10 @@ impl PathWalk<'_, '_> {
                             load: true,
                             registers,
                             ..
-                        } if registers & (1 << Register::Pc.bits()) != 0 => return,
+                        } if registers & (1 << Register::Pc.bits()) != 0 => {
+                            self.stop(addr, state, StopReason::Return);
+                            return;
+                        }
                         _ => addr = addr.wrapping_add(2),
                     }
                 }
