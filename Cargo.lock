@@ -13,6 +13,11 @@ name = "analysis"
 version = "0.1.0"
 dependencies = [
  "decode",
+ "rom",
+ "serde",
+ "serde_json",
+ "testutil",
+ "thiserror",
 ]
 
 [[package]]

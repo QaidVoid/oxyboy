@@ -6,3 +6,10 @@ license.workspace = true
 
 [dependencies]
 decode = { version = "0.1.0", path = "../decode" }
+rom = { version = "0.1.0", path = "../rom" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+
+[dev-dependencies]
+testutil = { path = "../testutil" }
