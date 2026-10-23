@@ -89,20 +89,11 @@ fn run_case(state: analysis::State, code: &[u8], rng: &mut Rng) {
         panic!("expected a returning block, got {:?}", block.term);
     };
     let mut machine = Machine::new(256, bytes.clone());
-    machine.bind_params(&block.params);
-    for (i, r) in regs.iter().enumerate() {
-        machine.set_slot(i, *r);
-    }
-    // The pc slot is never read by the included classes.
-    machine.set_slot(15, 0);
-    for (f, v) in flags.iter().enumerate() {
-        machine.set_slot(16 + f, u32::from(*v));
-    }
-    machine.ewram_mut()[..EWRAM_PREFILL].copy_from_slice(&ewram);
+    seed_machine(&mut machine, &block.params, &regs, &flags, &ewram);
     machine.eval(&block.insts, end_state);
 
     // Interpreter side.
-    let mut bus = Bus::new(bytes);
+    let mut bus = Bus::new(bytes.clone());
     for (i, chunk) in ewram.as_chunks::<4>().0.iter().enumerate() {
         let word = u32::from_le_bytes(*chunk);
         bus.write_u32(0x0200_0000 + i as u32 * 4, word);
@@ -120,6 +111,65 @@ fn run_case(state: analysis::State, code: &[u8], rng: &mut Rng) {
     cpu.step(&mut bus);
 
     // Compare: registers r0..r14, flags, and both RAM blocks.
+    let plain_fail = state_diff(&machine, &cpu, &bus);
+
+    // Optimized side: the optimization pipeline must preserve the state
+    // the unoptimized IR produces.
+    let mut opt_fn = function.clone();
+    ir::opt::optimize(&mut opt_fn);
+    let oblock = &opt_fn.blocks[0];
+    let ir::Terminator::Return { state: oend_state } = &oblock.term else {
+        panic!("optimized function lost its return");
+    };
+    let mut omachine = Machine::new(256, bytes.clone());
+    seed_machine(&mut omachine, &oblock.params, &regs, &flags, &ewram);
+    omachine.eval(&oblock.insts, oend_state);
+    let opt_fail = state_diff(&omachine, &cpu, &bus);
+
+    if !plain_fail.is_empty() || !opt_fail.is_empty() {
+        let code_hex: String = code
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let seeds: String = regs
+            .iter()
+            .enumerate()
+            .map(|(i, r)| format!("r{i}={r:#010x}"))
+            .chain(flags.iter().enumerate().map(|(i, f)| format!("f{i}={f}")))
+            .collect::<Vec<_>>()
+            .join(" ");
+        panic!(
+            "differential mismatch for {code_hex}:\n  plain:{plain_fail}\n  optimized:{opt_fail}\
+             \nseeds: {seeds}\n=== lifted ===\n{}\n=== optimized ===\n{}",
+            ir::print::fmt_function(&function),
+            ir::print::fmt_function(&opt_fn)
+        );
+    }
+}
+
+/// Loads the shared random state into a fresh evaluator.
+fn seed_machine(
+    machine: &mut Machine,
+    params: &[ir::ValueId],
+    regs: &[u32; 15],
+    flags: &[bool; 4],
+    ewram: &[u8],
+) {
+    machine.bind_params(params);
+    for (i, r) in regs.iter().enumerate() {
+        machine.set_slot(i, *r);
+    }
+    // The pc slot is never read by the included classes.
+    machine.set_slot(15, 0);
+    for (f, v) in flags.iter().enumerate() {
+        machine.set_slot(16 + f, u32::from(*v));
+    }
+    machine.ewram_mut()[..EWRAM_PREFILL].copy_from_slice(ewram);
+}
+
+/// Full-state diff between the evaluator and the interpreter.
+fn state_diff(machine: &Machine, cpu: &Cpu, bus: &Bus) -> String {
     let mut fail = String::new();
     for i in 0..15 {
         let (a, b) = (machine.slot(i), cpu.reg_for_test(i as u8));
@@ -141,22 +191,7 @@ fn run_case(state: analysis::State, code: &[u8], rng: &mut Rng) {
     if machine.iwram() != bus.iwram() {
         fail.push_str("\n  iwram: diverged");
     }
-    if !fail.is_empty() {
-        let code_hex: String = code
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<Vec<_>>()
-            .join(" ");
-        let ir_text = ir::print::fmt_function(&function);
-        let seeds: String = regs
-            .iter()
-            .enumerate()
-            .map(|(i, r)| format!("r{i}={r:#010x}"))
-            .chain(flags.iter().enumerate().map(|(i, f)| format!("f{i}={f}")))
-            .collect::<Vec<_>>()
-            .join(" ");
-        panic!("differential mismatch for {code_hex}:{fail}\nseeds: {seeds}\n{ir_text}");
-    }
+    fail
 }
 
 /// Generates a random ARM word decoding to an included class.

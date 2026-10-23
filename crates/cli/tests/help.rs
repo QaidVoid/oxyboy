@@ -6,7 +6,7 @@ use std::process::Command;
 use testutil::golden::assert_matches;
 
 const SUBCOMMANDS: [&str; 6] = ["info", "disasm", "analyze", "lift", "recomp", "run"];
-const UNIMPLEMENTED: [&str; 4] = ["disasm", "analyze", "lift", "recomp"];
+const UNIMPLEMENTED: [&str; 3] = ["disasm", "analyze", "recomp"];
 
 fn oxyboy() -> Command {
     Command::new(env!("CARGO_BIN_EXE_oxyboy"))

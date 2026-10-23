@@ -138,6 +138,9 @@ pub struct Machine {
     /// previous representative instead.
     written: Vec<bool>,
     slot_ids: [ValueId; STATE_SLOTS],
+    /// Constant overrides from an optimized end state: a folded slot
+    /// representative is a `Const` argument, not an id.
+    consts: [Option<u32>; STATE_SLOTS],
     memory: EvalMemory,
 }
 
@@ -154,6 +157,7 @@ impl Machine {
             values: vec![0; value_count],
             written: vec![false; value_count],
             slot_ids,
+            consts: [None; STATE_SLOTS],
             memory: EvalMemory::new(rom),
         }
     }
@@ -163,6 +167,7 @@ impl Machine {
     pub fn bind_params(&mut self, ids: &[ValueId]) {
         for (slot, id) in ids.iter().take(STATE_SLOTS).enumerate() {
             self.slot_ids[slot] = *id;
+            self.consts[slot] = None;
         }
     }
 
@@ -174,6 +179,9 @@ impl Machine {
 
     /// The current value of one machine slot.
     pub fn slot(&self, slot: usize) -> u32 {
+        if let Some(c) = self.consts[slot] {
+            return c;
+        }
         self.values[self.slot_ids[slot].0 as usize]
     }
 
@@ -212,10 +220,15 @@ impl Machine {
             self.eval_inst(inst);
         }
         for (slot, value) in end_state.iter().take(STATE_SLOTS).enumerate() {
-            if let Value::Id(id) = value
-                && self.written[id.0 as usize]
-            {
-                self.slot_ids[slot] = *id;
+            match value {
+                Value::Id(id) => {
+                    if self.written[id.0 as usize] {
+                        self.slot_ids[slot] = *id;
+                        self.consts[slot] = None;
+                    }
+                }
+                // A folded representative: the slot holds a constant.
+                Value::Const(c) => self.consts[slot] = Some(*c),
             }
         }
     }
@@ -444,19 +457,26 @@ impl Machine {
                     self.flag_value(carry_in),
                     kind,
                 );
-                if inst.dests.len() == 4 {
-                    // The op owns the flags (THUMB format 1): contract
-                    // `[v, n, z, c]`.
-                    let d = &inst.dests;
-                    self.set_id(d[0], v);
-                    self.set_slot_value(N_SLOT, d[1], u32::from(v & 0x8000_0000 != 0));
-                    self.set_slot_value(Z_SLOT, d[2], u32::from(v == 0));
-                    self.set_slot_value(C_SLOT, d[3], u32::from(c));
-                } else {
-                    // Operand-2 expansion: dests `[value, carry]`; the
-                    // parent op owns N/Z.
-                    self.set_id(inst.dests[0], v);
-                    self.set_id(inst.dests[1], u32::from(c));
+                // Length dispatch: 4 is the THUMB format-1 contract
+                // `[v, n, z, c]`, 3 its carry-dead truncation, 2 the
+                // operand-2 expansion `[v, c]`, 1 a value-only list
+                // after dead-flag elimination.
+                let d = &inst.dests;
+                self.set_id(d[0], v);
+                match d.len() {
+                    4 => {
+                        self.set_slot_value(N_SLOT, d[1], u32::from(v & 0x8000_0000 != 0));
+                        self.set_slot_value(Z_SLOT, d[2], u32::from(v == 0));
+                        self.set_slot_value(C_SLOT, d[3], u32::from(c));
+                    }
+                    3 => {
+                        self.set_slot_value(N_SLOT, d[1], u32::from(v & 0x8000_0000 != 0));
+                        self.set_slot_value(Z_SLOT, d[2], u32::from(v == 0));
+                    }
+                    2 => {
+                        self.set_id(d[1], u32::from(c));
+                    }
+                    _ => {}
                 }
             }
             Op::Rrx {
@@ -467,9 +487,10 @@ impl Machine {
                 let a = self.value(a);
                 let cin = self.flag_value(carry_in);
                 let v = (a >> 1) | (u32::from(cin) << 31);
-                let c = a & 1 != 0;
                 self.set_id(inst.dests[0], v);
-                self.set_id(inst.dests[1], u32::from(c));
+                if inst.dests.len() >= 2 {
+                    self.set_id(inst.dests[1], u32::from(a & 1 != 0));
+                }
             }
             Op::Load {
                 addr,
@@ -550,46 +571,54 @@ impl Machine {
 
     /// Shift with ARM7 carry rules (the interpreter's `apply_shift`).
     fn apply_shift(&self, value: u32, amount: u32, cin: bool, kind: ShiftKind) -> (u32, bool) {
-        match kind {
-            ShiftKind::Lsl => match amount {
-                0 => (value, cin),
-                1..=31 => (value << amount, value & (1 << (32 - amount)) != 0),
-                32 => (0, value & 1 != 0),
-                _ => (0, false),
-            },
-            ShiftKind::Lsr => match amount {
-                0 => (value, cin),
-                1..=31 => (value >> amount, value & (1 << (amount - 1)) != 0),
-                _ => (0, value & 0x8000_0000 != 0),
-            },
-            ShiftKind::Asr => {
-                if amount == 0 {
-                    (value, cin)
-                } else if amount >= 32 {
-                    let fill = u32::from(value & 0x8000_0000 != 0);
-                    (fill.wrapping_neg(), fill != 0)
-                } else {
-                    (
-                        ((value as i32) >> amount) as u32,
-                        value & (1 << (amount - 1)) != 0,
-                    )
-                }
+        apply_shift(value, amount, cin, kind)
+    }
+}
+
+/// The ARM7 barrel-shifter result, mirroring the interpreter's
+/// `apply_shift` (cpu.rs `apply_shift`).
+pub(crate) fn apply_shift(value: u32, amount: u32, cin: bool, kind: ShiftKind) -> (u32, bool) {
+    match kind {
+        ShiftKind::Lsl => match amount {
+            0 => (value, cin),
+            1..=31 => (value << amount, value & (1 << (32 - amount)) != 0),
+            32 => (0, value & 1 != 0),
+            _ => (0, false),
+        },
+        ShiftKind::Lsr => match amount {
+            0 => (value, cin),
+            1..=31 => (value >> amount, value & (1 << (amount - 1)) != 0),
+            _ => (0, value & 0x8000_0000 != 0),
+        },
+        ShiftKind::Asr => {
+            if amount == 0 {
+                (value, cin)
+            } else if amount >= 32 {
+                let fill = u32::from(value & 0x8000_0000 != 0);
+                (fill.wrapping_neg(), fill != 0)
+            } else {
+                (
+                    ((value as i32) >> amount) as u32,
+                    value & (1 << (amount - 1)) != 0,
+                )
             }
-            ShiftKind::Ror => {
-                if amount == 0 {
-                    (value, cin)
+        }
+        ShiftKind::Ror => {
+            if amount == 0 {
+                (value, cin)
+            } else {
+                let n = amount % 32;
+                if n == 0 {
+                    (value, value & 0x8000_0000 != 0)
                 } else {
-                    let n = amount % 32;
-                    if n == 0 {
-                        (value, value & 0x8000_0000 != 0)
-                    } else {
-                        (value.rotate_right(n), value & (1 << (n - 1)) != 0)
-                    }
+                    (value.rotate_right(n), value & (1 << (n - 1)) != 0)
                 }
             }
         }
     }
+}
 
+impl Machine {
     fn value(&self, v: &Value) -> u32 {
         match v {
             Value::Const(w) => *w,
@@ -610,15 +639,17 @@ impl Machine {
     fn set_slot_value(&mut self, slot: usize, id: ValueId, value: u32) {
         self.values[id.0 as usize] = value;
         self.slot_ids[slot] = id;
+        self.consts[slot] = None;
     }
 
     fn set_flag(&mut self, slot: usize, value: bool) {
         let id = self.slot_ids[slot];
         self.values[id.0 as usize] = u32::from(value);
+        self.consts[slot] = None;
     }
 }
 
-enum ShiftKind {
+pub(crate) enum ShiftKind {
     Lsl,
     Lsr,
     Asr,
@@ -627,7 +658,7 @@ enum ShiftKind {
 
 /// 64-bit add with carry-in, returning result, carry-out, and signed
 /// overflow (ARM ARM A2.3.1 formulas, as the interpreter implements).
-fn add_with_carry(a: u32, b: u32, carry_in: bool) -> (u32, bool, bool) {
+pub(crate) fn add_with_carry(a: u32, b: u32, carry_in: bool) -> (u32, bool, bool) {
     let r = u64::from(a) + u64::from(b) + u64::from(carry_in);
     let res = r as u32;
     let c = r >> 32 == 1;
@@ -637,7 +668,7 @@ fn add_with_carry(a: u32, b: u32, carry_in: bool) -> (u32, bool, bool) {
 
 /// 64-bit subtract with borrow-in (`borrow = !carry`), returning
 /// result, carry-out (true when no borrow), and signed overflow.
-fn sub_with_borrow(a: u32, b: u32, borrow: bool) -> (u32, bool, bool) {
+pub(crate) fn sub_with_borrow(a: u32, b: u32, borrow: bool) -> (u32, bool, bool) {
     let r = u64::from(a)
         .wrapping_sub(u64::from(b))
         .wrapping_sub(u64::from(borrow));

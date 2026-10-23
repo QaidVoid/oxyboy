@@ -9,6 +9,7 @@
 pub mod arm;
 pub mod eval;
 pub mod lift;
+pub mod opt;
 pub mod print;
 pub mod thumb;
 

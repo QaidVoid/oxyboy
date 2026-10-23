@@ -30,7 +30,7 @@ enum Command {
     /// Recover code and data layout and function boundaries.
     Analyze(RomArgs),
     /// Lift a ROM into the intermediate representation.
-    Lift(RomArgs),
+    Lift(commands::lift::LiftArgs),
     /// Statically recompile a ROM to host code.
     Recomp(RomArgs),
     /// Execute a ROM in the GBA runtime.
@@ -55,7 +55,7 @@ fn main() {
         Command::Info { rom, db } => commands::info::run(rom, db),
         Command::Disasm(_) => not_implemented("disasm"),
         Command::Analyze(_) => not_implemented("analyze"),
-        Command::Lift(_) => not_implemented("lift"),
+        Command::Lift(args) => commands::lift::run(args),
         Command::Recomp(_) => not_implemented("recomp"),
         Command::Run(args) => commands::run::run(args),
     };
