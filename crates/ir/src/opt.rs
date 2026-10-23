@@ -10,7 +10,7 @@
 use std::collections::HashSet;
 
 use crate::eval::{ShiftKind, add_with_carry, apply_shift, sub_with_borrow};
-use crate::{Condition, Function, Inst, Op, Terminator, Value, ValueId};
+use crate::{Block, Condition, Function, Inst, Op, Terminator, Value, ValueId};
 
 /// Flag slots in N, Z, C, V order.
 const FLAG_SLOTS: [usize; 4] = [16, 17, 18, 19];
@@ -292,9 +292,11 @@ fn substitute_term(term: &mut Terminator, subs: &[(ValueId, u32)]) {
         } => vec![then_args, else_args],
         Terminator::Call {
             cont: Some((_, args)),
+            state,
             ..
-        } => vec![args],
+        } => vec![args, state],
         Terminator::Return { state } => vec![state],
+        Terminator::IndirectExit { state, .. } => vec![state],
         _ => vec![],
     };
     for list in lists {
@@ -329,8 +331,15 @@ pub fn dead_flag_elimination(function: &mut Function) {
     let exits: Vec<HashSet<u32>> = (0..function.blocks.len())
         .map(|index| exit_live(function, &facts, index, &live_in))
         .collect();
+    let cond_reads: Vec<Vec<u32>> = (0..function.blocks.len())
+        .map(|index| term_cond_reads(&function.blocks[index], &facts[index]))
+        .collect();
     for (index, block) in function.blocks.iter_mut().enumerate() {
         let mut live = exits[index].clone();
+        // The terminator's own condition reads the flags at block exit.
+        for id in &cond_reads[index] {
+            live.insert(*id);
+        }
         for inst_index in (0..block.insts.len()).rev() {
             mark_guard_reads(
                 block.insts[inst_index].guard,
@@ -358,9 +367,10 @@ pub fn dead_flag_elimination(function: &mut Function) {
     }
 }
 
-/// Live-at-exit for one block. Return arguments are the outgoing
-/// state and are live directly; branch arguments survive only when
-/// the successor's matching parameter is live there.
+/// Live-at-exit for one block. Return, indirect-exit, and call state
+/// lists are the outgoing machine state and are live directly; branch
+/// arguments survive only when the successor's matching parameter is
+/// live there.
 fn exit_live(
     function: &Function,
     facts: &[BlockFacts],
@@ -368,13 +378,17 @@ fn exit_live(
     live_in: &[HashSet<u32>],
 ) -> HashSet<u32> {
     let mut live: HashSet<u32> = HashSet::new();
-    if let Terminator::Return { state } = &function.blocks[index].term {
-        for value in state {
-            if let Value::Id(id) = value {
-                live.insert(id.0);
+    match &function.blocks[index].term {
+        Terminator::Return { state }
+        | Terminator::IndirectExit { state, .. }
+        | Terminator::Call { state, .. } => {
+            for value in state {
+                if let Value::Id(id) = value {
+                    live.insert(id.0);
+                }
             }
         }
-        return live;
+        _ => {}
     }
     for (succ, args) in &facts[index].edges {
         for (arg, param) in args.iter().zip(function.blocks[*succ].params.iter()) {
@@ -396,6 +410,10 @@ fn liveness(function: &Function, facts: &[BlockFacts]) -> Vec<HashSet<u32>> {
         for index in 0..function.blocks.len() {
             let mut live = exit_live(function, facts, index, &live_in);
             let block = &function.blocks[index];
+            // The terminator's own condition reads the flags at block exit.
+            for id in term_cond_reads(block, &facts[index]) {
+                live.insert(id);
+            }
             for inst_index in (0..block.insts.len()).rev() {
                 let inst = &block.insts[inst_index];
                 mark_guard_reads(
@@ -441,6 +459,35 @@ fn mark_guard_reads(
             }
         }
     }
+}
+
+/// The ids a block-terminating condition reads: the same reads an
+/// inst guard makes, but at block exit. Without this a conditional
+/// branch is the only user of its `cmp` and the pass would drop the
+/// comparison.
+fn term_cond_reads(block: &Block, facts: &BlockFacts) -> Vec<u32> {
+    let Terminator::BranchCond { cond, .. } = block.term else {
+        return Vec::new();
+    };
+    let mut reps = facts.flag_reps_before.last().copied().unwrap_or([None; 4]);
+    if let Some(inst) = block.insts.last() {
+        for (slot, dest) in FLAG_SLOTS.iter().zip(flag_dests(&inst.op, &inst.dests)) {
+            if let Some(id) = dest {
+                reps[*slot - FLAG_SLOTS[0]] = Some(id);
+            }
+        }
+    }
+    let mut reads = Vec::new();
+    for (slot, rep) in FLAG_SLOTS.iter().zip(reps.iter()) {
+        match rep {
+            Some(id) => reads.push(id.0),
+            None => reads.push(block.params[*slot].0),
+        }
+    }
+    if cond == Condition::Al {
+        return Vec::new();
+    }
+    reads
 }
 
 /// Static per-block facts for the liveness walks.
@@ -893,9 +940,11 @@ fn rewrite_term_copies(term: &mut Terminator, copies: &[(ValueId, Value)]) {
         } => vec![then_args, else_args],
         Terminator::Call {
             cont: Some((_, args)),
+            state,
             ..
-        } => vec![args],
+        } => vec![args, state],
         Terminator::Return { state } => vec![state],
+        Terminator::IndirectExit { state, .. } => vec![state],
         _ => vec![],
     };
     for list in lists {
@@ -909,5 +958,50 @@ fn rewrite_term_copies(term: &mut Terminator, copies: &[(ValueId, Value)]) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lift::{FunctionRegion, lift_function};
+    use analysis::{FlagMap, Flags, State};
+
+    /// Lifts `words` as one ARM region from the canonical base.
+    fn lift_arm(words: &[u32]) -> Function {
+        let mut bytes = vec![0u8; 256];
+        for (index, word) in words.iter().enumerate() {
+            bytes[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        let image = rom::Image::from_bytes(bytes).expect("parses");
+        let mut map = FlagMap::from_image(&image);
+        let base = map.canonical().base();
+        map.mark_range(base, base + words.len() as u32 * 4, Flags::EXEC);
+        lift_function(
+            &image,
+            &map,
+            FunctionRegion {
+                start: base,
+                end: base + words.len() as u32 * 4,
+                state: State::Arm,
+            },
+        )
+    }
+
+    /// A conditional branch reads the comparison's flags; the pass
+    /// must not drop the `cmp` as dead (the recomp corpus
+    /// regressed exactly here).
+    #[test]
+    fn branch_condition_keeps_its_comparison() {
+        // cmp r0, #1; bne .
+        let mut function = lift_arm(&[0xE350_0001, 0x1AFF_FFFE]);
+        optimize(&mut function);
+        assert!(
+            function.blocks[0]
+                .insts
+                .iter()
+                .any(|inst| matches!(inst.op, Op::Cmp { .. })),
+            "the comparison feeding a branch condition must survive"
+        );
     }
 }

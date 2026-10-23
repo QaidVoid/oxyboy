@@ -75,6 +75,26 @@ impl System {
         }
     }
 
+    /// Whether a frame boundary was crossed since the last
+    /// [`System::step_frame`] (peek, without consuming it).
+    #[must_use]
+    pub fn frame_ended(&self) -> bool {
+        self.ppu.frame_ended()
+    }
+
+    /// Advances the video clock, timers, and APU by `cycles` and
+    /// drains any DMA the guest armed, then refreshes the CPU IRQ
+    /// input line. [`System::step`] applies this to its instruction's
+    /// cycle count; the recompiled driver applies it per native chunk.
+    pub fn advance_clock(&mut self, cycles: u32) {
+        let dma_cycles = self.bus.dma_run_deferred();
+        self.ppu.step(&mut self.bus, cycles + dma_cycles);
+        self.bus.step_timers(cycles + dma_cycles);
+        self.bus.step_apu(cycles + dma_cycles);
+        let pending = self.bus.irq_pending();
+        self.cpu.set_irq_line(pending);
+    }
+
     /// Runs one step and records what it did as a
     /// [`trace::Record`]: the PC after the instruction, the Thumb and
     /// halted state bits, the register writes (indices 0-14; R15 is

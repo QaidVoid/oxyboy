@@ -527,6 +527,11 @@ impl Bus {
         std::mem::take(&mut self.write_log)
     }
 
+    /// The IO register image, for state-equality tests.
+    pub fn io_image(&self) -> &[u8] {
+        &self.io
+    }
+
     /// Maps an address in the VRAM window onto the 96 KiB array.
     ///
     /// The 64 KiB BG bank repeats every 64 KiB and the 32 KiB OBJ bank

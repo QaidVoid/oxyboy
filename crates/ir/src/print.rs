@@ -391,25 +391,22 @@ fn fmt_term(term: &Terminator) -> String {
             fmt_block_ref(*then_target, then_args),
             fmt_block_ref(*else_target, else_args)
         ),
-        Terminator::Call { target, cont } => match cont {
+        Terminator::Call {
+            target,
+            cont,
+            state,
+        } => match cont {
             Some((block, args)) => format!(
-                "bl {}, cont {}\n",
+                "bl {}, cont {}, state {}\n",
                 fmt_value(target),
-                fmt_block_ref(*block, args)
+                fmt_block_ref(*block, args),
+                fmt_state(state)
             ),
-            None => format!("bl {}\n", fmt_value(target)),
+            None => format!("bl {}, state {}\n", fmt_value(target), fmt_state(state)),
         },
-        Terminator::Return { state } => {
-            let list = state
-                .iter()
-                .zip(SLOTS)
-                .map(|(value, slot)| format!("{}={}", slot_name(slot), fmt_value(value)))
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!("ret {list}\n")
-        }
-        Terminator::IndirectExit { target } => {
-            format!("bx {}\n", fmt_value(target))
+        Terminator::Return { state } => format!("ret {}\n", fmt_state(state)),
+        Terminator::IndirectExit { target, state } => {
+            format!("bx {}, state {}\n", fmt_value(target), fmt_state(state))
         }
         Terminator::Unreachable => "unreachable\n".to_string(),
     }
@@ -419,6 +416,16 @@ fn fmt_term(term: &Terminator) -> String {
 fn fmt_block_ref(target: BlockId, args: &[Value]) -> String {
     let list = args.iter().map(fmt_value).collect::<Vec<_>>().join(", ");
     format!("b{}({list})", target.0)
+}
+
+/// Renders an outgoing state list as `r0=v0, r1=v1, ...`.
+fn fmt_state(state: &[Value]) -> String {
+    state
+        .iter()
+        .zip(SLOTS)
+        .map(|(value, slot)| format!("{}={}", slot_name(slot), fmt_value(value)))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// The stable name of one state slot.
@@ -474,6 +481,7 @@ pub(crate) fn sample_function() -> Function {
         name: "sample".to_string(),
         blocks: vec![
             Block {
+                addr: 0x100,
                 params: entry.clone(),
                 insts: vec![
                     Inst {
@@ -529,14 +537,20 @@ pub(crate) fn sample_function() -> Function {
                 },
             },
             Block {
+                addr: 0x120,
                 params: vec![ValueId(27), ValueId(28)],
                 insts: vec![],
                 term: Terminator::Call {
                     target: reg(3),
                     cont: Some((BlockId(2), vec![reg(27)])),
+                    state: (0..16)
+                        .map(|slot| if slot == 14 { reg(28) } else { reg(slot) })
+                        .chain([reg(22), reg(23), reg(24), reg(25)])
+                        .collect(),
                 },
             },
             Block {
+                addr: 0x130,
                 params: vec![ValueId(29)],
                 insts: vec![Inst {
                     guard: None,
@@ -547,9 +561,16 @@ pub(crate) fn sample_function() -> Function {
                         carry_in: reg(24),
                     },
                 }],
-                term: Terminator::IndirectExit { target: reg(15) },
+                term: Terminator::IndirectExit {
+                    target: reg(15),
+                    state: (0..16)
+                        .map(reg)
+                        .chain([reg(22), reg(23), reg(24), reg(25)])
+                        .collect(),
+                },
             },
             Block {
+                addr: 0x140,
                 params: vec![ValueId(32)],
                 insts: vec![],
                 term: Terminator::Return {
@@ -579,10 +600,10 @@ b0(v0, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v1
   v26 = ldrsh [v20]\n\
 br.cs b1(v21, v26), else b3(v21)\n\
 b1(v27, v28):\n\
-  bl v3, cont b2(v27)\n\
+  bl v3, cont b2(v27), state r0=v0, r1=v1, r2=v2, r3=v3, r4=v4, r5=v5, r6=v6, r7=v7, r8=v8, r9=v9, r10=v10, r11=v11, r12=v12, sp=v13, lr=v28, pc=v15, n=v22, z=v23, c=v24, v=v25\n\
 b2(v29):\n\
   v30, v31 = rrxs v29, c=v24\n\
-  bx v15\n\
+  bx v15, state r0=v0, r1=v1, r2=v2, r3=v3, r4=v4, r5=v5, r6=v6, r7=v7, r8=v8, r9=v9, r10=v10, r11=v11, r12=v12, sp=v13, lr=v14, pc=v15, n=v22, z=v23, c=v24, v=v25\n\
 b3(v32):\n\
   ret r0=v32, r1=v1, r2=v2, r3=v3, r4=v4, r5=v5, r6=v6, r7=v7, r8=v8, r9=v9, \
 r10=v10, r11=v11, r12=v12, sp=v13, lr=v14, pc=v15, n=v22, z=v23, c=v24, v=v25\n\

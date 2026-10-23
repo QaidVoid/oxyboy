@@ -6,10 +6,13 @@ license.workspace = true
 
 [dependencies]
 decode = { version = "0.1.0", path = "../decode" }
+recomp = { version = "0.1.0", path = "../recomp" }
 rom = { version = "0.1.0", path = "../rom" }
 thiserror = "2.0.21"
 trace = { version = "0.1.0", path = "../trace" }
 
 [dev-dependencies]
+analysis = { version = "0.1.0", path = "../analysis" }
+ir = { version = "0.1.0", path = "../ir" }
 rom = { version = "0.1.0", path = "../rom" }
 testutil = { path = "../testutil" }

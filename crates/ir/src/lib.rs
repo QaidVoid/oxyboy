@@ -318,16 +318,22 @@ pub enum Terminator {
     },
     /// Call `target` and, when known, fall through into `cont` with
     /// the caller state.
+    /// `state` is the pre-call machine state in [`SLOTS`] order: it
+    /// becomes visible when the budget expires before the callee runs
+    /// or when the call is a tail call (`cont` is [`None`]).
     Call {
         target: Value,
         cont: Option<(BlockId, Vec<Value>)>,
+        state: Vec<Value>,
     },
     /// Leave the function; the arguments are the outgoing machine
     /// state in [`SLOTS`] order.
     Return { state: Vec<Value> },
     /// Control leaves to an unresolved value (`bx` on an unknown
-    /// register, an unresolved switch arm).
-    IndirectExit { target: Value },
+    /// register, an unresolved switch arm). `state` is the outgoing
+    /// machine state in [`SLOTS`] order, observable across direct
+    /// calls between translated functions.
+    IndirectExit { target: Value, state: Vec<Value> },
     /// Control never reaches here.
     Unreachable,
 }
@@ -335,6 +341,9 @@ pub enum Terminator {
 /// One basic block: parameters, ordered instructions, one terminator.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Block {
+    /// The block leader's guest address: the first instruction's
+    /// address. Exit helpers carry the address control leaves to.
+    pub addr: u32,
     /// Values the block receives from its predecessors' arguments.
     pub params: Vec<ValueId>,
     /// Instructions in address order within the block.
@@ -344,8 +353,9 @@ pub struct Block {
 }
 
 /// A lifted function: the entry block's parameters are the incoming
-/// machine state ([`SLOTS`] order) and every [`Terminator::Return`]
-/// carries the outgoing state.
+/// machine state ([`SLOTS`] order) and every [`Terminator::Return`],
+/// [`Terminator::IndirectExit`], and [`Terminator::Call`] carries the
+/// outgoing (or pre-call) machine state.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Function {
     /// Symbol name, matching the emitter's naming.

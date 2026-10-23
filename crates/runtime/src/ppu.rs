@@ -112,6 +112,12 @@ impl Ppu {
         std::mem::take(&mut self.frame_ended)
     }
 
+    /// Whether a frame boundary was crossed, without consuming it.
+    #[must_use]
+    pub fn frame_ended(&self) -> bool {
+        self.frame_ended
+    }
+
     /// The rendered frame.
     pub fn frame(&self) -> &Frame {
         &self.frame

@@ -6,6 +6,7 @@ members = [
     "crates/decode",
     "crates/emit",
     "crates/ir",
+    "crates/recomp",
     "crates/rom",
     "crates/runtime",
     "crates/testutil",

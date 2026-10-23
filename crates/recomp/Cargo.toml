@@ -1,0 +1,10 @@
+[package]
+name = "recomp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+decode = { version = "0.1.0", path = "../decode" }
+ir = { version = "0.1.0", path = "../ir" }
+libloading = "0.8"

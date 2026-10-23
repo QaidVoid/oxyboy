@@ -426,7 +426,7 @@ impl Lifter<'_> {
         }
 
         let mut blocks = Vec::with_capacity(order.len() + helpers.len());
-        for (_, raw) in order.iter() {
+        for (addr, raw) in order.iter() {
             let params = raw.params.clone();
             let current: Vec<Value> = raw.end_state.iter().copied().map(Value::Id).collect();
             let term = match &raw.term {
@@ -448,22 +448,31 @@ impl Lifter<'_> {
                 RawTerm::Call { target, cont } => Terminator::Call {
                     target: Value::Const(*target),
                     cont: cont.map(|addr| (ids[&addr], current.clone())),
+                    state: current.clone(),
                 },
                 RawTerm::Return => Terminator::Return {
                     state: current.clone(),
                 },
                 RawTerm::IndirectExit(reg) => Terminator::IndirectExit {
                     target: current[reg.bits() as usize],
+                    state: current.clone(),
                 },
                 RawTerm::Unreachable => Terminator::Unreachable,
             };
             blocks.push(Block {
+                addr: *addr,
                 params,
                 insts: raw.insts.clone(),
                 term,
             });
         }
-        for (addr, &id) in &helpers {
+        // Helpers carry ids sequential after the real blocks, so
+        // pushing in id order lands each at its index.
+        let mut placed: Vec<(BlockId, u32)> =
+            helpers.iter().map(|(&addr, &id)| (id, addr)).collect();
+        placed.sort_unstable();
+        for (id, addr) in placed {
+            debug_assert_eq!(id.0 as usize, blocks.len(), "helper ids must be dense");
             let params: Vec<ValueId> = (0..STATE_COUNT)
                 .map(|_| {
                     let allocated = next;
@@ -471,14 +480,16 @@ impl Lifter<'_> {
                     allocated
                 })
                 .collect();
-            blocks[id.0 as usize] = Block {
+            blocks.push(Block {
+                addr,
                 params,
                 insts: Vec::new(),
                 term: Terminator::Call {
-                    target: Value::Const(*addr),
+                    target: Value::Const(addr),
                     cont: None,
+                    state: Vec::new(),
                 },
-            };
+            });
         }
         Function {
             name: format!("sub_{:08x}", self.region.start),
@@ -599,7 +610,7 @@ mod tests {
         let function = lift_arm(&[0xEB00_0002, 0xE280_0001, 0xE12F_FF1E], 3);
         assert_eq!(function.blocks.len(), 2);
         match &function.blocks[0].term {
-            Terminator::Call { target, cont } => {
+            Terminator::Call { target, cont, .. } => {
                 assert!(matches!(target, Value::Const(word) if word % 4 == 0));
                 let Some((_, args)) = cont else {
                     panic!("expected a continuation");
@@ -627,7 +638,9 @@ mod tests {
         let function = lift_arm(&[0xEA00_0001, 0xE280_0001], 2);
         assert_eq!(function.blocks.len(), 1);
         match &function.blocks[0].term {
-            Terminator::Call { target, cont: None } => assert!(matches!(target, Value::Const(_))),
+            Terminator::Call {
+                target, cont: None, ..
+            } => assert!(matches!(target, Value::Const(_))),
             other => panic!("expected exit call, got {other:?}"),
         }
     }
@@ -659,7 +672,7 @@ mod tests {
         let function = lift_thumb(&[0x4718], 1);
         assert_eq!(function.blocks.len(), 1);
         match &function.blocks[0].term {
-            Terminator::IndirectExit { target } => {
+            Terminator::IndirectExit { target, .. } => {
                 assert_eq!(*target, Value::Id(function.blocks[0].params[3]));
             }
             other => panic!("expected indirect exit, got {other:?}"),
@@ -678,7 +691,7 @@ mod tests {
         let function = lift_thumb(&[0xF000, 0xF800, 0x2001, 0x4770], 4);
         assert_eq!(function.blocks.len(), 2);
         match &function.blocks[0].term {
-            Terminator::Call { target, cont } => {
+            Terminator::Call { target, cont, .. } => {
                 assert!(matches!(target, Value::Const(word) if *word % 2 == 0));
                 let Some((_, args)) = cont else {
                     panic!("expected a continuation");
@@ -967,6 +980,21 @@ mod tests {
         assert!(matches!(
             function.blocks[0].term,
             Terminator::IndirectExit { .. }
+        ));
+    }
+
+    /// A conditional branch whose fall-through leaves the region gets
+    /// an exit-helper block appended after the real ones (this used to
+    /// index past the block vector and panic).
+    #[test]
+    fn out_of_region_fall_through_appends_an_exit_helper() {
+        // cmp r0, #1; bne .  (the taken target is in region, the
+        // fall-through is one past the region end)
+        let function = lift_arm(&[0xE350_0001, 0x1AFF_FFFE], 2);
+        assert_eq!(function.blocks.len(), 3);
+        assert!(matches!(
+            function.blocks[2].term,
+            Terminator::Call { cont: None, .. }
         ));
     }
 
