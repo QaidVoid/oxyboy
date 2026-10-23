@@ -312,6 +312,123 @@ fn swi_in_translated_function_dispatches_hle_and_matches_interpreted() {
     assert!(drift <= 1, "scheduler drift {drift} scanlines");
 }
 
+/// Pointer-table dispatch: the translated dispatcher loads a function
+/// pointer from a literal-pool table and `bx`es to never-lifted code;
+/// the callee returns into the dispatcher's unlifted tail, which then
+/// calls a second translated function. Exercises the hybrid fallback
+/// end to end: native, stub exit, interpreter, native re-entry.
+fn dispatch_image() -> Image {
+    let words: [u32; 18] = [
+        0xE3A0_5402, // 0x100: mov r5, #0x02000000
+        0xE28F_E004, // 0x104: add lr, pc, #4        (lr = 0x110 return point)
+        0xE59F_3010, // 0x108: ldr r3, [pc, #16]     (table at 0x120)
+        0xE12F_FF13, // 0x10c: bx r3                 (unresolved indirect exit)
+        0xE585_0000, // 0x110: str r0, [r5]          (return point, unlifted)
+        0xEB00_0005, // 0x114: bl 0x130              (translated helper)
+        0xE585_0004, // 0x118: str r0, [r5, #4]
+        0xEAFF_FFFE, // 0x11c: b .
+        0x0800_0140, // 0x120: .word unanalyzed callee
+        0,           // 0x124: pad
+        0,           // 0x128: pad
+        0,           // 0x12c: pad
+        0xE280_0015, // 0x130: helper: add r0, r0, #21
+        0xE1A0_F00E, // 0x134: mov pc, lr
+        0,           // 0x138: pad
+        0,           // 0x13c: pad
+        0xE3A0_0015, // 0x140: unanalyzed: mov r0, #21
+        0xE12F_FF1E, // 0x144: bx lr
+    ];
+    let mut bytes = RomBuilder::new().title("DISP").build();
+    let mut code = Vec::new();
+    for word in words {
+        code.extend_from_slice(&word.to_le_bytes());
+    }
+    bytes[0x100..0x100 + code.len()].copy_from_slice(&code);
+    Image::from_bytes(bytes).expect("parse")
+}
+
+#[test]
+fn pointer_table_dispatch_runs_unanalyzed_code_via_stubs() {
+    if !recomp::Module::compiler_available() {
+        println!("skipping: no host C compiler on PATH");
+        return;
+    }
+    let image = dispatch_image();
+    let park = 0x0800_011C;
+
+    let mut interpreted = System::new(image.bytes().to_vec(), 0x0800_0100);
+    let mut steps = 0;
+    while interpreted.cpu.pc() != park && steps < 10_000 {
+        interpreted.step();
+        steps += 1;
+    }
+    assert_eq!(
+        interpreted.cpu.pc(),
+        park,
+        "interpreted run reaches the park"
+    );
+
+    // Only the dispatcher and the helper are lifted; the 0x140 callee
+    // is never analyzed and runs interpreted through the stub.
+    let marks = [(0x100u32, 0x124u32), (0x130, 0x138)];
+    let mut driver = build_driver(&image, &marks, "recomp-dispatch").expect("module builds");
+    assert!(driver.is_translated(0x0800_0100));
+    assert!(driver.is_translated(0x0800_0130));
+    assert!(
+        !driver.is_translated(0x0800_0140),
+        "callee stays unanalyzed"
+    );
+
+    let mut hybrid = System::new(image.bytes().to_vec(), 0x0800_0100);
+    let mut steps = 0;
+    while hybrid.cpu.pc() != park && steps < 10_000 {
+        driver.step(&mut hybrid).expect("native call");
+        steps += 1;
+    }
+    assert_eq!(hybrid.cpu.pc(), park, "hybrid run reaches the park");
+
+    // The dispatch produced the right results through both boundaries:
+    // the unanalyzed callee's r0 landed in EWRAM, and the translated
+    // helper's result followed it.
+    let word = |sys: &System, index: usize| {
+        u32::from_le_bytes(
+            sys.bus().ewram()[index * 4..index * 4 + 4]
+                .try_into()
+                .unwrap(),
+        )
+    };
+    assert_eq!(word(&hybrid, 0), 21, "unanalyzed callee result stored");
+    assert_eq!(word(&hybrid, 1), 42, "helper result stored");
+
+    // Full-state parity with the pure interpreter.
+    for i in 0..15u8 {
+        assert_eq!(
+            interpreted.cpu.reg_for_test(i),
+            hybrid.cpu.reg_for_test(i),
+            "r{i}"
+        );
+    }
+    assert_eq!(
+        interpreted.cpu.cpsr() & 0xF000_0000,
+        hybrid.cpu.cpsr() & 0xF000_0000,
+        "flags"
+    );
+    let mismatch = interpreted
+        .bus()
+        .ewram()
+        .iter()
+        .zip(hybrid.bus().ewram().iter())
+        .position(|(a, b)| a != b);
+    assert_eq!(mismatch, None, "EWRAM");
+    let mismatch = interpreted
+        .bus()
+        .iwram()
+        .iter()
+        .zip(hybrid.bus().iwram().iter())
+        .position(|(a, b)| a != b);
+    assert_eq!(mismatch, None, "IWRAM");
+}
+
 #[test]
 fn mode3_rom_renders_the_same_frame_through_both_paths() {
     let Some(path) = testutil::testrom::require("mode3") else {
