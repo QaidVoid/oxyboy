@@ -60,7 +60,7 @@ start:
     @ LZ77UnCompWram: r0 = source stream, r1 = destination.
     ldr r0, =lz_data
     ldr r1, =0x02000000
-    swi 0x11
+    swi 0x110000
 
     @ CpuFastSet fill: r0 = source word, r1 = destination, r2 = fill
     @ mode + 8 words.
@@ -68,20 +68,20 @@ start:
     ldr r1, =0x02000100
     mov r2, #0x01000000
     orr r2, r2, #8
-    swi 0x0C
+    swi 0x0C0000
 
     @ Capture the 16 decompressed bytes (4 words; CpuFastSet rounds up
     @ to 8 words, the tail reads zeroed EWRAM).
     ldr r0, =0x02000000
     ldr r1, =0x03000004
     mov r2, #4
-    swi 0x0C
+    swi 0x0C0000
 
     @ Capture the 8 filled words.
     ldr r0, =0x02000100
     ldr r1, =0x03000040
     mov r2, #8
-    swi 0x0C
+    swi 0x0C0000
 
     ldr r3, =0x03000000
     mov r4, #0xC1

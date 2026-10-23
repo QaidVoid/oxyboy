@@ -588,7 +588,9 @@ pub(crate) fn apply_shift(value: u32, amount: u32, cin: bool, kind: ShiftKind) -
         ShiftKind::Lsr => match amount {
             0 => (value, cin),
             1..=31 => (value >> amount, value & (1 << (amount - 1)) != 0),
-            _ => (0, value & 0x8000_0000 != 0),
+            32 => (0, value & 0x8000_0000 != 0),
+            // Beyond 32 no bit is shifted out: carry clear (A2.4).
+            _ => (0, false),
         },
         ShiftKind::Asr => {
             if amount == 0 {

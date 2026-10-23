@@ -505,9 +505,15 @@ fn apply_shift(value: u32, kind: ShiftKind, amount: u32, carry_in: bool) -> Shif
                 value: value >> amount,
                 carry: value & (1 << (amount - 1)) != 0,
             },
-            _ => ShiftOut {
+            32 => ShiftOut {
                 value: 0,
                 carry: value & 0x8000_0000 != 0,
+            },
+            // Beyond 32 no bit of the value is ever shifted out, so
+            // the carry is clear (ARM ARM A2.4 LSR, amount > 32).
+            _ => ShiftOut {
+                value: 0,
+                carry: false,
             },
         },
         ShiftKind::Asr => {
@@ -912,7 +918,11 @@ impl Cpu {
             }
             ArmInstr::SoftwareInterrupt { imm24 } => {
                 if self.bios_hle {
-                    if crate::swi::execute(self, bus, imm24) {
+                    // ARM state carries the call number in the comment
+                    // field, bits 16-23 (GBATEK: the BIOS reads the
+                    // instruction at r14_svc - 4); THUMB carries it in
+                    // bits 0-7 and pre-shifts at its dispatch site.
+                    if crate::swi::execute(self, bus, imm24 >> 16) {
                         self.pc = self.pc.wrapping_add(4);
                     }
                 } else {

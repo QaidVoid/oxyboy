@@ -144,7 +144,9 @@ static uint32_t oxy_shl(uint32_t v, uint32_t amt, uint32_t cin, uint32_t* co) {
 static uint32_t oxy_shr(uint32_t v, uint32_t amt, uint32_t cin, uint32_t* co) {
     if (amt == 0u) { *co = cin; return v; }
     if (amt <= 31u) { *co = (v >> (amt - 1u)) & 1u; return v >> amt; }
-    *co = (v >> 31) & 1u; return 0u;
+    if (amt == 32u) { *co = (v >> 31) & 1u; return 0u; }
+    /* Beyond 32 no bit is shifted out: carry clear (A2.4). */
+    *co = 0u; return 0u;
 }
 
 static uint32_t oxy_sar(uint32_t v, uint32_t amt, uint32_t cin, uint32_t* co) {

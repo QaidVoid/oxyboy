@@ -223,7 +223,7 @@ fn swi_image() -> Image {
         0xE1A0_0000, // (filler, never executed)
         0xE3A0_0019, // mov r0, #25
         0xE3A0_1004, // mov r1, #4
-        0xEF00_0006, // swi 6 (Div)
+        0xEF06_0000, // swi 6 (Div; number in comment bits 16-23)
         0xE584_0000, // str r0, [r4]
         0xEAFF_FFFE, // b .
     ];

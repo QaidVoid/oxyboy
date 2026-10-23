@@ -32,8 +32,9 @@ const CALL_OVERHEAD: u32 = 45;
 const DECOMP_CYCLES_PER_BYTE: u32 = 10;
 
 /// Dispatches one BIOS call. `number` is the SWI comment field
-/// (ARM bits 0-23, THUMB bits 0-7); the real BIOS dispatches on the
-/// same value read back from the instruction stream. Returns false
+/// already shifted per state: ARM callers supply bits 16-23 of the
+/// instruction, THUMB callers bits 0-7; the real BIOS dispatches on
+/// the same bytes read back from the instruction stream. Returns false
 /// when the call redirected execution (SoftReset) so the caller skips
 /// the sequential pc advance.
 pub(crate) fn execute(cpu: &mut Cpu, bus: &mut Bus, number: u32) -> bool {

@@ -11,7 +11,7 @@ use runtime::cpu::{Cpu, Mode};
 /// and bus after the call.
 fn run_arm_swi(number: u32, extra: &[u8], setup: impl FnOnce(&mut Cpu, &mut Bus)) -> (Cpu, Bus) {
     let mut rom = vec![0; 0x400];
-    rom[..4].copy_from_slice(&(0xEF00_0000u32 | number).to_le_bytes());
+    rom[..4].copy_from_slice(&(0xEF00_0000u32 | (number << 16)).to_le_bytes());
     rom[0x100..0x100 + extra.len()].copy_from_slice(extra);
     let mut bus = Bus::new(rom);
     let mut cpu = Cpu::new(0x0800_0000);
@@ -490,4 +490,25 @@ fn thumb_swi_dispatches_the_same_calls() {
     cpu.step(&mut bus);
     assert_eq!(cpu.reg_for_test(0), (-123i32) as u32);
     assert_eq!(cpu.reg_for_test(3), 123);
+}
+
+#[test]
+fn arm_swi_number_lives_in_comment_bits() {
+    // ARM toolchains encode `swi 6` as 0xEF060000: the call number
+    // sits in bits 16-23 and the low bits stay zero. Dispatching on
+    // the low byte instead would treat this call as SoftReset 00h and
+    // wipe the registers.
+    let mut rom = vec![0; 0x40];
+    rom[..4].copy_from_slice(&0xEF06_0000u32.to_le_bytes());
+    rom[4..8].copy_from_slice(&0xEAFF_FFFEu32.to_le_bytes());
+    let mut bus = Bus::new(rom);
+    let mut cpu = Cpu::new(0x0800_0000);
+    cpu.set_reg_for_test(0, (-1234i32) as u32);
+    cpu.set_reg_for_test(1, 10);
+    cpu.set_reg_for_test(12, 0xDEAD_BEEF);
+    cpu.step(&mut bus);
+    assert_eq!(cpu.reg_for_test(0), (-123i32) as u32);
+    assert_eq!(cpu.reg_for_test(1), (-4i32) as u32);
+    assert_eq!(cpu.reg_for_test(3), 123);
+    assert_eq!(cpu.reg_for_test(12), 0xDEAD_BEEF, "registers preserved");
 }

@@ -76,6 +76,8 @@ fn shifter_carry_semantics() {
         0xE3A0_5000,
         0xE1B0_9530,
         0xE1B0_A570,
+        0xE3A0_5021,
+        0xE1B0_B530,
     ];
     let mut bus = rom(&words);
     let mut cpu = Cpu::new(0x0800_0000);
@@ -136,6 +138,13 @@ fn shifter_carry_semantics() {
     run(&mut cpu, &mut bus, 1);
     assert_eq!(reg(&cpu, 10), 0xFFFF_FFFF);
     assert_eq!(flags(&cpu), (true, false, false, false));
+
+    // Register-specified LSR by 33: zero, carry clear (no bit of the
+    // value is shifted out; regression for the external arm suite's
+    // test 157).
+    run(&mut cpu, &mut bus, 2);
+    assert_eq!(reg(&cpu, 11), 0);
+    assert_eq!(flags(&cpu), (false, true, false, false));
 }
 
 #[test]
