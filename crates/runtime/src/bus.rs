@@ -13,6 +13,7 @@ pub const EWRAM_SIZE: usize = 256 * 1024;
 use crate::apu::Apu;
 use crate::dma::{Dma, DmaTiming};
 use crate::input::Key;
+use crate::save::{Save, SaveKind};
 use crate::timer::Timers;
 /// On-chip work RAM (IWRAM): 32 KiB.
 pub const IWRAM_SIZE: usize = 32 * 1024;
@@ -24,8 +25,6 @@ pub const VRAM_SIZE: usize = 96 * 1024;
 pub const OAM_SIZE: usize = 1024;
 /// Maximum Game Pak ROM image size: 32 MiB.
 pub const ROM_MAX_SIZE: usize = 32 * 1024 * 1024;
-/// Maximum Game Pak SRAM size: 64 KiB.
-pub const SRAM_MAX_SIZE: usize = 64 * 1024;
 
 /// Value returned by reads of unmapped locations.
 ///
@@ -74,7 +73,8 @@ pub struct Bus {
     rom: Box<[u8]>,
     /// `next_power_of_two(rom.len()) - 1`, for mirroring beyond the image.
     rom_mask: usize,
-    sram: Box<[u8]>,
+    /// The cartridge backup medium (SRAM, flash, or EEPROM).
+    save: Save,
     /// 0x04000000: halfword-granular IO register image (1 KiB window).
     io: Box<[u8]>,
     /// The four DMA channels (registers in `io`, engine state here).
@@ -100,6 +100,8 @@ impl Bus {
         } else {
             rom.len().next_power_of_two() - 1
         };
+        let rom = rom.into_boxed_slice();
+        let save = Save::new(SaveKind::detect(&rom));
         let mut bus = Bus {
             bios: vec![0; 0x4000].into_boxed_slice(),
             ewram: vec![0; EWRAM_SIZE].into_boxed_slice(),
@@ -107,9 +109,9 @@ impl Bus {
             palette: vec![0; PALETTE_SIZE].into_boxed_slice(),
             vram: vec![0; VRAM_SIZE].into_boxed_slice(),
             oam: vec![0; OAM_SIZE].into_boxed_slice(),
-            rom: rom.into_boxed_slice(),
+            rom,
             rom_mask,
-            sram: vec![0; SRAM_MAX_SIZE].into_boxed_slice(),
+            save,
             io: vec![0; 0x400].into_boxed_slice(),
             dma: Dma::default(),
             timers: Timers::default(),
@@ -159,13 +161,18 @@ impl Bus {
         &self.oam
     }
 
-    /// The 64 KiB SRAM array (address 0x0E000000).
-    pub fn sram(&self) -> &[u8] {
-        &self.sram
+    /// The cartridge backup medium.
+    pub fn save(&self) -> &Save {
+        &self.save
+    }
+
+    /// The cartridge backup medium, mutably (tests and tools).
+    pub fn save_mut(&mut self) -> &mut Save {
+        &mut self.save
     }
 
     /// Reads one byte.
-    pub fn read_u8(&self, addr: u32) -> u8 {
+    pub fn read_u8(&mut self, addr: u32) -> u8 {
         let a = addr & 0x0FFF_FFFF;
         match a >> 24 {
             0x00 if a < 0x4000 => self.bios[(a & 0x3FFF) as usize],
@@ -200,17 +207,23 @@ impl Bus {
                 let i = (Self::vram_index(a) & !1) as usize;
                 self.vram[i]
             }
+            // The EEPROM answers on the upper ROM window when it is
+            // the cart's medium; otherwise 0x0D is plain ROM.
+            0x0D if matches!(self.save.kind(), SaveKind::Eeprom512 | SaveKind::Eeprom8k) => self
+                .save
+                .read_eeprom_half()
+                .map_or(OPEN_BUS_BYTE, |v| v as u8),
             0x08..=0x0D => match self.rom_index(a) {
                 Some(i) => self.rom[i],
                 None => OPEN_BUS_BYTE,
             },
-            0x0E | 0x0F => self.sram[(a & 0x0000_FFFF) as usize],
+            0x0E | 0x0F => self.save.read_u8((a & 0x0000_FFFF) as u16),
             _ => OPEN_BUS_BYTE,
         }
     }
 
     /// Reads a little-endian halfword.
-    pub fn read_u16(&self, addr: u32) -> u16 {
+    pub fn read_u16(&mut self, addr: u32) -> u16 {
         let a = addr & 0x0FFF_FFFF;
         match a >> 24 {
             0x05 => halfword(&self.palette, ((a & 0x0000_03FF) & !1) as usize),
@@ -219,8 +232,17 @@ impl Bus {
             // SRAM has an 8-bit bus: wide reads execute as sequential
             // byte reads of consecutive addresses.
             0x0E | 0x0F => {
-                u16::from(self.sram[(a & 0x0000_FFFF) as usize])
-                    | (u16::from(self.read_u8(addr.wrapping_add(1))) << 8)
+                u16::from(self.read_u8(addr)) | (u16::from(self.read_u8(addr.wrapping_add(1))) << 8)
+            }
+            // The EEPROM drives bit 0 of the 16-bit ROM window lane:
+            // one halfword access, one bit (not two byte lanes).
+            0x0D => {
+                if let Some(v) = self.save.read_eeprom_half() {
+                    v
+                } else {
+                    u16::from(self.read_u8(addr))
+                        | (u16::from(self.read_u8(addr.wrapping_add(1))) << 8)
+                }
             }
             _ => {
                 u16::from(self.read_u8(addr)) | (u16::from(self.read_u8(addr.wrapping_add(1))) << 8)
@@ -232,7 +254,7 @@ impl Bus {
     ///
     /// Palette, VRAM, and OAM are 16-bit regions, so their word reads are
     /// two halfword lanes; everywhere else the access is four byte lanes.
-    pub fn read_u32(&self, addr: u32) -> u32 {
+    pub fn read_u32(&mut self, addr: u32) -> u32 {
         let a = addr & 0x0FFF_FFFF;
         if matches!(a >> 24, 0x05..=0x07) {
             u32::from(self.read_u16(addr)) | (u32::from(self.read_u16(addr.wrapping_add(2))) << 16)
@@ -264,7 +286,7 @@ impl Bus {
                 self.vram[i] = value;
                 self.vram[i + 1] = value;
             }
-            0x0E | 0x0F => self.sram[(a & 0x0000_FFFF) as usize] = value,
+            0x0E | 0x0F => self.save.write_u8((a & 0x0000_FFFF) as u16, value),
             _ => {}
         }
     }
@@ -280,6 +302,12 @@ impl Bus {
                 self.write_u8(addr.wrapping_add(1), hi);
             }
             0x04 if a < 0x0400_0400 => self.io_write_u16(a & !1, value),
+            // The EEPROM takes one bit per halfword access: the write
+            // is not split into byte lanes (GBATEK "GBA Cart Backup
+            // EEPROM": only bit 0 of the data bus reaches the chip).
+            0x0D => {
+                self.save.write_eeprom_half(value);
+            }
             0x05 => {
                 let i = ((a & 0x0000_03FF) & !1) as usize;
                 self.palette[i] = lo;

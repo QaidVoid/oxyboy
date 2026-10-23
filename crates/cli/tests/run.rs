@@ -90,6 +90,8 @@ fn headless_dump_matches_golden() {
             "2",
             "--dump-frame",
             dump.to_str().expect("utf-8 path"),
+            "--save-dir",
+            dir.join("saves").to_str().expect("utf-8 path"),
         ])
         .status()
         .expect("spawn oxyboy");
@@ -114,6 +116,8 @@ fn headless_without_dump_exits_successfully() {
             "--headless",
             "--frames",
             "3",
+            "--save-dir",
+            dir.join("saves").to_str().expect("utf-8 path"),
         ])
         .status()
         .expect("spawn oxyboy");

@@ -21,11 +21,11 @@ const IF: u32 = 0x0400_0202;
 /// IF bit 12: the keypad request.
 const KEY_IF: u16 = 0x1000;
 
-fn keyinput(bus: &Bus) -> u16 {
+fn keyinput(bus: &mut Bus) -> u16 {
     bus.read_u16(KEYINPUT)
 }
 
-fn key_irq(bus: &Bus) -> bool {
+fn key_irq(bus: &mut Bus) -> bool {
     bus.read_u16(IF) & KEY_IF != 0
 }
 
@@ -39,30 +39,34 @@ fn arm_keycnt(bus: &mut Bus, mask: u16, and: bool) {
 #[test]
 fn keyinput_reads_active_low_with_defaults() {
     let mut bus = Bus::new(Vec::new());
-    assert_eq!(keyinput(&bus), 0x03FF, "no keys pressed at reset");
+    assert_eq!(keyinput(&mut bus), 0x03FF, "no keys pressed at reset");
 
     bus.press(Key::A);
-    assert_eq!(keyinput(&bus), 0x03FE, "pressed A reads 0");
+    assert_eq!(keyinput(&mut bus), 0x03FE, "pressed A reads 0");
     bus.press(Key::L);
-    assert_eq!(keyinput(&bus), 0x01FE, "L is bit 9");
+    assert_eq!(keyinput(&mut bus), 0x01FE, "L is bit 9");
     bus.release(Key::A);
     bus.release(Key::L);
-    assert_eq!(keyinput(&bus), 0x03FF);
+    assert_eq!(keyinput(&mut bus), 0x03FF);
 
     // A face-mash across both bit bytes composes independently.
     bus.press(Key::Start);
     bus.press(Key::Right);
     bus.press(Key::Up);
-    assert_eq!(keyinput(&bus), 0x03FF & !(0x08 | 0x10 | 0x40));
+    assert_eq!(keyinput(&mut bus), 0x03FF & !(0x08 | 0x10 | 0x40));
 }
 
 #[test]
 fn keyinput_is_read_only() {
     let mut bus = Bus::new(Vec::new());
     bus.write_u16(KEYINPUT, 0x0000);
-    assert_eq!(keyinput(&bus), 0x03FF, "writes to KEYINPUT are discarded");
+    assert_eq!(
+        keyinput(&mut bus),
+        0x03FF,
+        "writes to KEYINPUT are discarded"
+    );
     bus.write_u8(KEYINPUT + 1, 0x00);
-    assert_eq!(keyinput(&bus), 0x03FF);
+    assert_eq!(keyinput(&mut bus), 0x03FF);
 }
 
 #[test]
@@ -71,22 +75,22 @@ fn key_irq_or_condition_fires_once_per_press() {
     arm_keycnt(&mut bus, 0x0001, false); // A, OR, enabled
 
     bus.press(Key::A);
-    assert!(key_irq(&bus), "the press raises the request");
+    assert!(key_irq(&mut bus), "the press raises the request");
     bus.write_u16(IF, KEY_IF); // acknowledge
     // Holding the key must not re-fire (edge, not level).
     bus.press(Key::A);
-    assert!(!key_irq(&bus), "no second request while held");
+    assert!(!key_irq(&mut bus), "no second request while held");
 
     bus.release(Key::A);
-    assert!(!key_irq(&bus), "release clears the condition quietly");
+    assert!(!key_irq(&mut bus), "release clears the condition quietly");
     bus.press(Key::A);
-    assert!(key_irq(&bus), "a fresh press fires again");
+    assert!(key_irq(&mut bus), "a fresh press fires again");
 
     // Keys outside the mask stay quiet.
     bus.write_u16(IF, KEY_IF);
     bus.press(Key::B);
     bus.release(Key::A);
-    assert!(!key_irq(&bus));
+    assert!(!key_irq(&mut bus));
 }
 
 #[test]
@@ -95,15 +99,15 @@ fn key_irq_and_condition_needs_all_selected() {
     arm_keycnt(&mut bus, 0x0003, true); // A+B, AND, enabled
 
     bus.press(Key::A);
-    assert!(!key_irq(&bus), "one of two is not all");
+    assert!(!key_irq(&mut bus), "one of two is not all");
     bus.press(Key::B);
-    assert!(key_irq(&bus), "A+B satisfies AND");
+    assert!(key_irq(&mut bus), "A+B satisfies AND");
     bus.write_u16(IF, KEY_IF);
 
     // Dropping one key clears the condition; re-completing re-fires.
     bus.release(Key::B);
     bus.press(Key::B);
-    assert!(key_irq(&bus));
+    assert!(key_irq(&mut bus));
 }
 
 #[test]
@@ -112,27 +116,27 @@ fn key_irq_disabled_or_empty_mask_never_fires() {
     // Mask set but bit 14 clear.
     bus.write_u16(KEYCNT, 0x0001);
     bus.press(Key::A);
-    assert!(!key_irq(&bus), "disabled means no request");
+    assert!(!key_irq(&mut bus), "disabled means no request");
 
     // Enabled with an empty mask (the degenerate AND case).
     bus.write_u16(KEYCNT, 0xC000);
     for key in [Key::A, Key::B, Key::Start, Key::L] {
         bus.press(key);
     }
-    assert!(!key_irq(&bus), "an empty mask selects nothing");
+    assert!(!key_irq(&mut bus), "an empty mask selects nothing");
 }
 
 #[test]
 fn keycnt_rewrite_over_held_keys_fires() {
     let mut bus = Bus::new(Vec::new());
     bus.press(Key::A);
-    assert!(!key_irq(&bus));
+    assert!(!key_irq(&mut bus));
 
     // Arming while the condition already holds raises the request
     // (the condition edge happened before the write; the write makes
     // it visible).
     arm_keycnt(&mut bus, 0x0001, false);
-    assert!(key_irq(&bus));
+    assert!(key_irq(&mut bus));
 }
 
 #[test]
@@ -140,9 +144,9 @@ fn system_press_reaches_the_polled_register() {
     let mut system = System::new(vec![0xEA, 0xFF, 0xFF, 0xFE], 0x0800_0000);
     system.press(Key::Start);
     system.step_frame();
-    assert_eq!(system.bus().read_u16(KEYINPUT), 0x03F7);
+    assert_eq!(system.bus_mut().read_u16(KEYINPUT), 0x03F7);
     system.release(Key::Start);
-    assert_eq!(system.bus().read_u16(KEYINPUT), 0x03FF);
+    assert_eq!(system.bus_mut().read_u16(KEYINPUT), 0x03FF);
 }
 
 /// ROM-level check: the assembled `inputtest` micro-ROM
@@ -156,55 +160,55 @@ fn input_rom_polled_input_and_key_irq() {
     };
     let image = Image::from_file(&path).expect("script-built ROM must parse");
     let mut system = System::new(image.bytes().to_vec(), 0x0800_0000);
-    let word = |system: &System, addr: u32| system.bus().read_u32(addr);
-    let half = |system: &System, addr: u32| system.bus().read_u16(addr);
+    let word = |system: &mut System, addr: u32| system.bus_mut().read_u32(addr);
+    let half = |system: &mut System, addr: u32| system.bus_mut().read_u16(addr);
     const SNAPSHOT: u32 = 0x0300_0000;
     const ENTRIES: u32 = 0x0300_0004;
     const CONTRACT: u32 = 0x0300_0008;
 
     // Frame 1: the ROM parks on the poll loop, nothing pressed.
     system.step_frame();
-    assert_eq!(half(&system, SNAPSHOT), 0x03FF, "nothing pressed");
-    assert_eq!(word(&system, ENTRIES), 0);
+    assert_eq!(half(&mut system, SNAPSHOT), 0x03FF, "nothing pressed");
+    assert_eq!(word(&mut system, ENTRIES), 0);
 
     // Press A: the next frame dispatches the key IRQ once and the
     // poll loop observes the pressed bit.
     system.press(Key::A);
     system.step_frame();
-    assert_eq!(half(&system, SNAPSHOT), 0x03FE, "the ROM polled A down");
-    assert_eq!(word(&system, ENTRIES), 1, "exactly one key IRQ");
-    assert_eq!(word(&system, CONTRACT), 0x0001, "r0 == IE & IF");
+    assert_eq!(half(&mut system, SNAPSHOT), 0x03FE, "the ROM polled A down");
+    assert_eq!(word(&mut system, ENTRIES), 1, "exactly one key IRQ");
+    assert_eq!(word(&mut system, CONTRACT), 0x0001, "r0 == IE & IF");
 
     // Holding A across another frame fires nothing more.
     system.step_frame();
-    assert_eq!(word(&system, ENTRIES), 1, "edge, not level");
+    assert_eq!(word(&mut system, ENTRIES), 1, "edge, not level");
 
     // Release: the snapshot follows, no new request.
     system.release(Key::A);
     system.step_frame();
-    assert_eq!(half(&system, SNAPSHOT), 0x03FF);
-    assert_eq!(word(&system, ENTRIES), 1);
+    assert_eq!(half(&mut system, SNAPSHOT), 0x03FF);
+    assert_eq!(word(&mut system, ENTRIES), 1);
 
     // A key outside the mask neither fires nor disturbs the poll.
     system.press(Key::B);
     system.step_frame();
-    assert_eq!(half(&system, SNAPSHOT), 0x03FD);
-    assert_eq!(word(&system, ENTRIES), 1);
+    assert_eq!(half(&mut system, SNAPSHOT), 0x03FD);
+    assert_eq!(word(&mut system, ENTRIES), 1);
 
     // A re-press of the masked key fires again.
     system.press(Key::A);
     system.step_frame();
-    assert_eq!(word(&system, ENTRIES), 2);
+    assert_eq!(word(&mut system, ENTRIES), 2);
 
     // Switch the config to AND over A+B (the driver writes KEYCNT
     // the way a ROM would). A is already down; B completes it.
     system.bus_mut().write_u16(KEYCNT, 0xC003);
     system.step_frame();
-    assert_eq!(word(&system, ENTRIES), 2, "line already high: no edge");
+    assert_eq!(word(&mut system, ENTRIES), 2, "line already high: no edge");
 
     system.release(Key::B);
     system.press(Key::B);
     system.step_frame();
-    assert_eq!(word(&system, ENTRIES), 3, "AND condition re-completed");
-    assert_eq!(word(&system, CONTRACT), 0x0001);
+    assert_eq!(word(&mut system, ENTRIES), 3, "AND condition re-completed");
+    assert_eq!(word(&mut system, CONTRACT), 0x0001);
 }

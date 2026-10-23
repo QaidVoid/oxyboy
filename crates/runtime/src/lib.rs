@@ -7,5 +7,6 @@ pub mod cpu;
 pub mod dma;
 pub mod input;
 pub mod ppu;
+pub mod save;
 pub mod system;
 pub mod timer;

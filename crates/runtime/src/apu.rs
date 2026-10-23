@@ -692,7 +692,7 @@ mod tests {
         bus
     }
 
-    fn read(bus: &Bus, off: u32) -> u16 {
+    fn read(bus: &mut Bus, off: u32) -> u16 {
         bus.read_u16(0x0400_0000 + off)
     }
 
@@ -705,7 +705,7 @@ mod tests {
             (NR23_NR24, 0x4000 | 0x8000),
         ]);
         let mut apu = Apu::new();
-        apu.restart_square(1, read(&bus, NR21_NR22), read(&bus, NR23_NR24), 0);
+        apu.restart_square(1, read(&mut bus, NR21_NR22), read(&mut bus, NR23_NR24), 0);
         assert_eq!(apu.active_mask() & 0x2, 0x2);
 
         apu.step(&mut bus, SEQ_PERIOD - 1);
@@ -730,7 +730,7 @@ mod tests {
             (NR23_NR24, 0x8000),
         ]);
         let mut apu = Apu::new();
-        apu.restart_square(1, read(&bus, NR21_NR22), read(&bus, NR23_NR24), 0);
+        apu.restart_square(1, read(&mut bus, NR21_NR22), read(&mut bus, NR23_NR24), 0);
         assert_eq!(apu.sq[1].env.vol, 3);
         // The envelope ticks at sequencer step 7, 15, 23 (64 Hz); the
         // first tick lands on the eighth 512 Hz step.
@@ -746,7 +746,7 @@ mod tests {
         // Increase direction clamps at 15.
         let mut bus = bus_with(&[(NR21_NR22, 0x3900), (NR23_NR24, 0x8000)]);
         let mut apu = Apu::new();
-        apu.restart_square(1, read(&bus, NR21_NR22), read(&bus, NR23_NR24), 0);
+        apu.restart_square(1, read(&mut bus, NR21_NR22), read(&mut bus, NR23_NR24), 0);
         apu.step(&mut bus, 96 * SEQ_PERIOD);
         assert_eq!(apu.sq[1].env.vol, 15);
     }
@@ -758,9 +758,9 @@ mod tests {
         let mut apu = Apu::new();
         apu.restart_square(
             0,
-            read(&bus, NR11_NR12),
-            read(&bus, NR13_NR14),
-            read(&bus, 0x060),
+            read(&mut bus, NR11_NR12),
+            read(&mut bus, NR13_NR14),
+            read(&mut bus, 0x060),
         );
 
         // First sweep applies at sequencer step 2 (the third 512 Hz
@@ -768,28 +768,28 @@ mod tests {
         apu.step(&mut bus, 3 * SEQ_PERIOD);
         assert_eq!(apu.sq[0].sweep_shadow, 1250);
         assert_eq!(
-            read(&bus, NR13_NR14) & 0x07FF,
+            read(&mut bus, NR13_NR14) & 0x07FF,
             1250,
             "frequency written back"
         );
         assert_eq!(apu.active_mask() & 0x1, 0x1);
         // Second sweep at step 6: 1250 + 312 = 1562.
         apu.step(&mut bus, 4 * SEQ_PERIOD);
-        assert_eq!(read(&bus, NR13_NR14) & 0x07FF, 1562);
+        assert_eq!(read(&mut bus, NR13_NR14) & 0x07FF, 1562);
 
         // Overflow: pace 1, increase, shift 3, f=1900 -> 2137 > 2047.
         let mut bus = bus_with(&[(0x060, 0x0013), (NR13_NR14, 0x8000 | 1900)]);
         let mut apu = Apu::new();
         apu.restart_square(
             0,
-            read(&bus, NR11_NR12),
-            read(&bus, NR13_NR14),
-            read(&bus, 0x060),
+            read(&mut bus, NR11_NR12),
+            read(&mut bus, NR13_NR14),
+            read(&mut bus, 0x060),
         );
         apu.step(&mut bus, 3 * SEQ_PERIOD);
         assert_eq!(apu.active_mask() & 0x1, 0, "overflow disables the channel");
         assert_eq!(
-            read(&bus, NR13_NR14) & 0x07FF,
+            read(&mut bus, NR13_NR14) & 0x07FF,
             1900,
             "no write-back on overflow"
         );
@@ -799,12 +799,12 @@ mod tests {
         let mut apu = Apu::new();
         apu.restart_square(
             0,
-            read(&bus, NR11_NR12),
-            read(&bus, NR13_NR14),
-            read(&bus, 0x060),
+            read(&mut bus, NR11_NR12),
+            read(&mut bus, NR13_NR14),
+            read(&mut bus, 0x060),
         );
         apu.step(&mut bus, 16 * SEQ_PERIOD);
-        assert_eq!(read(&bus, NR13_NR14) & 0x07FF, 1000);
+        assert_eq!(read(&mut bus, NR13_NR14) & 0x07FF, 1000);
     }
 
     #[test]
@@ -877,7 +877,7 @@ mod tests {
             (0x8000, 11),
         ] {
             bus.write_u16(0x0400_0000 + NR31_NR32, bits);
-            let len_vol = read(&bus, NR31_NR32);
+            let len_vol = read(&mut bus, NR31_NR32);
             let sample = u32::from(apu.wave_nibble(&bus, 0));
             let got = if len_vol & 0x8000 != 0 {
                 sample * 3 / 4
@@ -987,7 +987,7 @@ mod tests {
             (NR23_NR24, 0x8000 | 512),
         ]);
         let mut apu = Apu::new();
-        apu.restart_square(1, read(&bus, NR21_NR22), read(&bus, NR23_NR24), 0);
+        apu.restart_square(1, read(&mut bus, NR21_NR22), read(&mut bus, NR23_NR24), 0);
         apu.step(&mut bus, SAMPLE_PERIOD);
         assert_eq!(apu.take_samples().len(), 2);
 
@@ -996,39 +996,43 @@ mod tests {
         bus.write_u16(0x0400_0000 + SOUNDCNT_X, 0x0000);
         apu.reset();
         assert_eq!(apu.active_mask(), 0);
-        assert_eq!(read(&bus, 0x060), 0);
-        assert_eq!(read(&bus, NR21_NR22), 0);
-        assert_eq!(read(&bus, NR23_NR24), 0, "restart strobe stored as zero");
-        assert_eq!(read(&bus, SOUNDCNT_H), 0);
+        assert_eq!(read(&mut bus, 0x060), 0);
+        assert_eq!(read(&mut bus, NR21_NR22), 0);
+        assert_eq!(
+            read(&mut bus, NR23_NR24),
+            0,
+            "restart strobe stored as zero"
+        );
+        assert_eq!(read(&mut bus, SOUNDCNT_H), 0);
         bus.write_u8(0x0400_0090, 0xAB);
         assert_eq!(bus.read_u8(0x0400_0090), 0xAB, "wave RAM survives");
 
         // Writes to the PSG range are ignored while disabled.
         bus.write_u16(0x0400_0000 + NR21_NR22, 0xFFFF);
-        assert_eq!(read(&bus, NR21_NR22), 0);
+        assert_eq!(read(&mut bus, NR21_NR22), 0);
 
         // Re-enabling restores writability.
         bus.write_u16(0x0400_0000 + SOUNDCNT_X, 0x0080);
         bus.write_u16(0x0400_0000 + NR21_NR22, 0x1234);
-        assert_eq!(read(&bus, NR21_NR22), 0x1234);
+        assert_eq!(read(&mut bus, NR21_NR22), 0x1234);
     }
 
     #[test]
     fn restart_strobe_reads_as_zero_and_fires_from_a_byte_merge() {
         let mut bus = bus_with(&[]);
         bus.write_u16(0x0400_0000 + NR13_NR14, 0x8000 | 100);
-        assert_eq!(read(&bus, NR13_NR14), 100, "strobe bit stored as zero");
+        assert_eq!(read(&mut bus, NR13_NR14), 100, "strobe bit stored as zero");
 
         // A plain NR13 word write leaves no stale strobe for a later
         // NR13 write to inherit.
         bus.write_u16(0x0400_0000 + NR13_NR14, 100 | 0x0400);
-        assert_eq!(read(&bus, NR13_NR14), 100 | 0x0400);
+        assert_eq!(read(&mut bus, NR13_NR14), 100 | 0x0400);
 
         // Writing NR14 alone (byte merge into the halfword) fires the
         // strobe and replaces the whole high byte: the length flag
         // clears and the strobe stores as zero, leaving freq 100.
         bus.write_u8(0x0400_0065, 0x80);
-        assert_eq!(read(&bus, NR13_NR14), 100);
+        assert_eq!(read(&mut bus, NR13_NR14), 100);
     }
 
     #[test]

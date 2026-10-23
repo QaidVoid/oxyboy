@@ -706,6 +706,7 @@ dependencies = [
  "decode",
  "rom",
  "testutil",
+ "thiserror",
 ]
 
 [[package]]

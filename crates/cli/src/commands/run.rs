@@ -13,10 +13,11 @@
 
 use std::fs::File;
 use std::io::BufWriter;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rom::Image;
 use runtime::ppu::{VISIBLE_LINES, WIDTH};
+use runtime::save::Save;
 use runtime::system::System;
 
 use crate::RomArgs;
@@ -41,6 +42,16 @@ pub struct RunArgs {
     /// Write the final rendered frame to this PNG path.
     #[arg(long, value_name = "FILE")]
     pub dump_frame: Option<std::path::PathBuf>,
+
+    /// Directory for save files. The default is the user data dir
+    /// (never inside the repository).
+    #[arg(long, value_name = "DIR")]
+    pub save_dir: Option<PathBuf>,
+
+    /// Path to a JSON ROM database; an entry's `save_type` overrides
+    /// the backup medium auto-detection.
+    #[arg(long, value_name = "FILE", env = "OXYBOY_ROM_DB")]
+    pub db: Option<PathBuf>,
 }
 
 /// Runs `oxyboy run` and returns the process exit code.
@@ -53,12 +64,37 @@ pub fn run(args: RunArgs) -> i32 {
         }
     };
     let mut system = System::new(image.bytes().to_vec(), CART_BASE);
+    let save_file = save_path(&args, &image);
+    if let Some(Err(e)) = save_file.as_deref().map(|path| {
+        path.parent()
+            .map(std::fs::create_dir_all)
+            .unwrap_or_else(|| Ok(()))
+    }) {
+        eprintln!("oxyboy run: {e}");
+        return 1;
+    }
+    if let Some(path) = &save_file {
+        apply_save_override(&mut system, &args, &image);
+        if path.exists() {
+            match Save::from_file(path) {
+                Ok(loaded) => *system.bus_mut().save_mut() = loaded,
+                Err(e) => eprintln!("oxyboy run: {}: {e}", path.display()),
+            }
+        }
+    }
     if args.headless {
         for _ in 0..args.frames {
             system.step_frame();
         }
     } else if let Err(code) = run_windowed(&mut system) {
         eprintln!("oxyboy run: {code}");
+        return 1;
+    }
+    if let Some(Err(e)) = save_file
+        .as_deref()
+        .map(|path| system.bus().save().to_file(path))
+    {
+        eprintln!("oxyboy run: {e}");
         return 1;
     }
     if let Some(Err(e)) = args
@@ -97,6 +133,57 @@ fn run_windowed(system: &mut System) -> Result<(), String> {
             .map_err(|e| format!("present failed: {e}"))?;
     }
     Ok(())
+}
+
+/// Resolves the save file path: `<save-dir>/<game code>.sav`.
+///
+/// With `--save-dir` the directory is used as given; otherwise the
+/// default is `$XDG_DATA_HOME/oxyboy/saves` or
+/// `$HOME/.local/share/oxyboy/saves`. Returns `None` when persistence
+/// is impossible (no directory resolvable or no game code in the
+/// header).
+fn save_path(args: &RunArgs, image: &Image) -> Option<PathBuf> {
+    let dir = args.save_dir.clone().map_or_else(default_save_dir, Some)?;
+    let code = image.header().game_code_str()?;
+    Some(dir.join(format!("{code}.sav")))
+}
+
+/// The user data directory for saves, or `None` when neither
+/// `XDG_DATA_HOME` nor `HOME` is set.
+fn default_save_dir() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_DATA_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local").join("share"))
+        })?;
+    Some(base.join("oxyboy").join("saves"))
+}
+
+/// Replaces the auto-detected medium when the ROM database entry for
+/// this image carries a `save_type` override.
+fn apply_save_override(system: &mut System, args: &RunArgs, image: &Image) {
+    let Some(path) = &args.db else {
+        return;
+    };
+    let db = match rom::Database::from_file(path) {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!("oxyboy run: {}: {e}", path.display());
+            return;
+        }
+    };
+    let hashes = rom::Hashes::compute(image.bytes());
+    let Some(entry) = db.find(&hashes) else {
+        return;
+    };
+    let Some(name) = entry.save_type.as_deref() else {
+        return;
+    };
+    match runtime::save::SaveKind::from_name(name) {
+        Some(kind) => *system.bus_mut().save_mut() = Save::new(kind),
+        None => eprintln!("oxyboy run: unknown save_type {name:?} in {path:?}"),
+    }
 }
 
 /// Encodes the framebuffer as an RGBA8888 PNG.

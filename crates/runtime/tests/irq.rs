@@ -214,7 +214,7 @@ fn irq_rom_vblank_masking_dispatch_and_return() {
     };
     let image = Image::from_file(&path).expect("script-built ROM must parse");
     let mut system = System::new(image.bytes().to_vec(), 0x0800_0000);
-    let word = |system: &System, addr: u32| system.bus().read_u32(addr);
+    let word = |system: &mut System, addr: u32| system.bus_mut().read_u32(addr);
     const ENTRIES: u32 = 0x0300_0000;
     const CONTRACT: u32 = 0x0300_0008;
     const HEARTBEAT: u32 = 0x0300_0010;
@@ -223,7 +223,7 @@ fn irq_rom_vblank_masking_dispatch_and_return() {
     // nothing dispatches (GBATEK: IME = 0 masks all).
     system.step_frame();
     system.step_frame();
-    assert_eq!(word(&system, ENTRIES), 0, "IME=0 must mask all");
+    assert_eq!(word(&mut system, ENTRIES), 0, "IME=0 must mask all");
     assert_ne!(
         system.bus().int_flags() & 0x0001,
         0,
@@ -241,12 +241,12 @@ fn irq_rom_vblank_masking_dispatch_and_return() {
     system.step_frame();
     system.step_frame();
     assert_eq!(
-        word(&system, ENTRIES),
+        word(&mut system, ENTRIES),
         3,
         "handler must run exactly once per VBlank"
     );
     assert_eq!(
-        word(&system, CONTRACT),
+        word(&mut system, CONTRACT),
         0x0003,
         "r0 = IE&IF and canary preservation"
     );
@@ -255,11 +255,11 @@ fn irq_rom_vblank_masking_dispatch_and_return() {
         0,
         "the handler acknowledged IF"
     );
-    let heartbeat = word(&system, HEARTBEAT);
+    let heartbeat = word(&mut system, HEARTBEAT);
     assert!(heartbeat > 0, "the interrupted loop must have run");
     system.step_frame();
     assert!(
-        word(&system, HEARTBEAT) > heartbeat,
+        word(&mut system, HEARTBEAT) > heartbeat,
         "the interrupted loop must keep running after returns"
     );
 }

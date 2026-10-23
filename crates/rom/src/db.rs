@@ -29,6 +29,11 @@ pub struct DatabaseEntry {
     pub md5: String,
     /// SHA-1 digest as lowercase hex.
     pub sha1: String,
+    /// Backup medium override for wrong or missing ID strings: one of
+    /// `sram`, `flash64`, `flash128`, `eeprom512`, `eeprom8k`
+    /// (`runtime::save::SaveKind::from_name` parses it).
+    #[serde(default)]
+    pub save_type: Option<String>,
 }
 
 /// Errors produced while loading a database.
@@ -123,7 +128,8 @@ mod tests {
         "entries": [
             { "name": "Known Game", "status": "Verified",
               "md5": "900150983cd24fb0d6963f7d28e17f72",
-              "sha1": "a9993e364706816aba3e25717850c26c9cd0d89d" },
+              "sha1": "a9993e364706816aba3e25717850c26c9cd0d89d",
+              "save_type": "eeprom8k" },
             { "name": "Half Match", "status": null,
               "md5": "900150983cd24fb0d6963f7d28e17f72",
               "sha1": "0000000000000000000000000000000000000000" }
@@ -137,6 +143,7 @@ mod tests {
         let found = db.find(&hashes).expect("hit");
         assert_eq!(found.name, "Known Game");
         assert_eq!(found.status.as_deref(), Some("Verified"));
+        assert_eq!(found.save_type.as_deref(), Some("eeprom8k"));
     }
 
     #[test]

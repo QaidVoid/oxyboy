@@ -172,6 +172,12 @@ impl Dma {
         };
 
         let mut cycles = 0u32;
+        // A request stream is announced by the transfer that carries
+        // it: the chip's address width follows from the bit count
+        // (GBATEK EEPROM streams go out via DMA3 halfwords).
+        if unit == 2 && (0x0D00_0000..0x0E00_0000).contains(&dad) && (9..=81).contains(&count) {
+            bus.save_mut().announce_eeprom_stream(count as u8);
+        }
         for _ in 0..count {
             cycles += crate::cpu::access_cycles(bus, sad, unit as u8);
             cycles += crate::cpu::access_cycles(bus, dad, unit as u8);

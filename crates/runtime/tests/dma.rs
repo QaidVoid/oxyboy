@@ -55,7 +55,7 @@ fn immediate_halfword_transfer_copies_on_the_next_system_step() {
     assert_eq!(bus.read_u16(DST), 0);
 
     system.step();
-    let bus = system.bus();
+    let bus = system.bus_mut();
     for i in 0..4u32 {
         assert_eq!(
             bus.read_u16(DST + 2 * i),
@@ -82,7 +82,7 @@ fn word_width_transfers_32_bit_units() {
     bus.write_u16(ch(1) + CNT_H, cnt_h(0b00, 0b00, 0b00, 0x0020));
     system.step();
 
-    let bus = system.bus();
+    let bus = system.bus_mut();
     assert_eq!(bus.read_u32(DST), 0x1122_3344);
     assert_eq!(bus.read_u32(DST + 4), 0x5566_7788);
 }
@@ -98,7 +98,7 @@ fn dst_fixed_writes_every_unit_to_the_same_address() {
     bus.write_u16(ch(0) + CNT_H, cnt_h(0b10, 0b00, 0b00, 0));
     system.step();
 
-    let bus = system.bus();
+    let bus = system.bus_mut();
     assert_eq!(bus.read_u16(DST), 0x0102, "the last unit lands alone");
     assert_eq!(bus.read_u16(DST + 2), 0);
 }
@@ -115,7 +115,7 @@ fn dst_dec_walks_backwards_from_the_destination() {
     bus.write_u16(ch(0) + CNT_H, cnt_h(0b01, 0b00, 0b00, 0));
     system.step();
 
-    let bus = system.bus();
+    let bus = system.bus_mut();
     assert_eq!(bus.read_u16(DST + 2), 0x0100);
     assert_eq!(bus.read_u16(DST), 0x0101);
 }
@@ -131,7 +131,7 @@ fn src_dec_reads_backwards_from_the_source() {
     bus.write_u16(ch(0) + CNT_H, cnt_h(0b00, 0b01, 0b00, 0));
     system.step();
 
-    let bus = system.bus();
+    let bus = system.bus_mut();
     assert_eq!(bus.read_u16(DST), 0x0101);
     assert_eq!(bus.read_u16(DST + 2), 0x0100);
 }
@@ -149,7 +149,7 @@ fn count_zero_means_the_channel_maximum() {
     bus.write_u16(ch(3) + CNT_H, cnt_h(0b10, 0b00, 0b00, 0));
     system.step();
 
-    let bus = system.bus();
+    let bus = system.bus_mut();
     // A fixed destination keeps only the final unit: 0x1FFFE bytes in.
     assert_eq!(bus.read_u16(0x0300_0000), 0x0200u16.wrapping_add(0xFFFF));
 }
@@ -168,7 +168,7 @@ fn latched_addresses_survive_later_register_writes() {
     bus.write_u32(ch(0) + SAD, SRC + 0x40);
     system.step();
 
-    assert_eq!(system.bus().read_u16(DST), 0x0A0A);
+    assert_eq!(system.bus_mut().read_u16(DST), 0x0A0A);
 }
 
 #[test]
@@ -187,7 +187,7 @@ fn simultaneous_enables_run_lowest_channel_first() {
     }
     system.step();
 
-    let bus = system.bus();
+    let bus = system.bus_mut();
     assert_eq!(bus.read_u16(DST), 0xBBBB, "channel 0 runs first");
     assert_eq!(bus.int_flags() & 0x0300, 0x0300, "both channels ran");
 }
@@ -301,9 +301,13 @@ fn special_timing_ignores_immediate_and_flag_edges() {
     bus.write_u16(ch(1) + CNT_L, 4);
     bus.write_u16(ch(1) + CNT_H, cnt_h(0b11, 0b00, 0b11, 0));
     system.step();
-    assert_eq!(system.bus().read_u16(0x0400_00A0), 0, "no immediate run");
+    assert_eq!(
+        system.bus_mut().read_u16(0x0400_00A0),
+        0,
+        "no immediate run"
+    );
     assert_ne!(
-        system.bus().read_u16(ch(1) + CNT_H) & 0x8000,
+        system.bus_mut().read_u16(ch(1) + CNT_H) & 0x8000,
         0,
         "FIFO channels stay enabled"
     );

@@ -44,13 +44,19 @@ fn prescaler_ticks_follow_the_elapsed_cycle_budget_exactly() {
         elapsed += system.step();
     }
     assert_eq!(
-        u32::from(system.bus().read_u16(tm(0) + CNT_L)),
+        u32::from(system.bus_mut().read_u16(tm(0) + CNT_L)),
         elapsed % 0x1_0000
     );
-    assert_eq!(system.bus().read_u16(tm(1) + CNT_L), (elapsed / 64) as u16);
-    assert_eq!(system.bus().read_u16(tm(2) + CNT_L), (elapsed / 256) as u16);
     assert_eq!(
-        system.bus().read_u16(tm(3) + CNT_L),
+        system.bus_mut().read_u16(tm(1) + CNT_L),
+        (elapsed / 64) as u16
+    );
+    assert_eq!(
+        system.bus_mut().read_u16(tm(2) + CNT_L),
+        (elapsed / 256) as u16
+    );
+    assert_eq!(
+        system.bus_mut().read_u16(tm(3) + CNT_L),
         (elapsed / 1024) as u16
     );
 
@@ -58,7 +64,10 @@ fn prescaler_ticks_follow_the_elapsed_cycle_budget_exactly() {
     for _ in 0..10 {
         elapsed += system.step();
     }
-    assert_eq!(system.bus().read_u16(tm(1) + CNT_L), (elapsed / 64) as u16);
+    assert_eq!(
+        system.bus_mut().read_u16(tm(1) + CNT_L),
+        (elapsed / 64) as u16
+    );
 }
 
 #[test]
@@ -72,19 +81,19 @@ fn reload_applies_on_overflow_and_on_reenable() {
     }
     // Enough cycles for several ticks; the value is reload plus the
     // ticks since enable modulo the wraps.
-    let counter = system.bus().read_u16(tm(0) + CNT_L);
+    let counter = system.bus_mut().read_u16(tm(0) + CNT_L);
     assert_ne!(counter, 0xFFFF, "the counter must have ticked");
 
     // A write while enabled changes only the reload latch.
     let bus = system.bus_mut();
     bus.write_u16(tm(0) + CNT_L, 0x1234);
-    assert_ne!(system.bus().read_u16(tm(0) + CNT_L), 0x1234);
+    assert_ne!(system.bus_mut().read_u16(tm(0) + CNT_L), 0x1234);
 
     // Disable, then enable: the counter takes the new reload.
     let bus = system.bus_mut();
     bus.write_u16(tm(0) + CNT_H, cnt_h(0, false, false, false));
     bus.write_u16(tm(0) + CNT_H, cnt_h(0, false, false, true));
-    assert_eq!(system.bus().read_u16(tm(0) + CNT_L), 0x1234);
+    assert_eq!(system.bus_mut().read_u16(tm(0) + CNT_L), 0x1234);
 }
 
 #[test]
@@ -114,9 +123,9 @@ fn cascade_ticks_chain_across_three_channels() {
     let t1_overflows = t0_overflows / p1;
     assert!(t1_overflows >= 2, "test must run long enough to chain");
 
-    let t0 = system.bus().read_u16(tm(0) + CNT_L);
-    let t1 = system.bus().read_u16(tm(1) + CNT_L);
-    let t2 = system.bus().read_u16(tm(2) + CNT_L);
+    let t0 = system.bus_mut().read_u16(tm(0) + CNT_L);
+    let t1 = system.bus_mut().read_u16(tm(1) + CNT_L);
+    let t2 = system.bus_mut().read_u16(tm(2) + CNT_L);
     let k0 = elapsed % p0;
     let k1 = t0_overflows % p1;
     let expected_t0 = if k0 == 0 {

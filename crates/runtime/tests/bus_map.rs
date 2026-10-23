@@ -116,7 +116,7 @@ fn vram_mirror_quirk_does_not_alias_bg_bank() {
 
 #[test]
 fn rom_windows_mirror_the_image() {
-    let bus = bus_with_rom();
+    let mut bus = bus_with_rom();
     assert_eq!(bus.read_u8(0x0800_0000), 0x00);
     assert_eq!(bus.read_u8(0x0800_03FF), 0xFF);
     // Within the 32 MiB segment the image repeats at its own size.
@@ -145,7 +145,7 @@ fn rom_writes_are_discarded() {
 fn rom_read_beyond_power_of_two_tail_is_open_bus() {
     // 3 KiB image: the tail 0x08000C00..0x08001000 has no chip behind it.
     let rom = vec![7u8; 3072];
-    let bus = Bus::new(rom);
+    let mut bus = Bus::new(rom);
     assert_eq!(bus.read_u8(0x0800_0BFF), 7);
     assert_eq!(bus.read_u8(0x0800_0C00), 0);
     assert_eq!(bus.read_u8(0x0800_0FFF), 0);
