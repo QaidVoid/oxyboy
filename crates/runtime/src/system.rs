@@ -33,12 +33,13 @@ impl System {
 
     /// Runs one CPU instruction, advances the video clock by the
     /// cycles it consumed plus any immediate DMA the instruction armed,
-    /// and refreshes the CPU IRQ input line from the interrupt
-    /// controller state.
+    /// drives the timers on the same cycle budget, and refreshes the
+    /// CPU IRQ input line from the interrupt controller state.
     pub fn step(&mut self) -> u32 {
         let cycles = self.cpu.step(&mut self.bus);
         let dma_cycles = self.bus.dma_run_deferred();
         self.ppu.step(&mut self.bus, cycles + dma_cycles);
+        self.bus.step_timers(cycles + dma_cycles);
         let pending = self.bus.irq_pending();
         self.cpu.set_irq_line(pending);
         cycles

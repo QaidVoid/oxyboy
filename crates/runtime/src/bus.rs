@@ -11,6 +11,7 @@
 pub const EWRAM_SIZE: usize = 256 * 1024;
 
 use crate::dma::{Dma, DmaTiming};
+use crate::timer::Timers;
 /// On-chip work RAM (IWRAM): 32 KiB.
 pub const IWRAM_SIZE: usize = 32 * 1024;
 /// BG/OBJ palette RAM: 1 KiB.
@@ -76,6 +77,8 @@ pub struct Bus {
     io: Box<[u8]>,
     /// The four DMA channels (registers in `io`, engine state here).
     dma: Dma,
+    /// The four timers (registers in `io`, live counters here).
+    timers: Timers,
 }
 
 impl Bus {
@@ -100,6 +103,7 @@ impl Bus {
             sram: vec![0; SRAM_MAX_SIZE].into_boxed_slice(),
             io: vec![0; 0x400].into_boxed_slice(),
             dma: Dma::default(),
+            timers: Timers::default(),
         }
     }
 
@@ -150,7 +154,17 @@ impl Bus {
             0x00 if a < 0x4000 => self.bios[(a & 0x3FFF) as usize],
             0x02 => self.ewram[(a & 0x0003_FFFF) as usize],
             0x03 => self.iwram[(a & 0x0000_7FFF) as usize],
-            0x04 if a < 0x0400_0400 => self.io[(a & 0x3FF) as usize],
+            0x04 if a < 0x0400_0400 => {
+                let off = a & 0x3FF;
+                // TMxCNT_L reads return the live counter, not the
+                // stored reload value (GBATEK "TMxCNT_L").
+                if let Some(ch) = Self::timer_channel(off, 0) {
+                    let shift = 8 * (off & 1);
+                    (self.timers.counter(ch) >> shift) as u8
+                } else {
+                    self.io[(off) as usize]
+                }
+            }
             // Palette and OAM sit on 16/32-bit buses with no 8-bit data
             // lane; 8-bit reads return 0 (GBATEK bus-width table).
             0x05 | 0x07 => OPEN_BUS_BYTE,
@@ -331,7 +345,9 @@ impl Bus {
     fn io_write_u16(&mut self, half: u32, value: u16) {
         let off = (half & 0x3FF) as usize;
         let dma_cnt_h = Self::dma_cnt_h_channel(off as u32);
-        let was_enabled = dma_cnt_h.is_some() && halfword(&self.io, off) & 0x8000 != 0;
+        let timer_cnt_h = Self::timer_channel(off as u32, 2);
+        let was_enabled = dma_cnt_h.is_some() && halfword(&self.io, off) & 0x8000 != 0
+            || timer_cnt_h.is_some() && halfword(&self.io, off) & 0x0080 != 0;
         let stored = match off as u32 {
             Self::DISPSTAT => {
                 let flags = halfword(&self.io, off) & 0x0007;
@@ -351,6 +367,32 @@ impl Bus {
                 self.dma.on_enable(&self.io, ch);
             }
         }
+        if let Some(ch) = timer_cnt_h {
+            // The timer counter reloads on the enable 0 -> 1 edge
+            // (GBATEK "TMxCNT_L") from the just-latched CNT_L value.
+            if !was_enabled && value & 0x0080 != 0 {
+                let reload = halfword(&self.io, off - 2);
+                self.timers.on_enable(ch, reload);
+            }
+        }
+    }
+
+    /// The channel index if `off` is timer N's CNT_L (`base`) or CNT_H
+    /// (`base + 2`) halfword offset at `0x04000100 + 4*N`.
+    fn timer_channel(off: u32, which: u32) -> Option<usize> {
+        if (0x100..0x110).contains(&off) && (off - 0x100) & 0x3 == which {
+            Some(((off - 0x100) / 4) as usize)
+        } else {
+            None
+        }
+    }
+
+    /// Advances every enabled timer by `cycles` (one system step's
+    /// worth, CPU plus DMA cycles).
+    pub(crate) fn step_timers(&mut self, cycles: u32) {
+        let mut timers = std::mem::take(&mut self.timers);
+        timers.step(self, cycles);
+        self.timers = timers;
     }
 
     /// The raw IO halfword at `off` (masked into the 1 KiB window).
