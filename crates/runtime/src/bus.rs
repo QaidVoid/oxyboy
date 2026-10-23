@@ -12,6 +12,7 @@ pub const EWRAM_SIZE: usize = 256 * 1024;
 
 use crate::apu::Apu;
 use crate::dma::{Dma, DmaTiming};
+use crate::input::Key;
 use crate::timer::Timers;
 /// On-chip work RAM (IWRAM): 32 KiB.
 pub const IWRAM_SIZE: usize = 32 * 1024;
@@ -82,6 +83,11 @@ pub struct Bus {
     timers: Timers,
     /// The PSG sound channels (registers in `io`, engine state here).
     apu: Apu,
+    /// The pressed keypad buttons (bit set = pressed, active high;
+    /// KEYINPUT renders the inverse image).
+    keys: u16,
+    /// The last evaluated KEYCNT condition, for the request edge.
+    key_irq_line: bool,
 }
 
 impl Bus {
@@ -108,10 +114,13 @@ impl Bus {
             dma: Dma::default(),
             timers: Timers::default(),
             apu: Apu::new(),
+            keys: 0,
+            key_irq_line: false,
         };
         // SOUNDBIAS resets to 0200h: bias level 100h, the 10-bit output
         // midpoint (GBATEK SOUNDBIAS).
         bus.io[0x089] = 0x02;
+        bus.refresh_keyinput();
         bus
     }
 
@@ -448,6 +457,7 @@ impl Bus {
                 flags | (value & !0x0007)
             }
             Self::VCOUNT => return,
+            Self::KEYINPUT => return,
             Self::IF => halfword(&self.io, off) & !value,
             Self::SOUNDCNT_H => {
                 if value & 0x0800 != 0 {
@@ -492,6 +502,11 @@ impl Bus {
                 self.timers.on_enable(ch, reload);
             }
         }
+        if snd == Self::KEYCNT {
+            // A KEYCNT rewrite can make the request condition true
+            // (mask or condition change over held keys).
+            self.eval_key_irq();
+        }
     }
 
     /// The channel index if `off` is timer N's CNT_L (`base`) or CNT_H
@@ -533,6 +548,52 @@ impl Bus {
     /// 1 = B), for headless inspection of playback health.
     pub fn fifo_len(&self, which: usize) -> usize {
         self.apu.fifo_len(which)
+    }
+
+    /// Presses one keypad button (the scripted test input API; a
+    /// press takes effect immediately and re-evaluates the KEYCNT
+    /// request condition).
+    pub fn press(&mut self, key: Key) {
+        self.keys |= key.bit();
+        self.refresh_keyinput();
+        self.eval_key_irq();
+    }
+
+    /// Releases one keypad button.
+    pub fn release(&mut self, key: Key) {
+        self.keys &= !key.bit();
+        self.refresh_keyinput();
+        self.eval_key_irq();
+    }
+
+    /// Stores the KEYINPUT register image: pressed bits read 0
+    /// (GBATEK KEYINPUT, active low); the unused bits 10-15 read 0,
+    /// matching mGBA and VBA (GBATEK lists them unused without a
+    /// value).
+    fn refresh_keyinput(&mut self) {
+        let image = !self.keys & 0x03FF;
+        self.io[Self::KEYINPUT as usize] = image as u8;
+        self.io[Self::KEYINPUT as usize + 1] = (image >> 8) as u8;
+    }
+
+    /// Evaluates the KEYCNT condition (OR: at least one selected key
+    /// down; AND: all selected keys down; an empty mask is never
+    /// true) and raises IF bit 12 on the false -> true edge while
+    /// bit 14 enables the request.
+    fn eval_key_irq(&mut self) {
+        let cnt = self.io_half(Self::KEYCNT);
+        let mask = cnt & 0x03FF;
+        let pressed = self.keys & mask;
+        let cond = if cnt & 0x8000 != 0 {
+            mask != 0 && pressed == mask
+        } else {
+            pressed != 0
+        };
+        let was = self.key_irq_line;
+        self.key_irq_line = cond;
+        if cond && !was && cnt & 0x4000 != 0 {
+            self.raise_if(0x1000);
+        }
     }
 
     /// Latches the next FIFO byte per the SOUNDCNT_H timer selects for
@@ -699,6 +760,9 @@ impl Bus {
     const NR30: u32 = 0x070;
     const SOUNDCNT_H: u32 = 0x082;
     const SOUNDCNT_X: u32 = 0x084;
+    /// KEYINPUT (read only) and KEYCNT (key IRQ control).
+    const KEYINPUT: u32 = 0x130;
+    const KEYCNT: u32 = 0x132;
     /// IO offsets of the four sound CNT_X halfwords whose bit 15
     /// restarts a channel (NR14/NR24/NR34/NR44).
     const SND_STROBES: [u32; 4] = [0x064, 0x06C, 0x074, 0x07C];

@@ -7,6 +7,7 @@
 
 use crate::bus::Bus;
 use crate::cpu::Cpu;
+use crate::input::Key;
 use crate::ppu::{Frame, Ppu};
 
 /// A GBA machine: interpreter CPU, system bus, and video.
@@ -88,5 +89,16 @@ impl System {
     /// The bus, mutably.
     pub fn bus_mut(&mut self) -> &mut Bus {
         &mut self.bus
+    }
+
+    /// Presses a keypad button (scripted input; call at a frame
+    /// boundary between `step_frame` calls).
+    pub fn press(&mut self, key: Key) {
+        self.bus.press(key);
+    }
+
+    /// Releases a keypad button.
+    pub fn release(&mut self, key: Key) {
+        self.bus.release(key);
     }
 }
