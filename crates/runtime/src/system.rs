@@ -33,13 +33,15 @@ impl System {
 
     /// Runs one CPU instruction, advances the video clock by the
     /// cycles it consumed plus any immediate DMA the instruction armed,
-    /// drives the timers on the same cycle budget, and refreshes the
-    /// CPU IRQ input line from the interrupt controller state.
+    /// drives the timers and the APU on the same cycle budget, and
+    /// refreshes the CPU IRQ input line from the interrupt controller
+    /// state.
     pub fn step(&mut self) -> u32 {
         let cycles = self.cpu.step(&mut self.bus);
         let dma_cycles = self.bus.dma_run_deferred();
         self.ppu.step(&mut self.bus, cycles + dma_cycles);
         self.bus.step_timers(cycles + dma_cycles);
+        self.bus.step_apu(cycles + dma_cycles);
         let pending = self.bus.irq_pending();
         self.cpu.set_irq_line(pending);
         cycles
@@ -60,6 +62,12 @@ impl System {
     /// 240x160.
     pub fn framebuffer(&self) -> &Frame {
         self.ppu.frame()
+    }
+
+    /// Drains the APU's interleaved stereo sample buffer; call after
+    /// [`System::step_frame`] for one mix-down per frame.
+    pub fn take_audio(&mut self) -> Vec<i16> {
+        self.bus.take_audio()
     }
 
     /// The current scanline (the VCOUNT register view).

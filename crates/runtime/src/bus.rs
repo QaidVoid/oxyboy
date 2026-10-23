@@ -10,6 +10,7 @@
 /// On-board work RAM (EWRAM): 256 KiB.
 pub const EWRAM_SIZE: usize = 256 * 1024;
 
+use crate::apu::Apu;
 use crate::dma::{Dma, DmaTiming};
 use crate::timer::Timers;
 /// On-chip work RAM (IWRAM): 32 KiB.
@@ -79,6 +80,8 @@ pub struct Bus {
     dma: Dma,
     /// The four timers (registers in `io`, live counters here).
     timers: Timers,
+    /// The PSG sound channels (registers in `io`, engine state here).
+    apu: Apu,
 }
 
 impl Bus {
@@ -104,6 +107,7 @@ impl Bus {
             io: vec![0; 0x400].into_boxed_slice(),
             dma: Dma::default(),
             timers: Timers::default(),
+            apu: Apu::new(),
         }
     }
 
@@ -161,6 +165,11 @@ impl Bus {
                 if let Some(ch) = Self::timer_channel(off, 0) {
                     let shift = 8 * (off & 1);
                     (self.timers.counter(ch) >> shift) as u8
+                } else if off == Self::SOUNDCNT_X {
+                    // Only the master enable bit is stored; the
+                    // channel-active flags are live APU state (GBATEK
+                    // SOUNDCNT_X).
+                    (self.io[off as usize] & 0x80) | self.apu.active_mask()
                 } else {
                     self.io[(off) as usize]
                 }
@@ -352,8 +361,44 @@ impl Bus {
     /// read-only, and IF acknowledges on written 1 bits.
     fn io_write_u16(&mut self, half: u32, value: u16) {
         let off = (half & 0x3FF) as usize;
-        let dma_cnt_h = Self::dma_cnt_h_channel(off as u32);
-        let timer_cnt_h = Self::timer_channel(off as u32, 2);
+        let snd = off as u32;
+        if (0x060..0x082).contains(&snd) {
+            // PSG registers: while the master enable is clear the image
+            // is zero and writes are ignored (GBATEK SOUNDCNT_X). The
+            // restart strobes (bit 15 of the four CNT_X halfwords) are
+            // write-only and stored as zero, then fire once here.
+            if self.io[Self::SOUNDCNT_X as usize] & 0x80 == 0 {
+                return;
+            }
+            let strobe = Self::SND_STROBES.contains(&snd) && value & 0x8000 != 0;
+            let stored = if strobe { value & !0x8000 } else { value };
+            self.io[off] = stored as u8;
+            self.io[off + 1] = (stored >> 8) as u8;
+            if strobe {
+                match snd {
+                    0x064 => {
+                        let env = halfword(&self.io, 0x062);
+                        let sweep = halfword(&self.io, 0x060);
+                        self.apu.restart_square(0, env, value, sweep);
+                    }
+                    0x06C => {
+                        let env = halfword(&self.io, 0x068);
+                        self.apu.restart_square(1, env, value, 0);
+                    }
+                    0x074 => {
+                        let len = halfword(&self.io, 0x072);
+                        self.apu.restart_wave(len);
+                    }
+                    _ => {
+                        let env = halfword(&self.io, 0x078);
+                        self.apu.restart_noise(env, value);
+                    }
+                }
+            }
+            return;
+        }
+        let dma_cnt_h = Self::dma_cnt_h_channel(snd);
+        let timer_cnt_h = Self::timer_channel(snd, 2);
         let was_enabled = dma_cnt_h.is_some() && halfword(&self.io, off) & 0x8000 != 0
             || timer_cnt_h.is_some() && halfword(&self.io, off) & 0x0080 != 0;
         let stored = match off as u32 {
@@ -363,6 +408,20 @@ impl Bus {
             }
             Self::VCOUNT => return,
             Self::IF => halfword(&self.io, off) & !value,
+            Self::SOUNDCNT_X => {
+                let was_on = halfword(&self.io, off) & 0x0080 != 0;
+                if was_on && value & 0x0080 == 0 {
+                    // Master disable zeroes the PSG image (0x060..0x081)
+                    // and resets the engine until re-enabled; SOUNDCNT_H
+                    // and WAVE_RAM are unaffected (GBATEK SOUNDCNT_X).
+                    for h in (0x060..=0x080).step_by(2) {
+                        self.io[h] = 0;
+                        self.io[h + 1] = 0;
+                    }
+                    self.apu.reset();
+                }
+                value & 0x0080
+            }
             _ => value,
         };
         self.io[off] = stored as u8;
@@ -401,6 +460,27 @@ impl Bus {
         let mut timers = std::mem::take(&mut self.timers);
         timers.step(self, cycles);
         self.timers = timers;
+    }
+
+    /// Advances the APU by `cycles` system cycles. `System::step`
+    /// calls this with every step's cycle budget; exposing it also lets
+    /// tests and tools run the audio pipeline without a CPU.
+    pub fn step_apu(&mut self, cycles: u32) {
+        let mut apu = std::mem::take(&mut self.apu);
+        apu.step(self, cycles);
+        self.apu = apu;
+    }
+
+    /// Drains the interleaved stereo samples the APU mixed since the
+    /// last drain: the headless capture API (`System::step_frame` plus
+    /// this yields one mix-down per frame).
+    pub fn take_audio(&mut self) -> Vec<i16> {
+        self.apu.take_samples()
+    }
+
+    /// The raw IO byte at `off` (masked into the 1 KiB window).
+    pub(crate) fn io_byte(&self, off: u32) -> u8 {
+        self.io[(off & 0x3FF) as usize]
     }
 
     /// The raw IO halfword at `off` (masked into the 1 KiB window).
@@ -540,6 +620,10 @@ impl Bus {
     const GREENSWAP: u32 = 0x002;
     const DISPSTAT: u32 = 0x004;
     const VCOUNT: u32 = 0x006;
+    const SOUNDCNT_X: u32 = 0x084;
+    /// IO offsets of the four sound CNT_X halfwords whose bit 15
+    /// restarts a channel (NR14/NR24/NR34/NR44).
+    const SND_STROBES: [u32; 4] = [0x064, 0x06C, 0x074, 0x07C];
     const IE: u32 = 0x200;
     const IF: u32 = 0x202;
     const IME: u32 = 0x208;
