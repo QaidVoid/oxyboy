@@ -296,6 +296,15 @@ pub struct Inst {
     pub dests: Vec<ValueId>,
     /// The operation and its operands.
     pub op: Op,
+    /// Canonical guest address of the source instruction. Effects that
+    /// need a resume point when they abort mid-chunk (stores that hit
+    /// translated code) read it at emit time.
+    pub pc: u32,
+    /// Full machine state right after this instruction, for effects
+    /// that hand control back to the interpreter mid-chunk: the bail
+    /// flushes it so the resumed interpreter sees the chunk's effects.
+    /// Empty on instructions that never abort.
+    pub state: Vec<Value>,
 }
 
 /// A block index into [`Function::blocks`].

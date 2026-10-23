@@ -27,6 +27,11 @@ pub const OAM_SIZE: usize = 1024;
 /// Maximum Game Pak ROM image size: 32 MiB.
 pub const ROM_MAX_SIZE: usize = 32 * 1024 * 1024;
 
+/// Log2 of the invalidation page size the recomp driver uses:
+/// translated code occupies 1 KiB pages, and any write into a page
+/// holding translated code invalidates that code.
+pub const PAGE_SHIFT: u32 = 10;
+
 /// Value returned by reads of unmapped locations.
 ///
 /// Real hardware drives the data bus with the most recently fetched opcode
@@ -101,6 +106,14 @@ pub struct Bus {
     write_trace: bool,
     /// Bus writes captured since the last drain, oldest first.
     write_log: Vec<trace::MemWrite>,
+    /// Whether bus writes are recorded for the recomp driver's
+    /// self-modifying-code detection. Independent of `write_trace` so
+    /// tracing and recompilation do not steal each other's records.
+    write_watch: bool,
+    /// Addresses of the writes observed while `write_watch` is armed,
+    /// oldest first; one entry per page touched (a write straddling a
+    /// page boundary contributes both pages).
+    watch_log: Vec<u32>,
     /// Nesting depth of the capture guard: write widths funnel into
     /// narrower writes, and only the outermost call is recorded.
     capture_depth: u32,
@@ -138,6 +151,8 @@ impl Bus {
             prefetch: None,
             write_trace: false,
             write_log: Vec::new(),
+            write_watch: false,
+            watch_log: Vec::new(),
             capture_depth: 0,
         };
         // SOUNDBIAS resets to 0200h: bias level 100h, the 10-bit output
@@ -506,7 +521,20 @@ impl Bus {
         if self.write_trace && self.capture_depth == 0 {
             self.write_log.push(trace::MemWrite { addr, width, value });
         }
+        if self.write_watch && self.capture_depth == 0 {
+            let last = addr + u32::from(width) - 1;
+            self.watch_log.push(addr);
+            if Self::page_of(addr) != Self::page_of(last) {
+                self.watch_log.push(last);
+            }
+        }
         self.capture_depth += 1;
+    }
+
+    /// The 1 KiB page index of a bus address, the granularity the
+    /// recomp driver uses for translated-code invalidation.
+    fn page_of(addr: u32) -> u32 {
+        (addr & 0x0FFF_FFFF) >> PAGE_SHIFT
     }
 
     /// Closes the capture guard opened by [`Bus::begin_capture`].
@@ -525,6 +553,21 @@ impl Bus {
     /// Drains the captured bus writes, oldest first.
     pub fn take_writes(&mut self) -> Vec<trace::MemWrite> {
         std::mem::take(&mut self.write_log)
+    }
+
+    /// Arms the write watch for one execution unit and discards
+    /// anything captured so far. Owned by the recomp driver: writes
+    /// observed while armed are the SMC-detection channel.
+    pub fn arm_write_watch(&mut self) {
+        self.write_watch = true;
+        self.watch_log.clear();
+    }
+
+    /// Disarms the write watch and returns the pages' worth of write
+    /// addresses captured while it was armed, oldest first.
+    pub fn take_write_watch(&mut self) -> Vec<u32> {
+        self.write_watch = false;
+        std::mem::take(&mut self.watch_log)
     }
 
     /// The IO register image, for state-equality tests.

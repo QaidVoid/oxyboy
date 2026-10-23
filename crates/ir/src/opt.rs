@@ -316,6 +316,16 @@ fn substitute_term(term: &mut Terminator, subs: &[(ValueId, u32)]) {
 /// Rewrites an inst's operands through `subs`.
 fn substitute_inst(inst: &mut Inst, subs: &[(ValueId, u32)]) {
     substitute_op(&mut inst.op, subs);
+    for value in &mut inst.state {
+        if let Value::Id(id) = *value {
+            for (from, to) in subs {
+                if *from == id {
+                    *value = Value::Const(*to);
+                    break;
+                }
+            }
+        }
+    }
 }
 
 /// Dead-flag elimination: clears the set-flags bit of ops whose flag
@@ -520,6 +530,7 @@ fn block_facts(function: &Function) -> Vec<BlockFacts> {
                 reads.push(
                     operands(&inst.op)
                         .iter()
+                        .chain(inst.state.iter())
                         .filter_map(|v| match v {
                             Value::Id(id) => Some(*id),
                             Value::Const(_) => None,

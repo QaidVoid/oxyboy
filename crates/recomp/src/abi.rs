@@ -62,14 +62,20 @@ pub struct GuestOps {
         signed_ext: u32,
         mode: u32,
     ) -> u32,
-    /// One store.
+    /// One store. Returns nonzero when the store targets a page the
+    /// host marks as translated code: the store is NOT performed, the
+    /// host has set `st->exited` and `st->pc = pc`, and the emitted
+    /// code must return immediately so the interpreter reruns the
+    /// storing instruction (and the patched bytes after it). The `pc`
+    /// argument is the storing instruction's guest address.
     pub store: unsafe extern "C" fn(
         ctx: *mut core::ffi::c_void,
         st: *mut GuestState,
         addr: u32,
         value: u32,
         size: u32,
-    ),
+        pc: u32,
+    ) -> u32,
     /// Native execution stops (with `exited` set) once `icount`
     /// reaches this.
     pub budget: u64,
@@ -105,7 +111,10 @@ struct oxy_state {
 struct oxy_ops {
     void* ctx;
     uint32_t (*load)(void* ctx, struct oxy_state* st, uint32_t addr, uint32_t size, uint32_t sext, uint32_t mode);
-    void (*store)(void* ctx, struct oxy_state* st, uint32_t addr, uint32_t value, uint32_t size);
+    /* Returns nonzero to abort the chunk: the store hit translated
+     * code, the host set st->pc/st->exited, and the interpreter reruns
+     * the storing instruction (pc argument). */
+    uint32_t (*store)(void* ctx, struct oxy_state* st, uint32_t addr, uint32_t value, uint32_t size, uint32_t pc);
     uint64_t budget;
 };
 

@@ -465,13 +465,19 @@ fn inst_body(inst: &Inst) -> String {
             );
         }
         Op::Store { addr, value, size } => {
+            // A store into translated code bails before storing; the
+            // flush hands the chunk's effects to the interpreter, which
+            // re-executes the store from the resume PC.
             let _ = writeln!(
                 body,
-                "    ops->store(ops->ctx, st, {}, {}, {}u);",
+                "    if (ops->store(ops->ctx, st, {}, {}, {}u, {:#x}u)) {{",
                 expr(addr),
                 expr(value),
-                size_const(size)
+                size_const(size),
+                inst.pc
             );
+            flush_state(&mut body, &inst.state);
+            body.push_str("        return;\n    }\n");
         }
         // Opaque blocks are filtered before instructions are emitted.
         Op::Intrinsic { .. } => {}
@@ -985,6 +991,8 @@ mod tests {
                             a: reg(0),
                             b: Value::Const(4),
                         },
+                        pc: 0x0800_0100,
+                        state: Vec::new(),
                     },
                     Inst {
                         guard: Some(Condition::Ne),
@@ -994,6 +1002,8 @@ mod tests {
                             value: reg(1),
                             size: Size::Word,
                         },
+                        pc: 0x0800_0104,
+                        state: (0..20).map(reg).collect(),
                     },
                 ],
                 term: Terminator::Return {
@@ -1021,7 +1031,7 @@ mod tests {
         );
         assert!(source.contains("if (!st->z) {"), "ne guard: {source}");
         assert!(
-            source.contains("ops->store(ops->ctx, st, v20, v1, 2u);"),
+            source.contains("ops->store(ops->ctx, st, v20, v1, 2u, 0x8000104u)"),
             "{source}"
         );
         assert!(
@@ -1042,6 +1052,8 @@ mod tests {
                     name: "swi",
                     args: vec![],
                 },
+                pc: 0x0800_0100,
+                state: Vec::new(),
             },
         );
         let source = emit_module(&[(0x0800_0100, &f)]).c_source;

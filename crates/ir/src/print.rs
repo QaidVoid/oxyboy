@@ -492,6 +492,8 @@ pub(crate) fn sample_function() -> Function {
                             a: reg(0),
                             b: Value::Const(4),
                         },
+                        pc: 0x100,
+                        state: Vec::new(),
                     },
                     Inst {
                         guard: None,
@@ -507,6 +509,8 @@ pub(crate) fn sample_function() -> Function {
                             a: reg(20),
                             b: reg(1),
                         },
+                        pc: 0x104,
+                        state: Vec::new(),
                     },
                     Inst {
                         guard: Some(Condition::Ne),
@@ -516,6 +520,8 @@ pub(crate) fn sample_function() -> Function {
                             value: reg(2),
                             size: crate::Size::Word,
                         },
+                        pc: 0x108,
+                        state: Vec::new(),
                     },
                     Inst {
                         guard: None,
@@ -526,6 +532,8 @@ pub(crate) fn sample_function() -> Function {
                             signed: true,
                             mode: crate::LoadMode::Ldr,
                         },
+                        pc: 0x10C,
+                        state: Vec::new(),
                     },
                 ],
                 term: Terminator::BranchCond {
@@ -560,6 +568,8 @@ pub(crate) fn sample_function() -> Function {
                         a: reg(29),
                         carry_in: reg(24),
                     },
+                    pc: 0x130,
+                    state: Vec::new(),
                 }],
                 term: Terminator::IndirectExit {
                     target: reg(15),

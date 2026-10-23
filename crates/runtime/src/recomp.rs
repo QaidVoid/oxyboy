@@ -15,6 +15,24 @@
 //! chunks feed the scheduler through [`System::advance_clock`] with
 //! the chunk's charged cycles.
 //!
+//! Self-modifying code: every translated function's guest
+//! range marks 1 KiB pages ([`PAGE_SHIFT`]) in a flat map the store
+//! callback consults. A native store into a marked page aborts the
+//! chunk before the store happens and resumes interpretation at the
+//! storing instruction, so the store re-executes interpreted and the
+//! patched bytes are honored from then on. Interpreted stores, DMA
+//! included, are watched per step; a write touching any page of a
+//! translated function drops that function permanently (nothing
+//! retranslates at runtime). Documented limits: page granularity
+//! means data sharing a 1 KiB page with code invalidates that code;
+//! extents are the caller's analysis regions, so trailing padding
+//! marks extra pages; only the canonical 28-bit address is checked, a
+//! patch written through a non-canonical mirror of translated code is
+//! not detected; and a DMA armed mid-chunk drains at that chunk's
+//! clock advance (the deferred drain lives in
+//! [`System::advance_clock`]), still inside the step's watched
+//! window.
+//!
 //! Accuracy level: native chunks charge
 //! memory ops at real waitstate costs plus one cycle per IR
 //! instruction; opcode fetch, internal cycles, and IRQ boundary checks
@@ -23,7 +41,7 @@
 
 use core::ffi::c_void;
 
-use crate::bus::Bus;
+use crate::bus::{Bus, PAGE_SHIFT};
 use crate::system::System;
 use recomp::Module;
 use recomp::abi::{GuestOps, GuestState, SIZE_BYTE, SIZE_HALF, SIZE_WORD};
@@ -36,40 +54,104 @@ pub const DEFAULT_BUDGET: u64 = 1_000_000;
 /// owns the machine from that point. Not a mapped address.
 pub const HOST_RETURN_SENTINEL: u32 = 0xFFFF_0000;
 
+/// Number of 1 KiB pages over the canonical 28-bit bus.
+const PAGE_COUNT: usize = 1 << (28 - PAGE_SHIFT);
+
+/// The 1 KiB page index of a canonical bus address.
+fn page_of(addr: u32) -> u32 {
+    (addr & 0x0FFF_FFFF) >> PAGE_SHIFT
+}
+
+/// One translated function: the guest extent the analysis proved and
+/// the instruction state at its entry. The extent marks the invalidation
+/// pages, so conservative regions only cost spurious invalidations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TranslatedFn {
+    /// Address of the first instruction; the dispatch key.
+    pub start: u32,
+    /// One past the last byte of the function's code.
+    pub end: u32,
+    /// Instruction state at `start`.
+    pub thumb: bool,
+}
+
+/// Host context the emitted code hands back to every callback. Opaque
+/// to the C side; the host callbacks dereference it here.
+struct HostCtx {
+    bus: *mut Bus,
+    code_pages: *const u8,
+}
+
 /// A loaded translation plus its entry table.
 pub struct Driver {
     module: Module,
-    /// `(entry address, Thumb state)` pairs, ascending by address.
-    entries: Vec<(u32, bool)>,
+    /// Translated functions, ascending by entry address.
+    entries: Vec<TranslatedFn>,
+    /// Per-1 KiB-page map over the canonical bus: nonzero when some
+    /// translated function has code in the page.
+    code_pages: Vec<u8>,
     budget: u64,
 }
 
 impl Driver {
     /// Wraps a loaded module: `entries` maps each translated function
-    /// to its guest entry address and instruction state.
+    /// to its guest extent and entry instruction state.
     #[must_use]
-    pub fn new(module: Module, entries: Vec<(u32, bool)>) -> Self {
+    pub fn new(module: Module, entries: Vec<TranslatedFn>) -> Self {
         let mut entries = entries;
-        entries.sort_unstable();
+        entries.sort_unstable_by_key(|e| e.start);
+        let mut code_pages = vec![0u8; PAGE_COUNT];
+        for entry in &entries {
+            Self::mark_pages(&mut code_pages, entry);
+        }
         Driver {
             module,
             entries,
+            code_pages,
             budget: DEFAULT_BUDGET,
+        }
+    }
+
+    /// Marks every page the function's extent touches.
+    fn mark_pages(code_pages: &mut [u8], entry: &TranslatedFn) {
+        let first = page_of(entry.start) as usize;
+        let last = page_of(entry.end.saturating_sub(1).max(entry.start)) as usize;
+        for page in &mut code_pages[first..=last] {
+            *page = 1;
+        }
+    }
+
+    /// Drops every translated function overlapping any written page
+    /// and rebuilds the page map. Writes outside translated pages are
+    /// the common case and leave the module untouched.
+    fn invalidate(&mut self, written: &[u32]) {
+        if !written
+            .iter()
+            .any(|&addr| self.code_pages[page_of(addr) as usize] != 0)
+        {
+            return;
+        }
+        let pages: Vec<u32> = written.iter().copied().map(page_of).collect();
+        self.entries.retain(|e| {
+            let first = page_of(e.start);
+            let last = page_of(e.end.saturating_sub(1).max(e.start));
+            !(first..=last).any(|p| pages.contains(&p))
+        });
+        self.code_pages.fill(0);
+        for entry in &self.entries {
+            Self::mark_pages(&mut self.code_pages, entry);
         }
     }
 
     /// Whether `pc` is a translated function entry.
     #[must_use]
     pub fn is_translated(&self, pc: u32) -> bool {
-        self.entries.iter().any(|&(addr, _)| addr == pc)
+        self.entries.iter().any(|e| e.start == pc)
     }
 
     /// The instruction state of a translated function entry.
     fn thumb_at(&self, pc: u32) -> Option<bool> {
-        self.entries
-            .iter()
-            .find(|&&(addr, _)| addr == pc)
-            .map(|&(_, thumb)| thumb)
+        self.entries.iter().find(|e| e.start == pc).map(|e| e.thumb)
     }
 
     /// Runs one unit: a whole native function call when the PC is at
@@ -86,6 +168,16 @@ impl Driver {
     /// Returns a printable message when the native call fails (missing
     /// symbol or loader error).
     pub fn step(&mut self, system: &mut System) -> Result<u32, String> {
+        system.bus_mut().arm_write_watch();
+        let result = self.step_unit(system);
+        let watched = system.bus_mut().take_write_watch();
+        self.invalidate(&watched);
+        result
+    }
+
+    /// The one execution unit [`Driver::step`] wraps with SMC
+    /// watching.
+    fn step_unit(&mut self, system: &mut System) -> Result<u32, String> {
         let pc = system.cpu.pc();
         match self.thumb_at(pc) {
             Some(thumb) => {
@@ -138,7 +230,11 @@ impl Driver {
             system.cpu.set_reg_for_test(index as u8, *value);
         }
         system.cpu.set_reg_for_test(14, HOST_RETURN_SENTINEL);
-        self.run_native(system, start, thumb)?;
+        system.bus_mut().arm_write_watch();
+        let result = self.run_native(system, start, thumb);
+        let watched = system.bus_mut().take_write_watch();
+        self.invalidate(&watched);
+        result?;
         Ok(system.cpu.reg_for_test(0))
     }
 
@@ -167,8 +263,12 @@ impl Driver {
         st.v = u32::from(cpsr & 0x1000_0000 != 0);
 
         let budget = self.budget;
+        let mut ctx = HostCtx {
+            bus: system.bus_mut(),
+            code_pages: self.code_pages.as_ptr(),
+        };
         let ops = GuestOps {
-            ctx: std::ptr::from_mut(system.bus_mut()).cast::<c_void>(),
+            ctx: std::ptr::from_mut(&mut ctx).cast::<c_void>(),
             load: host_load,
             store: host_store,
             budget,
@@ -207,7 +307,8 @@ unsafe extern "C" fn host_load(
     sext: u32,
     _mode: u32,
 ) -> u32 {
-    let bus = unsafe { &mut *(ctx.cast::<Bus>()) };
+    let host = unsafe { &mut *(ctx.cast::<HostCtx>()) };
+    let bus = unsafe { &mut *host.bus };
     let width = match size {
         SIZE_BYTE => 1,
         SIZE_HALF => 2,
@@ -235,14 +336,19 @@ unsafe extern "C" fn host_load(
     }
 }
 
+/// `true` when the store lands in a page holding translated code.
+/// The caller has already bailed out by then; this decides whether to
+/// charge and perform the write.
 unsafe extern "C" fn host_store(
     ctx: *mut c_void,
     st: *mut GuestState,
     addr: u32,
     value: u32,
     size: u32,
-) {
-    let bus = unsafe { &mut *(ctx.cast::<Bus>()) };
+    pc: u32,
+) -> u32 {
+    let host = unsafe { &mut *(ctx.cast::<HostCtx>()) };
+    let bus = unsafe { &mut *host.bus };
     let width = match size {
         SIZE_BYTE => 1,
         SIZE_HALF => 2,
@@ -250,6 +356,21 @@ unsafe extern "C" fn host_store(
         _ => 0,
     };
     if width > 0 {
+        // Self-modifying store: refuse to perform it natively, hand
+        // the storing instruction back, and let the interpreter rerun
+        // it over the patched bytes.
+        let first = page_of(addr);
+        let last = page_of(addr + width as u32 - 1);
+        let hit = (first..=last)
+            .map(|p| unsafe { *host.code_pages.add(p as usize) })
+            .any(|marked| marked != 0);
+        if hit {
+            unsafe {
+                (*st).exited = 1;
+                (*st).pc = pc;
+            }
+            return 1;
+        }
         let cost = bus.access_cost(addr, width);
         unsafe { (*st).cycles += u64::from(cost) };
     }
@@ -258,4 +379,5 @@ unsafe extern "C" fn host_store(
         SIZE_HALF => bus.write_u16(addr, value as u16),
         _ => bus.write_u32(addr, value),
     }
+    0
 }

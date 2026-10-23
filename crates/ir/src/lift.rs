@@ -219,6 +219,8 @@ impl Lifter<'_> {
                                         a: Value::Const(addr + 4),
                                         carry_in: Value::Const(0),
                                     },
+                                    pc: addr,
+                                    state: Vec::new(),
                                 });
                                 let cont = addr + 4;
                                 let linked = self.in_region(cont);
@@ -327,6 +329,8 @@ impl Lifter<'_> {
                                     a: Value::Const(addr + 4),
                                     carry_in: Value::Const(0),
                                 },
+                                pc: addr,
+                                state: Vec::new(),
                             });
                             let cont = addr + 4;
                             let linked = self.in_region(cont);

@@ -44,10 +44,18 @@ impl ArmLift {
 
     /// Emits one instruction binding `dests`.
     pub(crate) fn emit(&mut self, op: Op, dests: Vec<ValueId>) {
+        // Stores can abort mid-chunk (the store hits translated code
+        // and the interpreter takes the instruction back), so they
+        // carry the post-instruction machine state for the bail flush.
+        let state = matches!(&op, Op::Store { .. })
+            .then(|| self.current.iter().map(|id| Value::Id(*id)).collect())
+            .unwrap_or_default();
         self.insts.push(Inst {
             guard: self.guard,
             dests,
             op,
+            pc: self.addr,
+            state,
         });
     }
 

@@ -129,7 +129,8 @@ mod tests {
         addr: u32,
         value: u32,
         size: u32,
-    ) {
+        _pc: u32,
+    ) -> u32 {
         let host = unsafe { &*(ctx.cast::<Host>()) };
         let mut mem = host.mem.borrow_mut();
         let n = match size {
@@ -140,6 +141,7 @@ mod tests {
         for i in 0..n {
             mem[((addr + i) & 0xFFFF) as usize] = (value >> (i * 8)) as u8;
         }
+        0
     }
 
     #[test]
@@ -203,6 +205,8 @@ mod tests {
                             a: reg(0),
                             b: Value::Const(4),
                         },
+                        pc: 0x0800_0100,
+                        state: Vec::new(),
                     },
                     Inst {
                         guard: None,
@@ -212,6 +216,8 @@ mod tests {
                             value: reg(1),
                             size: ir::Size::Word,
                         },
+                        pc: 0x0800_0104,
+                        state: (0..20).map(reg).collect(),
                     },
                 ],
                 term: Terminator::Return {

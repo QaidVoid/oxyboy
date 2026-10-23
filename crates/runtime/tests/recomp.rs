@@ -9,7 +9,7 @@
 
 use analysis::{FlagMap, State, Thresholds};
 use rom::Image;
-use runtime::recomp::Driver;
+use runtime::recomp::{Driver, TranslatedFn};
 use runtime::system::System;
 use testutil::synthetic::RomBuilder;
 
@@ -64,13 +64,17 @@ fn build_driver(image: &Image, marks: &[(u32, u32)], tag: &str) -> Result<Driver
         };
         let mut function = ir::lift::lift_function(image, &map, region);
         ir::opt::optimize(&mut function);
-        entries.push((region.start, false));
+        entries.push(TranslatedFn {
+            start: region.start,
+            end: region.end,
+            thumb: false,
+        });
         functions.push(function);
     }
     let refs: Vec<(u32, &ir::Function)> = functions
         .iter()
         .enumerate()
-        .map(|(i, f)| (entries[i].0, f))
+        .map(|(i, f)| (entries[i].start, f))
         .collect();
     let source = recomp::emit_module(&refs);
     let module = recomp::Module::build(&source.c_source, tag)?;
@@ -468,7 +472,11 @@ fn mode3_rom_renders_the_same_frame_through_both_paths() {
         let thumb = matches!(region.state, State::Thumb);
         let mut function = ir::lift::lift_function(&image, &map, region);
         ir::opt::optimize(&mut function);
-        entries.push((region.start, thumb));
+        entries.push(TranslatedFn {
+            start: region.start,
+            end: region.end,
+            thumb,
+        });
         functions.push(function);
     }
     assert!(
@@ -478,7 +486,7 @@ fn mode3_rom_renders_the_same_frame_through_both_paths() {
     let refs: Vec<(u32, &ir::Function)> = functions
         .iter()
         .enumerate()
-        .map(|(i, f)| (entries[i].0, f))
+        .map(|(i, f)| (entries[i].start, f))
         .collect();
     let source = recomp::emit_module(&refs);
     let module = recomp::Module::build(&source.c_source, "mode3-recomp").expect("compile");
@@ -491,4 +499,145 @@ fn mode3_rom_renders_the_same_frame_through_both_paths() {
         .run_frame(&mut recompiled)
         .expect("native calls succeed");
     assert_eq!(interpreted.framebuffer(), recompiled.framebuffer());
+}
+
+/// A multiboot-classified image so the canonical base is EWRAM and the
+/// code under test is writable; SMC tests need self-modifiable bytes.
+fn smc_image(title: &str, words: &[u32]) -> Image {
+    // The entry word must branch into EWRAM for multiboot
+    // classification (rom::classify); the image itself boots through
+    // the explicit start PC, never through the BIOS.
+    let mut bytes = RomBuilder::new()
+        .title(title)
+        .entry(0xEA00_002E)
+        .min_size(0x600)
+        .build();
+    let mut code = Vec::new();
+    for word in words {
+        code.extend_from_slice(&word.to_le_bytes());
+    }
+    bytes[0x100..0x100 + code.len()].copy_from_slice(&code);
+    Image::from_bytes(bytes).expect("parse")
+}
+
+/// Boots a multiboot image the way the BIOS would: the bytes land in
+/// EWRAM at 0x02000000 and the CPU enters at `pc`. `System::new` never
+/// sees a BIOS, so the copy is on us.
+fn boot_smc(image: &Image, pc: u32) -> System {
+    let mut system = System::new(image.bytes().to_vec(), pc);
+    for (index, byte) in image.bytes().iter().enumerate() {
+        system.bus_mut().write_u8(0x0200_0000 + index as u32, *byte);
+    }
+    system
+}
+
+#[test]
+fn self_patching_code_bails_and_reruns_patched() {
+    if !recomp::Module::compiler_available() {
+        println!("skipping: no host C compiler on PATH");
+        return;
+    }
+    // F1 loads a replacement instruction and stores it over its own
+    // next-but-one instruction, then parks. The store sits between the
+    // loads and the victim so the native chunk must bail at the store
+    // (resuming at 0x108) instead of executing the stale victim.
+    let words = [
+        0xE59F_0014, // 0x100: ldr r0, [pc, #0x14]   (patch value at 0x11c)
+        0xE59F_1014, // 0x104: ldr r1, [pc, #0x14]   (target at 0x120)
+        0xE581_0000, // 0x108: str r0, [r1]          (SMC store, pc = 0x108)
+        0xE3A0_0001, // 0x10c: mov r0, #1            (victim; patched to #2)
+        0xEAFF_FFFE, // 0x110: b .
+        0,           // 0x114: pad
+        0,           // 0x118: pad
+        0xE3A0_0002, // 0x11c: .word mov r0, #2
+        0x0200_010C, // 0x120: .word victim address
+    ];
+    let image = smc_image("SMC1", &words);
+    let marks = [(0x100u32, 0x114u32)];
+    let mut driver = build_driver(&image, &marks, "recomp-smc-self").expect("module builds");
+    assert!(driver.is_translated(0x0200_0100));
+
+    let mut system = boot_smc(&image, 0x0200_0100);
+    let park = 0x0200_0110;
+    let mut steps = 0;
+    while system.cpu.pc() != park && steps < 100 {
+        driver.step(&mut system).expect("step");
+        steps += 1;
+    }
+    assert_eq!(system.cpu.pc(), park);
+    // The patched instruction, not the stale one, produced r0.
+    assert_eq!(system.cpu.reg_for_test(0), 2, "patched mov r0, #2 ran");
+    // The function that patched itself no longer runs natively.
+    assert!(!driver.is_translated(0x0200_0100));
+    let ewram = system.bus().ewram();
+    let victim = u32::from_le_bytes(ewram[0x10C..0x110].try_into().unwrap());
+    assert_eq!(victim, 0xE3A0_0002, "the patch landed in EWRAM");
+}
+
+#[test]
+fn dma_into_translated_code_invalidates_it() {
+    if !recomp::Module::compiler_available() {
+        println!("skipping: no host C compiler on PATH");
+        return;
+    }
+    // F1 (page 0) arms DMA3 to copy one replacement word over F2's
+    // first instruction (page 1), then branches through an
+    // untranslated hop so the deferred DMA drain fires during an
+    // interpreted step before F2's entry is reached. F2 must then run
+    // interpreted and see the patched instruction.
+    let words = [
+        0xE59F_0028, // 0x100: ldr r0, [pc, #0x28]   (0x040000d4, DMA3SAD)
+        0xE59F_1028, // 0x104: ldr r1, [pc, #0x28]   (source data 0x148)
+        0xE580_1000, // 0x108: str r1, [r0]          (SAD = data)
+        0xE59F_1024, // 0x10c: ldr r1, [pc, #0x24]   (0x02000400, victim)
+        0xE580_1004, // 0x110: str r1, [r0, #4]      (DAD = victim)
+        0xE59F_1020, // 0x114: ldr r1, [pc, #0x20]   (0x040000dc, DMA3CNT_L)
+        0xE3A0_2001, // 0x118: mov r2, #1
+        0xE580_2008, // 0x11c: str r2, [r0, #8]      (one word)
+        0xE59F_2018, // 0x120: ldr r2, [pc, #0x18]   (0x8400: enable + word)
+        0xE1C0_20BA, // 0x124: strh r2, [r0, #0xa]   (DMA3CNT_H, arms the DMA)
+        0xE59F_3014, // 0x128: ldr r3, [pc, #0x14]   (untranslated hop, at 0x144)
+        0xE12F_FF13, // 0x12c: bx r3
+        0x0400_00D4, // 0x130: .word DMA3SAD
+        0x0200_0148, // 0x134: .word source data
+        0x0200_0400, // 0x138: .word victim instruction
+        0x0400_00DC, // 0x13c: .word DMA3CNT_L
+        0x0000_8400, // 0x140: .word DMA3CNT_H (enable | 32-bit)
+        0x0200_0200, // 0x144: .word untranslated hop
+        0xE3A0_0002, // 0x148: .word replacement mov r0, #2
+    ];
+    let mut full = words.to_vec();
+    // F2 lives on its own 1 KiB page so the test can see that only it
+    // was invalidated; the hop and the DMA literals share F1's page.
+    full.resize((0x408 - 0x100) / 4, 0);
+    // Untranslated hop (0x200) so interpreted steps drain the DMA
+    // before F2's entry is reached.
+    full[(0x200 - 0x100) / 4] = 0xE1A0_0000;
+    full[(0x204 - 0x100) / 4] = 0xEA00_007D;
+    // F2's original bytes: `mov r0, #1` then park. The DMA replaces
+    // the first word.
+    full[(0x400 - 0x100) / 4] = 0xE3A0_0001;
+    full[(0x404 - 0x100) / 4] = 0xEAFF_FFFE;
+    let image = smc_image("SMC2", &full);
+    let marks = [(0x100u32, 0x130u32), (0x400, 0x40c)];
+    let mut driver = build_driver(&image, &marks, "recomp-smc-dma").expect("module builds");
+    assert!(driver.is_translated(0x0200_0100));
+    assert!(driver.is_translated(0x0200_0400));
+
+    let mut system = boot_smc(&image, 0x0200_0100);
+    let park = 0x0200_0404;
+    let mut steps = 0;
+    while system.cpu.pc() != park && steps < 100 {
+        driver.step(&mut system).expect("step");
+        steps += 1;
+    }
+    assert_eq!(system.cpu.pc(), park);
+    // The DMA patch replaced F2's first instruction, which then ran
+    // interpreted off the patched bytes.
+    assert_eq!(system.cpu.reg_for_test(0), 2, "patched mov r0, #2 ran");
+    let ewram = system.bus().ewram();
+    let victim = u32::from_le_bytes(ewram[0x400..0x404].try_into().unwrap());
+    assert_eq!(victim, 0xE3A0_0002, "DMA wrote the patch");
+    assert!(!driver.is_translated(0x0200_0400), "F2 invalidated");
+    assert!(driver.is_translated(0x0200_0100), "F1's page untouched");
 }
