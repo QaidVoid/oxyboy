@@ -7,6 +7,7 @@
 //! control flow is an explicit terminator.
 
 pub mod arm;
+pub mod eval;
 pub mod lift;
 pub mod print;
 pub mod thumb;
@@ -36,6 +37,18 @@ pub enum Size {
     Half,
     /// Four bytes, little-endian.
     Word,
+}
+
+/// Word-read flavor of a load, per the interpreter's paths.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoadMode {
+    /// LDR: read the aligned word, rotate the byte lanes by the
+    /// address offset (ARM ARM A2.4.2, GBATEK "Mis-aligned").
+    Ldr,
+    /// SWP: read from the raw address, then rotate by the offset.
+    Swap,
+    /// Block transfers and THUMB pop: read raw with no rotation.
+    Block,
 }
 
 /// Architectural registers in the state slot list.
@@ -191,14 +204,17 @@ pub enum Op {
     /// architecturally unpredictable on ARM7TDMI and not produced).
     Mul { set_flags: bool, a: Value, b: Value },
     /// 64-bit multiply: `[lo, hi] = a * b` (sign per `unsigned`),
-    /// `a` accumulated into the 64-bit result when `accumulate`. With
-    /// flags: `[lo, hi, n, z]` (C, V unpredictable and not produced).
+    /// `acc_hi:acc_lo` accumulated into the 64-bit result when
+    /// `accumulate` (the pre-instruction RdLo/RdHi). With flags:
+    /// `[lo, hi, n, z]` (C, V unpredictable and not produced).
     MultiplyLong {
         unsigned: bool,
         accumulate: bool,
         set_flags: bool,
         a: Value,
         b: Value,
+        acc_lo: Value,
+        acc_hi: Value,
     },
     /// Comparison `a - b`, discarding the result: `[n, z, c, v]`.
     Cmp { a: Value, b: Value },
@@ -209,29 +225,34 @@ pub enum Op {
     Tst { a: Value, b: Value, carry_in: Value },
     /// Test `a ^ b`, discarding the result: `[n, z, c]` as `Tst`.
     Teq { a: Value, b: Value, carry_in: Value },
-    /// `v = a << amount`, or with flags `[v, c]`.
+    /// `v = a << amount`, or with flags `[v, c]` where `c` follows
+    /// ARM ARM A2.4: amount 0 keeps the carry, passed as `carry_in`.
     Lsl {
         set_flags: bool,
         a: Value,
         amount: Value,
+        carry_in: Value,
     },
     /// `v = a >> amount` (logical), flags as `Lsl`.
     Lsr {
         set_flags: bool,
         a: Value,
         amount: Value,
+        carry_in: Value,
     },
     /// `v = a >> amount` (arithmetic), flags as `Lsl`.
     Asr {
         set_flags: bool,
         a: Value,
         amount: Value,
+        carry_in: Value,
     },
     /// `v = a rotate_right amount`, flags as `Lsl`.
     Ror {
         set_flags: bool,
         a: Value,
         amount: Value,
+        carry_in: Value,
     },
     /// `v = {carry_in, a} rotate_right 1`, flags as `Lsl`.
     Rrx {
@@ -240,11 +261,15 @@ pub enum Op {
         carry_in: Value,
     },
     /// `v = memory[addr]` at the access width, zero- or sign-extended
-    /// to 32 bits per `signed`.
+    /// to 32 bits per `signed`. Word reads differ by interpreter path:
+    /// `Ldr` reads the aligned word and rotates the byte lanes, `Swap`
+    /// reads from the raw address and rotates, `Block` reads raw with
+    /// no rotation (LDM and THUMB pop).
     Load {
         addr: Value,
         size: Size,
         signed: bool,
+        mode: LoadMode,
     },
     /// `memory[addr] = value` at the access width. No dests.
     Store {

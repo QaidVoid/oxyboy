@@ -8,3 +8,6 @@ license.workspace = true
 rom = { version = "0.1.0", path = "../rom" }
 analysis = { version = "0.1.0", path = "../analysis" }
 decode = { version = "0.1.0", path = "../decode" }
+
+[dev-dependencies]
+runtime = { version = "0.1.0", path = "../runtime" }

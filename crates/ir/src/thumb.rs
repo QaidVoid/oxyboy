@@ -13,7 +13,7 @@ use decode::{
 };
 
 use crate::arm::{ArmLift, C_SLOT};
-use crate::{Op, Size, Value, ValueId};
+use crate::{LoadMode, Op, Size, Value, ValueId};
 
 impl ArmLift {
     /// Lowers one THUMB instruction that is not a control-flow
@@ -97,6 +97,7 @@ impl ArmLift {
                         addr,
                         size: Size::Word,
                         signed: false,
+                        mode: LoadMode::Block,
                     },
                     vec![out],
                 );
@@ -201,6 +202,7 @@ impl ArmLift {
                     load,
                     true,
                     true,
+                    false,
                     rb,
                     RegisterList::from_bits(u16::from(registers)),
                 );
@@ -239,25 +241,29 @@ impl ArmLift {
             ThumbShift::Lsr | ThumbShift::Asr => u32::from(imm5),
         };
         let out = self.write(rd);
-        let c = self.flag_dest(C_SLOT);
+        let c_in = self.carry_in();
         let op = match kind {
             ThumbShift::Lsl => Op::Lsl {
                 set_flags: true,
                 a,
                 amount: Value::Const(amount),
+                carry_in: c_in,
             },
             ThumbShift::Lsr => Op::Lsr {
                 set_flags: true,
                 a,
                 amount: Value::Const(amount),
+                carry_in: c_in,
             },
             ThumbShift::Asr => Op::Asr {
                 set_flags: true,
                 a,
                 amount: Value::Const(amount),
+                carry_in: c_in,
             },
         };
-        self.emit(op, vec![out, c]);
+        let dests = self.logic_dests(out);
+        self.emit(op, dests);
     }
 
     /// Format 4: ALU operation on low registers, always flag-setting.
@@ -300,28 +306,33 @@ impl ArmLift {
             ThumbAluOp::Lsl | ThumbAluOp::Lsr | ThumbAluOp::Asr | ThumbAluOp::Ror => {
                 let a = self.thumb_read(rd);
                 let amount = self.thumb_read(rs);
+                let c_in = self.carry_in();
                 let shifted = self.fresh();
                 let c = self.flag_dest(C_SLOT);
                 let op = match op {
                     ThumbAluOp::Lsl => Op::Lsl {
-                        set_flags: true,
+                        set_flags: false,
                         a,
                         amount,
+                        carry_in: c_in,
                     },
                     ThumbAluOp::Lsr => Op::Lsr {
-                        set_flags: true,
+                        set_flags: false,
                         a,
                         amount,
+                        carry_in: c_in,
                     },
                     ThumbAluOp::Asr => Op::Asr {
-                        set_flags: true,
+                        set_flags: false,
                         a,
                         amount,
+                        carry_in: c_in,
                     },
                     _ => Op::Ror {
-                        set_flags: true,
+                        set_flags: false,
                         a,
                         amount,
+                        carry_in: c_in,
                     },
                 };
                 self.emit(op, vec![shifted, c]);
@@ -516,6 +527,7 @@ impl ArmLift {
                     addr,
                     size: Size::Word,
                     signed: false,
+                    mode: LoadMode::Block,
                 },
                 vec![out],
             );
@@ -552,7 +564,15 @@ impl ArmLift {
         let addr = Value::Id(addr);
         if load {
             let out = self.write(rd);
-            self.emit(Op::Load { addr, size, signed }, vec![out]);
+            self.emit(
+                Op::Load {
+                    addr,
+                    size,
+                    signed,
+                    mode: LoadMode::Ldr,
+                },
+                vec![out],
+            );
         } else {
             self.emit(
                 Op::Store {

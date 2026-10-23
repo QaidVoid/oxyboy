@@ -13,7 +13,7 @@ use decode::{
     ShiftAmount, ShiftKind, ShifterOperand, TransferOffset,
 };
 
-use crate::{Inst, Op, STATE_ARITY, Size, Value, ValueId};
+use crate::{Inst, LoadMode, Op, STATE_ARITY, Size, Value, ValueId};
 
 /// Slot index of the C flag within the flag tail.
 pub(crate) const C_SLOT: usize = 2;
@@ -119,10 +119,12 @@ impl ArmLift {
                 ShiftKind::Ror => {
                     let out = self.fresh();
                     let c_in = self.carry_in();
-                    let c = self.flag_dest(C_SLOT);
+                    // A plain value, not a flag dest: whether the
+                    // shifter carry reaches C is the parent op's call.
+                    let c = self.fresh();
                     self.emit(
                         Op::Rrx {
-                            set_flags: true,
+                            set_flags: false,
                             a: self.read(rm),
                             carry_in: c_in,
                         },
@@ -137,36 +139,41 @@ impl ArmLift {
             ShiftAmount::Register(rs) => (shift.kind, self.read(rs)),
         };
         let out = self.fresh();
-        let c = self.flag_dest(C_SLOT);
+        let c_in = self.carry_in();
+        // Plain value: the parent op decides whether the shifter carry
+        // becomes the C flag.
+        let c = self.fresh();
+        let a = self.read(rm);
         let op = match kind {
             ShiftKind::Lsl => Op::Lsl {
-                set_flags: true,
-                a: self.read(rm),
+                set_flags: false,
+                a,
                 amount,
+                carry_in: c_in,
             },
             ShiftKind::Lsr => Op::Lsr {
-                set_flags: true,
-                a: self.read(rm),
+                set_flags: false,
+                a,
                 amount,
+                carry_in: c_in,
             },
             ShiftKind::Asr => Op::Asr {
-                set_flags: true,
-                a: self.read(rm),
+                set_flags: false,
+                a,
                 amount,
+                carry_in: c_in,
             },
             ShiftKind::Ror => Op::Ror {
-                set_flags: true,
-                a: self.read(rm),
+                set_flags: false,
+                a,
                 amount,
+                carry_in: c_in,
             },
-            ShiftKind::Rrx => {
-                let c_in = self.carry_in();
-                Op::Rrx {
-                    set_flags: true,
-                    a: self.read(rm),
-                    carry_in: c_in,
-                }
-            }
+            ShiftKind::Rrx => Op::Rrx {
+                set_flags: false,
+                a,
+                carry_in: c_in,
+            },
         };
         self.emit(op, vec![out, c]);
         (Value::Id(out), Value::Id(c))
@@ -191,29 +198,53 @@ impl ArmLift {
                 rs,
                 rm,
             } => {
-                let product = self.write(rd);
-                let mut dests = vec![product];
-                if set_flags {
-                    dests.push(self.flag_dest(0));
-                    dests.push(self.flag_dest(1));
-                }
-                self.emit(
-                    Op::Mul {
-                        set_flags,
-                        a: self.read(rm),
-                        b: self.read(rs),
-                    },
-                    dests,
-                );
+                // Reads come before the dest allocation: rd may alias
+                // rm, rs, or rn (e.g. `mul r0, r1, r0`), and the CPU
+                // consumes the old register values.
+                let rm = self.read(rm);
+                let rs = self.read(rs);
+                let rn = self.read(rn);
                 if accumulate {
-                    let sum = self.write(rd);
+                    // MLA's flags come from the accumulated result, so
+                    // the product is a temp and the Add owns N/Z with
+                    // the `[v, n, z]` contract (C, V unchanged).
+                    let product = self.fresh();
+                    self.emit(
+                        Op::Mul {
+                            set_flags: false,
+                            a: rm,
+                            b: rs,
+                        },
+                        vec![product],
+                    );
+                    let out = self.write(rd);
+                    let mut dests = vec![out];
+                    if set_flags {
+                        dests.push(self.flag_dest(0));
+                        dests.push(self.flag_dest(1));
+                    }
                     self.emit(
                         Op::Add {
-                            set_flags: false,
+                            set_flags,
                             a: Value::Id(product),
-                            b: self.read(rn),
+                            b: rn,
                         },
-                        vec![sum],
+                        dests,
+                    );
+                } else {
+                    let out = self.write(rd);
+                    let mut dests = vec![out];
+                    if set_flags {
+                        dests.push(self.flag_dest(0));
+                        dests.push(self.flag_dest(1));
+                    }
+                    self.emit(
+                        Op::Mul {
+                            set_flags,
+                            a: rm,
+                            b: rs,
+                        },
+                        dests,
                     );
                 }
             }
@@ -226,6 +257,12 @@ impl ArmLift {
                 rn,
                 rm,
             } => {
+                // rd_hi/rd_lo may alias rn or rm; read the sources and
+                // the accumulate registers before allocating dests.
+                let rm = self.read(rm);
+                let rn = self.read(rn);
+                let acc_lo = Value::Id(self.current[rd_lo.bits() as usize]);
+                let acc_hi = Value::Id(self.current[rd_hi.bits() as usize]);
                 let lo = self.write(rd_lo);
                 let hi = self.write(rd_hi);
                 let mut dests = vec![lo, hi];
@@ -238,8 +275,10 @@ impl ArmLift {
                         unsigned,
                         accumulate,
                         set_flags,
-                        a: self.read(rm),
-                        b: self.read(rn),
+                        a: rm,
+                        b: rn,
+                        acc_lo,
+                        acc_hi,
                     },
                     dests,
                 );
@@ -249,23 +288,20 @@ impl ArmLift {
                 // rm; expanded as load-then-store (the single-core GBA
                 // gives the pair its atomicity).
                 let size = if byte { Size::Byte } else { Size::Word };
+                let addr = self.read(rn);
+                // rm may alias rd; the store consumes the old value.
+                let value = self.read(rm);
                 let out = self.write(rd);
                 self.emit(
                     Op::Load {
-                        addr: self.read(rn),
+                        addr,
                         size,
                         signed: false,
+                        mode: LoadMode::Swap,
                     },
                     vec![out],
                 );
-                self.emit(
-                    Op::Store {
-                        addr: self.read(rn),
-                        value: self.read(rm),
-                        size,
-                    },
-                    vec![],
-                );
+                self.emit(Op::Store { addr, value, size }, vec![]);
             }
             ArmInstr::PsrRead { spsr, rd } => {
                 let out = self.write(rd);
@@ -342,10 +378,10 @@ impl ArmLift {
                 psr_and_force_user: _,
                 writeback,
                 up,
-                pre_index: _,
+                pre_index,
                 rn,
                 registers,
-            } => self.block_transfer(load, writeback, up, rn, registers),
+            } => self.block_transfer(load, writeback, up, pre_index, rn, registers),
             ArmInstr::SoftwareInterrupt { imm24 } => {
                 self.emit(
                     Op::Intrinsic {
@@ -477,11 +513,12 @@ impl ArmLift {
                 self.emit(op, dests);
             }
             DataOp::Add | DataOp::Adc => {
+                // Capture before the shifter runs: a register shift
+                // re-points the carry slot, and Adc must consume the
+                // instruction's incoming carry.
+                let carry = self.carry_in();
                 let (b, _) = self.shifter(operand2, false);
                 let a = self.read(rn);
-                // Capture before dest allocation: flag_dest replaces the
-                // carry slot, and Adc must consume the incoming carry.
-                let carry = self.carry_in();
                 let out = self.write(rd);
                 let mut dests = vec![out];
                 if set_flags {
@@ -502,9 +539,9 @@ impl ArmLift {
                 self.emit(op, dests);
             }
             DataOp::Sub | DataOp::Sbc | DataOp::Rsb | DataOp::Rsc => {
+                let carry = self.carry_in();
                 let (b, _) = self.shifter(operand2, false);
                 let a = self.read(rn);
-                let carry = self.carry_in();
                 let out = self.write(rd);
                 let mut dests = vec![out];
                 if set_flags {
@@ -574,48 +611,64 @@ impl ArmLift {
                 }
             }
         };
+        // The stored value is the pre-instruction register: a base that
+        // aliases rd must not leak the writeback into the store.
+        let stored = if load { Value::Const(0) } else { self.read(rd) };
+        let base = self.read(rn);
+        let mut pre_sum = None;
         let addr = if pre_index {
             let sum = self.fresh();
             self.emit(
                 Op::Add {
                     set_flags: false,
-                    a: self.read(rn),
+                    a: base,
                     b: offset,
                 },
                 vec![sum],
             );
-            if writeback && rn != Register::Pc {
-                self.current[rn.bits() as usize] = sum;
-            }
+            pre_sum = Some(sum);
             Value::Id(sum)
         } else {
-            let addr = self.read(rn);
-            if writeback && rn != Register::Pc {
+            base
+        };
+        if load {
+            let out = self.write(rd);
+            self.emit(
+                Op::Load {
+                    addr,
+                    size,
+                    signed,
+                    mode: LoadMode::Ldr,
+                },
+                vec![out],
+            );
+        } else {
+            self.emit(
+                Op::Store {
+                    addr,
+                    value: stored,
+                    size,
+                },
+                vec![],
+            );
+        }
+        // The writeback runs after the access, and a load into the
+        // base register wins over it (ARM ARM A4.1.6).
+        if writeback && rn != Register::Pc && !(load && rd == rn) {
+            if let Some(sum) = pre_sum {
+                self.current[rn.bits() as usize] = sum;
+            } else {
                 let sum = self.fresh();
                 self.emit(
                     Op::Add {
                         set_flags: false,
-                        a: self.read(rn),
+                        a: base,
                         b: offset,
                     },
                     vec![sum],
                 );
                 self.current[rn.bits() as usize] = sum;
             }
-            addr
-        };
-        if load {
-            let out = self.write(rd);
-            self.emit(Op::Load { addr, size, signed }, vec![out]);
-        } else {
-            self.emit(
-                Op::Store {
-                    addr,
-                    value: self.read(rd),
-                    size,
-                },
-                vec![],
-            );
         }
     }
 
@@ -628,6 +681,7 @@ impl ArmLift {
         load: bool,
         writeback: bool,
         up: bool,
+        pre_index: bool,
         rn: Register,
         registers: decode::RegisterList,
     ) {
@@ -636,22 +690,26 @@ impl ArmLift {
             .filter(|reg| registers.contains(*reg))
             .collect();
         let count = list.len() as u32;
+        // The transfer addresses derive from the original base; a list
+        // entry that loads into rn must not skew later entries.
+        let base = self.read(rn);
         for (index, reg) in list.iter().enumerate() {
-            // Ascending transfers start at the base; descending ones
-            // store the first register at base - 4 * count.
-            let delta = if up {
-                index as u32 * 4
-            } else {
-                ((count - index as u32) * 4).wrapping_neg()
+            // Offsets follow the four addressing modes: IA, IB, DB, DA
+            // (ARM ARM A4.1.10), derived from the P and U bits.
+            let delta: u32 = match (up, pre_index) {
+                (true, false) => index as u32 * 4,
+                (true, true) => (index as u32 + 1) * 4,
+                (false, true) => (index as u32 * 4).wrapping_sub(count * 4),
+                (false, false) => (index as u32 * 4 + 4).wrapping_sub(count * 4),
             };
             let addr = if delta == 0 {
-                self.read(rn)
+                base
             } else {
                 let sum = self.fresh();
                 self.emit(
                     Op::Add {
                         set_flags: false,
-                        a: self.read(rn),
+                        a: base,
                         b: Value::Const(delta),
                     },
                     vec![sum],
@@ -660,26 +718,51 @@ impl ArmLift {
             };
             if load {
                 let out = self.write(*reg);
+                // Block loads take the raw addressed word: no LDR
+                // byte-lane rotation (the interpreter's LDM path).
                 self.emit(
                     Op::Load {
                         addr,
                         size: Size::Word,
                         signed: false,
+                        mode: LoadMode::Block,
                     },
                     vec![out],
                 );
             } else {
+                // For STM, a base register that is not the first list
+                // entry stores the final writeback value (the old base
+                // stays current until the writeback after the loop).
+                let value = if *reg == rn && Some(*reg) != list.first().copied() {
+                    let total = count * 4;
+                    let delta = if up { total } else { total.wrapping_neg() };
+                    let sum = self.fresh();
+                    self.emit(
+                        Op::Add {
+                            set_flags: false,
+                            a: base,
+                            b: Value::Const(delta),
+                        },
+                        vec![sum],
+                    );
+                    Value::Id(sum)
+                } else {
+                    self.read(*reg)
+                };
                 self.emit(
                     Op::Store {
                         addr,
-                        value: self.read(*reg),
+                        value,
                         size: Size::Word,
                     },
                     vec![],
                 );
             }
         }
-        if writeback && rn != Register::Pc {
+        // ARMv4: an LDM whose list contains the base leaves the loaded
+        // value in place; no writeback runs.
+        let base_in_list = registers.contains(rn);
+        if writeback && rn != Register::Pc && !(load && base_in_list) {
             let delta = if up {
                 count * 4
             } else {
@@ -689,7 +772,7 @@ impl ArmLift {
             self.emit(
                 Op::Add {
                     set_flags: false,
-                    a: self.read(rn),
+                    a: base,
                     b: Value::Const(delta),
                 },
                 vec![sum],

@@ -193,7 +193,12 @@ impl Lifter<'_> {
         };
         let mut addr = from;
         let term = loop {
-            if addr >= self.region.end || !self.executed(addr) {
+            if addr >= self.region.end {
+                // Clean run off the region end: the function returns,
+                // carrying its final state in slot order.
+                break RawTerm::Return;
+            }
+            if !self.executed(addr) {
                 break RawTerm::Unreachable;
             }
             match self.region.state {
@@ -700,7 +705,7 @@ mod tests {
     #[test]
     fn every_arm_class_lifts_without_unhandled() {
         use crate::Op;
-        let words: [u32; 38] = [
+        let words: [u32; 39] = [
             0xE081_0002, // add r0, r1, r2
             0xE091_0182, // adds r0, r1, r2, lsl #3
             0xE251_0005, // subs r0, r1, #5
@@ -739,6 +744,7 @@ mod tests {
             0xE1D1_00F1, // ldrsh r0, [r1, #1]
             0xE8A1_000C, // stmia r1!, {r2, r3}
             0xEF00_0005, // swi 0x5
+            0xE911_800C, // ldmdb r1!, {r2, r3, pc}: return terminator
         ];
         let function = lift_arm(&words, words.len());
         for block in &function.blocks {
@@ -773,9 +779,9 @@ mod tests {
         };
         assert_eq!(*carry_in, Value::Id(sub_c));
         // Post-indexed ldrb with W=0 still writes the base back: the
-        // address add (base + 2) sits right before the load. The ldrb
-        // is the last unsigned byte load (swpb's is earlier, ldrsb's
-        // is signed).
+        // address add (base + 2) follows the load, since the writeback
+        // runs after the access. The ldrb is the last unsigned byte
+        // load (swpb's is earlier, ldrsb's is signed).
         let ldrb = insts
             .iter()
             .rposition(|i| {
@@ -791,17 +797,18 @@ mod tests {
             .expect("ldrb present");
         assert!(
             matches!(
-                &insts[ldrb - 1].op,
+                &insts[ldrb + 1].op,
                 Op::Add {
                     b: Value::Const(2),
                     ..
                 }
             ),
-            "before ldrb: {:?}",
-            insts[ldrb - 1].op
+            "after ldrb: {:?}",
+            insts[ldrb + 1].op
         );
-        // The LDM with pc is a return terminator, SWI stays inline.
-        assert!(matches!(function.blocks[0].term, Terminator::Unreachable));
+        // The LDM with pc is a return terminator (it ends the walk),
+        // and the SWI stays inline before it.
+        assert!(matches!(function.blocks[0].term, Terminator::Return { .. }));
         // Branch classes: conditional branch to two successors, bx as
         // indirect exit, plain branch as an in-region edge (b -3 lands
         // on the bx block).
@@ -819,14 +826,14 @@ mod tests {
     }
 
     /// The shifter carry shows up in lifted output: a shifted S-bit op
-    /// emits the explicit shift op and threads its carry into the ALU
-    /// op (pretty-print golden, spot-checked).
+    /// emits the explicit shift op (carry-only) and threads its carry
+    /// into the ALU op (pretty-print golden, spot-checked).
     #[test]
     fn shifter_carry_appears_in_lifted_output() {
         // ands r0, r1, r2, ror #4
         let function = lift_arm(&[0xE011_0262], 1);
         let printed = crate::print::fmt_function(&function);
-        assert!(printed.contains("rors"), "{printed}");
+        assert!(printed.contains("ror "), "{printed}");
         assert!(printed.contains("ands"), "{printed}");
         assert!(printed.contains(", c=v"), "{printed}");
     }

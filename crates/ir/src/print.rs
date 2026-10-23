@@ -5,7 +5,7 @@
 //! the entry block. The golden test pins the exact shape.
 
 use crate::{
-    BlockId, Flag, Function, Inst, Op, Reg, SLOTS, Size, Slot, Terminator, Value, ValueId,
+    BlockId, Flag, Function, Inst, LoadMode, Op, Reg, SLOTS, Size, Slot, Terminator, Value, ValueId,
 };
 
 /// Renders `function` in the stable text form.
@@ -143,6 +143,8 @@ fn fmt_op(op: &Op) -> String {
             set_flags,
             a,
             b,
+            acc_lo,
+            acc_hi,
         } => {
             let mnemonic = match (unsigned, accumulate) {
                 (false, false) => "smull",
@@ -150,13 +152,25 @@ fn fmt_op(op: &Op) -> String {
                 (true, false) => "umull",
                 (true, true) => "umlal",
             };
-            format!(
-                "{}{} {}, {}",
-                mnemonic,
-                suffix(*set_flags),
-                fmt_value(a),
-                fmt_value(b)
-            )
+            if *accumulate {
+                format!(
+                    "{}{} {}, {}, acc=({}, {})",
+                    mnemonic,
+                    suffix(*set_flags),
+                    fmt_value(a),
+                    fmt_value(b),
+                    fmt_value(acc_lo),
+                    fmt_value(acc_hi)
+                )
+            } else {
+                format!(
+                    "{}{} {}, {}",
+                    mnemonic,
+                    suffix(*set_flags),
+                    fmt_value(a),
+                    fmt_value(b)
+                )
+            }
         }
         Op::Rsb { set_flags, a, b } => {
             format!(
@@ -254,21 +268,25 @@ fn fmt_op(op: &Op) -> String {
             set_flags,
             a,
             amount,
+            carry_in,
         }
         | Op::Lsr {
             set_flags,
             a,
             amount,
+            carry_in,
         }
         | Op::Asr {
             set_flags,
             a,
             amount,
+            carry_in,
         }
         | Op::Ror {
             set_flags,
             a,
             amount,
+            carry_in,
         } => {
             let mnemonic = match op {
                 Op::Lsl { .. } => "lsl",
@@ -277,11 +295,12 @@ fn fmt_op(op: &Op) -> String {
                 _ => "ror",
             };
             format!(
-                "{}{} {}, {}",
+                "{}{} {}, {}{}",
                 mnemonic,
                 suffix(*set_flags),
                 fmt_value(a),
-                fmt_value(amount)
+                fmt_value(amount),
+                carry_suffix(true, carry_in)
             )
         }
         Op::Rrx {
@@ -294,8 +313,23 @@ fn fmt_op(op: &Op) -> String {
             fmt_value(a),
             fmt_value(carry_in)
         ),
-        Op::Load { addr, size, signed } => {
-            format!("{} [{}]", load_mnemonic(*size, *signed), fmt_value(addr))
+        Op::Load {
+            addr,
+            size,
+            signed,
+            mode,
+        } => {
+            let raw = match mode {
+                LoadMode::Ldr => "",
+                LoadMode::Swap => ".s",
+                LoadMode::Block => ".b",
+            };
+            format!(
+                "{}{} [{}]",
+                load_mnemonic(*size, *signed),
+                raw,
+                fmt_value(addr)
+            )
         }
         Op::Store { addr, value, size } => format!(
             "{} [{}], {}",
@@ -482,6 +516,7 @@ pub(crate) fn sample_function() -> Function {
                             addr: reg(20),
                             size: crate::Size::Half,
                             signed: true,
+                            mode: crate::LoadMode::Ldr,
                         },
                     },
                 ],
