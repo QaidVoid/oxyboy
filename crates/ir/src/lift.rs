@@ -17,6 +17,7 @@ use decode::{
     ArmInstr, Condition, Register, ShifterOperand, ThumbHiOp, ThumbInstr, decode_arm, decode_thumb,
 };
 
+use crate::arm::ArmLift;
 use crate::{Block, BlockId, Function, Inst, Op, SLOTS, Terminator, Value, ValueId};
 
 /// The number of machine state slots.
@@ -76,6 +77,7 @@ pub fn lift_function(image: &rom::Image, map: &FlagMap, region: FunctionRegion) 
         canon: map.canonical(),
         region,
         raw: BTreeMap::new(),
+        next: ValueId(STATE_COUNT as u32),
     }
     .lift()
 }
@@ -83,6 +85,8 @@ pub fn lift_function(image: &rom::Image, map: &FlagMap, region: FunctionRegion) 
 /// One undispatched block: decoded instructions plus a raw terminator
 /// still naming addresses.
 struct RawBlock {
+    params: Vec<ValueId>,
+    end_state: Vec<ValueId>,
     insts: Vec<Inst>,
     term: RawTerm,
 }
@@ -114,6 +118,7 @@ struct Lifter<'a> {
     canon: Canonical,
     region: FunctionRegion,
     raw: BTreeMap<u32, RawBlock>,
+    next: ValueId,
 }
 
 impl Lifter<'_> {
@@ -171,7 +176,23 @@ impl Lifter<'_> {
     /// returning the leader addresses the terminator targets.
     fn walk(&mut self, from: u32) -> Vec<u32> {
         let mut leaders = Vec::new();
-        let mut insts = Vec::new();
+        // The block receives the full machine state on entry.
+        let params: Vec<ValueId> = (0..STATE_COUNT)
+            .map(|_| {
+                let id = self.next;
+                self.next = ValueId(id.0 + 1);
+                id
+            })
+            .collect();
+        let mut current = [params[0]; STATE_COUNT];
+        current.copy_from_slice(&params);
+        let mut lift = ArmLift {
+            current,
+            next: self.next,
+            insts: Vec::new(),
+            addr: from,
+            guard: None,
+        };
         let mut addr = from;
         let term = loop {
             if addr >= self.region.end || !self.executed(addr) {
@@ -185,6 +206,17 @@ impl Lifter<'_> {
                         ArmInstr::Branch { link, offset } => {
                             let target = addr.wrapping_add(8).wrapping_add_signed(offset);
                             if link {
+                                lift.addr = addr;
+                                let lr = lift.write(Register::Lr);
+                                lift.insts.push(crate::Inst {
+                                    guard: None,
+                                    dests: vec![lr],
+                                    op: Op::Mov {
+                                        set_flags: false,
+                                        a: Value::Const(addr + 4),
+                                        carry_in: Value::Const(0),
+                                    },
+                                });
                                 let cont = addr + 4;
                                 let linked = self.in_region(cont);
                                 if linked {
@@ -243,8 +275,10 @@ impl Lifter<'_> {
                             break RawTerm::Return;
                         }
                         ArmInstr::Undefined { .. } => break RawTerm::Unreachable,
-                        _ => {
-                            insts.push(stub(guard));
+                        other => {
+                            lift.guard = guard;
+                            lift.addr = addr;
+                            lift.lift(other);
                             addr += 4;
                         }
                     }
@@ -280,6 +314,17 @@ impl Lifter<'_> {
                         }
                         ThumbInstr::LongBranchWithLink { offset } => {
                             let target = addr.wrapping_add(4).wrapping_add_signed(offset * 2);
+                            lift.addr = addr;
+                            let lr = lift.write(Register::Lr);
+                            lift.insts.push(crate::Inst {
+                                guard: None,
+                                dests: vec![lr],
+                                op: Op::Mov {
+                                    set_flags: false,
+                                    a: Value::Const(addr + 4),
+                                    carry_in: Value::Const(0),
+                                },
+                            });
                             let cont = addr + 4;
                             let linked = self.in_region(cont);
                             if linked {
@@ -305,7 +350,7 @@ impl Lifter<'_> {
                                 break RawTerm::IndirectExit(rs);
                             }
                             _ => {
-                                insts.push(stub(None));
+                                lift.insts.push(stub(None));
                                 addr += 2;
                             }
                         },
@@ -314,9 +359,30 @@ impl Lifter<'_> {
                             include_pc_or_lr,
                             ..
                         } if pop && include_pc_or_lr => break RawTerm::Return,
+                        ThumbInstr::SoftwareInterrupt { value } => {
+                            lift.addr = addr;
+                            lift.insts.push(crate::Inst {
+                                guard: None,
+                                dests: Vec::new(),
+                                op: Op::Intrinsic {
+                                    name: "swi",
+                                    args: vec![Value::Const(u32::from(value))],
+                                },
+                            });
+                            addr += 2;
+                        }
                         ThumbInstr::Undefined { .. } => break RawTerm::Unreachable,
                         _ => {
-                            insts.push(stub(None));
+                            lift.guard = None;
+                            lift.addr = addr;
+                            lift.insts.push(crate::Inst {
+                                guard: None,
+                                dests: Vec::new(),
+                                op: Op::Intrinsic {
+                                    name: "unhandled",
+                                    args: Vec::new(),
+                                },
+                            });
                             addr += 2;
                         }
                     }
@@ -324,7 +390,16 @@ impl Lifter<'_> {
             }
         };
         leaders.retain(|&leader| self.in_region(leader));
-        self.raw.insert(from, RawBlock { insts, term });
+        self.next = lift.next;
+        self.raw.insert(
+            from,
+            RawBlock {
+                params,
+                end_state: lift.current.to_vec(),
+                insts: lift.insts,
+                term,
+            },
+        );
         leaders
     }
 
@@ -332,6 +407,7 @@ impl Lifter<'_> {
     /// entry block carrying the incoming machine state, every edge
     /// passing the source block's (for now, identity) state values.
     fn render(self) -> Function {
+        let mut next = self.next;
         let mut ids: HashMap<u32, BlockId> = HashMap::new();
         let order: Vec<(u32, RawBlock)> = self.raw.into_iter().collect();
         for (index, (addr, _)) in order.iter().enumerate() {
@@ -358,24 +434,10 @@ impl Lifter<'_> {
             helpers.entry(addr).or_insert(BlockId(next));
         }
 
-        let mut next_id = ValueId(STATE_COUNT as u32);
         let mut blocks = Vec::with_capacity(order.len() + helpers.len());
-        let mut make_params = || -> (Vec<ValueId>, Vec<Value>) {
-            let mut params = Vec::with_capacity(STATE_COUNT);
-            for _ in 0..STATE_COUNT {
-                params.push(next_id);
-                next_id = ValueId(next_id.0 + 1);
-            }
-            let current: Vec<Value> = params.iter().copied().map(Value::Id).collect();
-            (params, current)
-        };
-        let (entry_params, entry_current) = make_params();
-        for (index, (_, raw)) in order.iter().enumerate() {
-            let (params, current) = if index == 0 {
-                (entry_params.clone(), entry_current.clone())
-            } else {
-                make_params()
-            };
+        for (_, raw) in order.iter() {
+            let params = raw.params.clone();
+            let current: Vec<Value> = raw.end_state.iter().copied().map(Value::Id).collect();
             let term = match &raw.term {
                 RawTerm::Branch(to) => Terminator::Branch {
                     target: block_or_helper(&ids, &helpers, *to),
@@ -411,7 +473,13 @@ impl Lifter<'_> {
             });
         }
         for (addr, &id) in &helpers {
-            let (params, _) = make_params();
+            let params: Vec<ValueId> = (0..STATE_COUNT)
+                .map(|_| {
+                    let allocated = next;
+                    next = ValueId(allocated.0 + 1);
+                    allocated
+                })
+                .collect();
             blocks[id.0 as usize] = Block {
                 params,
                 insts: Vec::new(),
@@ -452,6 +520,7 @@ fn stub(guard: Option<Condition>) -> Inst {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Size;
     use analysis::Flags;
 
     /// Builds a small image, marks `count` ARM words executed, and
@@ -553,18 +622,18 @@ mod tests {
         match &function.blocks[0].term {
             Terminator::Call { target, cont } => {
                 assert!(matches!(target, Value::Const(word) if word % 4 == 0));
-                assert_eq!(
-                    *cont,
-                    Some((
-                        BlockId(1),
-                        function.blocks[0]
-                            .params
-                            .iter()
-                            .copied()
-                            .map(Value::Id)
-                            .collect()
-                    ))
-                );
+                let Some((_, args)) = cont else {
+                    panic!("expected a continuation");
+                };
+                assert_eq!(args.len(), STATE_COUNT);
+                for (slot, arg) in args.iter().enumerate() {
+                    let entry = Value::Id(function.blocks[0].params[slot]);
+                    if slot == 14 {
+                        assert_ne!(*arg, entry, "lr must be rewritten");
+                    } else {
+                        assert_eq!(*arg, entry);
+                    }
+                }
             }
             other => panic!("expected call, got {other:?}"),
         }
@@ -632,23 +701,160 @@ mod tests {
         match &function.blocks[0].term {
             Terminator::Call { target, cont } => {
                 assert!(matches!(target, Value::Const(word) if *word % 2 == 0));
-                assert_eq!(
-                    *cont,
-                    Some((
-                        BlockId(1),
-                        function.blocks[0]
-                            .params
-                            .iter()
-                            .copied()
-                            .map(Value::Id)
-                            .collect()
-                    ))
-                );
+                let Some((_, args)) = cont else {
+                    panic!("expected a continuation");
+                };
+                assert_eq!(args.len(), STATE_COUNT);
+                for (slot, arg) in args.iter().enumerate() {
+                    let entry = Value::Id(function.blocks[0].params[slot]);
+                    if slot == 14 {
+                        assert_ne!(*arg, entry, "lr must be rewritten");
+                    } else {
+                        assert_eq!(*arg, entry);
+                    }
+                }
             }
             other => panic!("expected call, got {other:?}"),
         }
         assert_eq!(function.blocks[1].insts.len(), 1);
         assert!(matches!(function.blocks[1].term, Terminator::Return { .. }));
+    }
+
+    /// One instance of every ARM class (including branch and bx,
+    /// which the pipeline lifts as terminators), encodings verified
+    /// arm-none-eabi-as.
+    #[test]
+    fn every_arm_class_lifts_without_unhandled() {
+        use crate::Op;
+        let words: [u32; 38] = [
+            0xE081_0002, // add r0, r1, r2
+            0xE091_0182, // adds r0, r1, r2, lsl #3
+            0xE251_0005, // subs r0, r1, #5
+            0xE061_0002, // rsb r0, r1, r2
+            0xE0B1_0002, // adcs r0, r1, r2
+            0xE0D1_0002, // sbcs r0, r1, r2
+            0xE0F1_0002, // rscs r0, r1, r2
+            0xE011_0262, // ands r0, r1, r2, ror #4
+            0xE181_0002, // orr r0, r1, r2
+            0xE021_0002, // eor r0, r1, r2
+            0xE1C1_0002, // bic r0, r1, r2
+            0xE3A0_0001, // mov r0, #1
+            0xE1B0_0271, // movs r0, r1, ror r2
+            0xE1E0_0002, // mvn r0, r2
+            0xE111_0002, // tst r1, r2
+            0xE131_0002, // teq r1, r2
+            0xE351_0007, // cmp r1, #7
+            0xE171_0002, // cmn r1, r2
+            0xE000_0392, // mul r0, r2, r3
+            0xE020_4392, // mla r0, r2, r3, r4
+            0xE010_0392, // muls r0, r2, r3
+            0xE085_4392, // umull r4, r5, r2, r3
+            0xE0E5_4392, // smlal r4, r5, r2, r3
+            0xE101_0092, // swp r0, r2, [r1]
+            0xE141_0092, // swpb r0, r2, [r1]
+            0xE10F_0000, // mrs r0, cpsr
+            0xE128_F000, // msr cpsr_f, r0
+            0xE591_0000, // ldr r0, [r1]
+            0xE5A1_0004, // str r0, [r1, #4]!
+            0xE4D1_0002, // ldrb r0, [r1], #2
+            0xE711_0002, // ldr r0, [r1, -r2]
+            0xE791_0102, // ldr r0, [r1, r2, lsl #2]
+            0xE1C1_00B0, // strh r0, [r1]
+            0xE1D1_00B2, // ldrh r0, [r1, #2]
+            0xE191_00D2, // ldrsb r0, [r1, r2]
+            0xE1D1_00F1, // ldrsh r0, [r1, #1]
+            0xE8A1_000C, // stmia r1!, {r2, r3}
+            0xEF00_0005, // swi 0x5
+        ];
+        let function = lift_arm(&words, words.len());
+        for block in &function.blocks {
+            for inst in &block.insts {
+                assert_ne!(
+                    inst.op,
+                    Op::Intrinsic {
+                        name: "unhandled",
+                        args: Vec::new()
+                    },
+                    "every ARM class must lift"
+                );
+            }
+        }
+        let insts = &function.blocks[0].insts;
+        // insts[0] is the first add, [1] the Lsl the shifter emitted
+        // for `r2, lsl #3`, [2] the flag-binding Add itself.
+        assert!(matches!(
+            insts[2].op,
+            Op::Add {
+                set_flags: true,
+                ..
+            }
+        ));
+        assert_eq!(insts[2].dests.len(), 5, "adds binds value + nzcv");
+        // Adc consumes the carry from the preceding Sub, not its own
+        // freshly allocated c dest (dest allocation used to overwrite
+        // the carry slot before carry_in read it).
+        let sub_c = insts[3].dests[3];
+        let Op::Adc { carry_in, .. } = &insts[5].op else {
+            panic!("insts[5] should be the adcs");
+        };
+        assert_eq!(*carry_in, Value::Id(sub_c));
+        // Post-indexed ldrb with W=0 still writes the base back: the
+        // address add (base + 2) sits right before the load. The ldrb
+        // is the last unsigned byte load (swpb's is earlier, ldrsb's
+        // is signed).
+        let ldrb = insts
+            .iter()
+            .rposition(|i| {
+                matches!(
+                    i.op,
+                    Op::Load {
+                        size: Size::Byte,
+                        signed: false,
+                        ..
+                    }
+                )
+            })
+            .expect("ldrb present");
+        assert!(
+            matches!(
+                &insts[ldrb - 1].op,
+                Op::Add {
+                    b: Value::Const(2),
+                    ..
+                }
+            ),
+            "before ldrb: {:?}",
+            insts[ldrb - 1].op
+        );
+        // The LDM with pc is a return terminator, SWI stays inline.
+        assert!(matches!(function.blocks[0].term, Terminator::Unreachable));
+        // Branch classes: conditional branch to two successors, bx as
+        // indirect exit, plain branch as an in-region edge (b -3 lands
+        // on the bx block).
+        let control = lift_arm(&[0x0A00_0000, 0xE12F_FF10, 0xEAFF_FFFD], 3);
+        assert_eq!(control.blocks.len(), 3);
+        assert!(matches!(
+            control.blocks[0].term,
+            Terminator::BranchCond { .. }
+        ));
+        assert!(matches!(
+            control.blocks[1].term,
+            Terminator::IndirectExit { .. }
+        ));
+        assert!(matches!(control.blocks[2].term, Terminator::Branch { .. }));
+    }
+
+    /// The shifter carry shows up in lifted output: a shifted S-bit op
+    /// emits the explicit shift op and threads its carry into the ALU
+    /// op (pretty-print golden, spot-checked).
+    #[test]
+    fn shifter_carry_appears_in_lifted_output() {
+        // ands r0, r1, r2, ror #4
+        let function = lift_arm(&[0xE011_0262], 1);
+        let printed = crate::print::fmt_function(&function);
+        assert!(printed.contains("rors"), "{printed}");
+        assert!(printed.contains("ands"), "{printed}");
+        assert!(printed.contains(", c=v"), "{printed}");
     }
 
     #[test]

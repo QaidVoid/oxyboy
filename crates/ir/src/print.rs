@@ -125,6 +125,39 @@ fn fmt_op(op: &Op) -> String {
             fmt_value(b),
             fmt_value(carry_in)
         ),
+        Op::Rsc {
+            set_flags,
+            a,
+            b,
+            carry_in,
+        } => format!(
+            "rsc{} {}, {}, c={}",
+            suffix(*set_flags),
+            fmt_value(a),
+            fmt_value(b),
+            fmt_value(carry_in)
+        ),
+        Op::MultiplyLong {
+            unsigned,
+            accumulate,
+            set_flags,
+            a,
+            b,
+        } => {
+            let mnemonic = match (unsigned, accumulate) {
+                (false, false) => "smull",
+                (false, true) => "smlal",
+                (true, false) => "umull",
+                (true, true) => "umlal",
+            };
+            format!(
+                "{}{} {}, {}",
+                mnemonic,
+                suffix(*set_flags),
+                fmt_value(a),
+                fmt_value(b)
+            )
+        }
         Op::Rsb { set_flags, a, b } => {
             format!(
                 "rsb{} {}, {}",
@@ -133,40 +166,67 @@ fn fmt_op(op: &Op) -> String {
                 fmt_value(b)
             )
         }
-        Op::And { set_flags, a, b } => {
+        Op::And {
+            set_flags,
+            a,
+            b,
+            carry_in,
+        }
+        | Op::Orr {
+            set_flags,
+            a,
+            b,
+            carry_in,
+        }
+        | Op::Eor {
+            set_flags,
+            a,
+            b,
+            carry_in,
+        }
+        | Op::Bic {
+            set_flags,
+            a,
+            b,
+            carry_in,
+        } => {
+            let mnemonic = match op {
+                Op::And { .. } => "and",
+                Op::Orr { .. } => "orr",
+                Op::Eor { .. } => "eor",
+                _ => "bic",
+            };
             format!(
-                "and{} {}, {}",
+                "{}{} {}, {}{}",
+                mnemonic,
                 suffix(*set_flags),
                 fmt_value(a),
-                fmt_value(b)
+                fmt_value(b),
+                carry_suffix(*set_flags, carry_in)
             )
         }
-        Op::Orr { set_flags, a, b } => {
+        Op::Mov {
+            set_flags,
+            a,
+            carry_in,
+        }
+        | Op::Mvn {
+            set_flags,
+            a,
+            carry_in,
+        } => {
+            let mnemonic = match op {
+                Op::Mov { .. } => "mov",
+                _ => "mvn",
+            };
             format!(
-                "orr{} {}, {}",
+                "{}{} {}{}",
+                mnemonic,
                 suffix(*set_flags),
                 fmt_value(a),
-                fmt_value(b)
+                carry_suffix(*set_flags, carry_in)
             )
         }
-        Op::Eor { set_flags, a, b } => {
-            format!(
-                "eor{} {}, {}",
-                suffix(*set_flags),
-                fmt_value(a),
-                fmt_value(b)
-            )
-        }
-        Op::Bic { set_flags, a, b } => {
-            format!(
-                "bic{} {}, {}",
-                suffix(*set_flags),
-                fmt_value(a),
-                fmt_value(b)
-            )
-        }
-        Op::Mov { set_flags, a } => format!("mov{} {}", suffix(*set_flags), fmt_value(a)),
-        Op::Mvn { set_flags, a } => format!("mvn{} {}", suffix(*set_flags), fmt_value(a)),
         Op::Mul { set_flags, a, b } => {
             format!(
                 "mul{} {}, {}",
@@ -177,8 +237,19 @@ fn fmt_op(op: &Op) -> String {
         }
         Op::Cmp { a, b } => format!("cmp {}, {}", fmt_value(a), fmt_value(b)),
         Op::Cmn { a, b } => format!("cmn {}, {}", fmt_value(a), fmt_value(b)),
-        Op::Tst { a, b } => format!("tst {}, {}", fmt_value(a), fmt_value(b)),
-        Op::Teq { a, b } => format!("teq {}, {}", fmt_value(a), fmt_value(b)),
+        Op::Tst { a, b, carry_in } | Op::Teq { a, b, carry_in } => {
+            let mnemonic = match op {
+                Op::Tst { .. } => "tst",
+                _ => "teq",
+            };
+            format!(
+                "{} {}, {}{}",
+                mnemonic,
+                fmt_value(a),
+                fmt_value(b),
+                carry_suffix(true, carry_in)
+            )
+        }
         Op::Lsl {
             set_flags,
             a,
@@ -236,6 +307,15 @@ fn fmt_op(op: &Op) -> String {
             let list = args.iter().map(fmt_value).collect::<Vec<_>>().join(", ");
             format!("intrinsic \"{name}\" {list}")
         }
+    }
+}
+
+/// The ` c=...` suffix for ops whose carry is a transparent pass-through.
+fn carry_suffix(set_flags: bool, carry_in: &Value) -> String {
+    if set_flags {
+        format!(", c={}", fmt_value(carry_in))
+    } else {
+        String::new()
     }
 }
 

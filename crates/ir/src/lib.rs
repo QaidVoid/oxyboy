@@ -6,6 +6,7 @@
 //! ARM conditions are per-instruction guards; unresolved indirect
 //! control flow is an explicit terminator.
 
+pub mod arm;
 pub mod lift;
 pub mod print;
 
@@ -134,31 +135,79 @@ pub enum Op {
         b: Value,
         carry_in: Value,
     },
+    /// `v = b - a - (1 - carry_in)` (reverse subtract with carry),
+    /// flags as `Sub`.
+    Rsc {
+        set_flags: bool,
+        a: Value,
+        b: Value,
+        carry_in: Value,
+    },
     /// `v = b - a` (reverse subtract), flags as `Sub`.
     Rsb { set_flags: bool, a: Value, b: Value },
-    /// `v = a & b`, or with flags `[v, n, z]`.
-    And { set_flags: bool, a: Value, b: Value },
+    /// `v = a & b`, or with flags `[v, n, z, c]` where `c` is the
+    /// shifter carry, passed in explicitly as `carry_in`.
+    And {
+        set_flags: bool,
+        a: Value,
+        b: Value,
+        carry_in: Value,
+    },
     /// `v = a | b`, flags as `And`.
-    Orr { set_flags: bool, a: Value, b: Value },
+    Orr {
+        set_flags: bool,
+        a: Value,
+        b: Value,
+        carry_in: Value,
+    },
     /// `v = a ^ b`, flags as `And`.
-    Eor { set_flags: bool, a: Value, b: Value },
+    Eor {
+        set_flags: bool,
+        a: Value,
+        b: Value,
+        carry_in: Value,
+    },
     /// `v = a & !b`, flags as `And`.
-    Bic { set_flags: bool, a: Value, b: Value },
-    /// `v = a`, or with flags `[v, n, z]`.
-    Mov { set_flags: bool, a: Value },
+    Bic {
+        set_flags: bool,
+        a: Value,
+        b: Value,
+        carry_in: Value,
+    },
+    /// `v = a`, or with flags `[v, n, z, c]` (`c = carry_in`).
+    Mov {
+        set_flags: bool,
+        a: Value,
+        carry_in: Value,
+    },
     /// `v = !a`, flags as `Mov`.
-    Mvn { set_flags: bool, a: Value },
+    Mvn {
+        set_flags: bool,
+        a: Value,
+        carry_in: Value,
+    },
     /// `v = (a * b) & 0xffffffff`, or with flags `[v, n, z]` (C is
     /// architecturally unpredictable on ARM7TDMI and not produced).
     Mul { set_flags: bool, a: Value, b: Value },
+    /// 64-bit multiply: `[lo, hi] = a * b` (sign per `unsigned`),
+    /// `a` accumulated into the 64-bit result when `accumulate`. With
+    /// flags: `[lo, hi, n, z]` (C, V unpredictable and not produced).
+    MultiplyLong {
+        unsigned: bool,
+        accumulate: bool,
+        set_flags: bool,
+        a: Value,
+        b: Value,
+    },
     /// Comparison `a - b`, discarding the result: `[n, z, c, v]`.
     Cmp { a: Value, b: Value },
     /// Comparison `a + b`, discarding the result: `[n, z, c, v]`.
     Cmn { a: Value, b: Value },
-    /// Test `a & b`, discarding the result: `[n, z]`.
-    Tst { a: Value, b: Value },
-    /// Test `a ^ b`, discarding the result: `[n, z]`.
-    Teq { a: Value, b: Value },
+    /// Test `a & b`, discarding the result: `[n, z, c]` with `c` the
+    /// shifter carry (`carry_in`).
+    Tst { a: Value, b: Value, carry_in: Value },
+    /// Test `a ^ b`, discarding the result: `[n, z, c]` as `Tst`.
+    Teq { a: Value, b: Value, carry_in: Value },
     /// `v = a << amount`, or with flags `[v, c]`.
     Lsl {
         set_flags: bool,
