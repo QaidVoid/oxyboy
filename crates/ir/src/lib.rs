@@ -9,6 +9,7 @@
 pub mod arm;
 pub mod lift;
 pub mod print;
+pub mod thumb;
 
 use decode::Condition;
 

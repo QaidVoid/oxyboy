@@ -4,11 +4,9 @@
 //! The control flow comes from the analysis's flag map: a linear decode
 //! walk per function region splits basic blocks at branch targets, and
 //! terminators mirror the traversal's stop kinds (direct branch, call,
-//! return, indirect exit). Per-instruction semantics are stubbed as
-//! `unhandled` intrinsics until the ARM and THUMB
-//! lifters replace them class by class; the state threading is
-//! likewise identity for now, with per-instruction renames arriving
-//! with the real lifters.
+//! return, indirect exit). ARM and THUMB instruction semantics lower
+//! through the ARM and THUMB lifters; the state
+//! threading is real SSA values in slot order.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -350,39 +348,27 @@ impl Lifter<'_> {
                                 break RawTerm::IndirectExit(rs);
                             }
                             _ => {
-                                lift.insts.push(stub(None));
+                                lift.addr = addr;
+                                lift.thumb_hi(op, rd, rs);
                                 addr += 2;
                             }
                         },
                         ThumbInstr::PushPop {
-                            pop,
-                            include_pc_or_lr,
-                            ..
-                        } if pop && include_pc_or_lr => break RawTerm::Return,
-                        ThumbInstr::SoftwareInterrupt { value } => {
+                            pop: true,
+                            include_pc_or_lr: true,
+                            registers,
+                        } => {
+                            // The pop's loads must lift before the
+                            // return so the pc slot carries them.
                             lift.addr = addr;
-                            lift.insts.push(crate::Inst {
-                                guard: None,
-                                dests: Vec::new(),
-                                op: Op::Intrinsic {
-                                    name: "swi",
-                                    args: vec![Value::Const(u32::from(value))],
-                                },
-                            });
-                            addr += 2;
+                            lift.thumb_pop(u16::from(registers), true);
+                            break RawTerm::Return;
                         }
                         ThumbInstr::Undefined { .. } => break RawTerm::Unreachable,
-                        _ => {
+                        other => {
                             lift.guard = None;
                             lift.addr = addr;
-                            lift.insts.push(crate::Inst {
-                                guard: None,
-                                dests: Vec::new(),
-                                op: Op::Intrinsic {
-                                    name: "unhandled",
-                                    args: Vec::new(),
-                                },
-                            });
+                            lift.thumb(other);
                             addr += 2;
                         }
                     }
@@ -503,18 +489,6 @@ fn block_or_helper(
     addr: u32,
 ) -> BlockId {
     ids.get(&addr).copied().unwrap_or_else(|| helpers[&addr])
-}
-
-/// The placeholder instruction standing in for real per-class lifting.
-fn stub(guard: Option<Condition>) -> Inst {
-    Inst {
-        guard,
-        dests: Vec::new(),
-        op: Op::Intrinsic {
-            name: "unhandled",
-            args: Vec::new(),
-        },
-    }
 }
 
 #[cfg(test)]
@@ -855,6 +829,147 @@ mod tests {
         assert!(printed.contains("rors"), "{printed}");
         assert!(printed.contains("ands"), "{printed}");
         assert!(printed.contains(", c=v"), "{printed}");
+    }
+
+    /// One instance of every THUMB format, halfwords verified against
+    /// arm-none-eabi-as.
+    /// pop-pc ends the walk, so it closes the sweep; conditional and
+    /// unconditional branches ride along as in-region edges.
+    #[test]
+    fn every_thumb_format_lifts_without_unhandled() {
+        use crate::Op;
+        let halves: [u16; 56] = [
+            0x00D0, // lsls r0, r2, #3
+            0x0C48, // lsrs r0, r1, #17
+            0x17C8, // asrs r0, r1, #31
+            0x1CC8, // adds r0, r1, #3
+            0x1EC8, // subs r0, r1, #3
+            0x20FF, // movs r0, #255
+            0x2F07, // cmp r7, #7
+            0x320A, // adds r2, #10
+            0x3B01, // subs r3, #1
+            0x4008, // ands r0, r1
+            0x4048, // eors r0, r1
+            0x4088, // lsls r0, r1
+            0x40C8, // lsrs r0, r1
+            0x4108, // asrs r0, r1
+            0x4148, // adcs r0, r1
+            0x4188, // sbcs r0, r1
+            0x41C8, // rors r0, r1
+            0x4208, // tst r0, r1
+            0x4248, // negs r0, r1
+            0x4288, // cmp r0, r1
+            0x42C8, // cmn r0, r1
+            0x4308, // orrs r0, r1
+            0x4348, // muls r0, r1
+            0x4388, // bics r0, r1
+            0x43C8, // mvns r0, r1
+            0x4441, // add r1, r8
+            0x4540, // cmp r0, r8
+            0x4641, // mov r1, r8
+            0x4800, // ldr r0, [pc, #0]
+            0x5088, // str r0, [r1, r2]
+            0x5888, // ldr r0, [r1, r2]
+            0x5488, // strb r0, [r1, r2]
+            0x5C88, // ldrb r0, [r1, r2]
+            0x5288, // strh r0, [r1, r2]
+            0x5688, // ldsb r0, [r1, r2]
+            0x5A88, // ldrh r0, [r1, r2]
+            0x5E88, // ldsh r0, [r1, r2]
+            0x6048, // str r0, [r1, #4]
+            0x6848, // ldr r0, [r1, #4]
+            0x7108, // strb r0, [r1, #4]
+            0x7908, // ldrb r0, [r1, #4]
+            0x8088, // strh r0, [r1, #4]
+            0x8888, // ldrh r0, [r1, #4]
+            0x9001, // str r0, [sp, #4]
+            0x9801, // ldr r0, [sp, #4]
+            0xA001, // add r0, pc, #4
+            0xA801, // add r0, sp, #4
+            0xB004, // add sp, #16
+            0xB084, // sub sp, #16
+            0xD100, // bne .+4 (in-region edge)
+            0xE000, // b .+4 (in-region edge)
+            0xDF05, // swi 5
+            0xB403, // push {r0, r1}
+            0xB500, // push {lr}
+            0xBC01, // pop {r0}
+            0xBD01, // pop {r0, pc}: loads then Return (walk ends)
+        ];
+        let function = lift_thumb(&halves, halves.len());
+        for block in &function.blocks {
+            for inst in &block.insts {
+                assert_ne!(
+                    inst.op,
+                    Op::Intrinsic {
+                        name: "unhandled",
+                        args: Vec::new()
+                    },
+                    "every THUMB format must lift"
+                );
+            }
+        }
+        assert!(matches!(
+            function.blocks.last().expect("blocks").term,
+            Terminator::Return { .. }
+        ));
+        let insts = &function.blocks[0].insts;
+        // negs lowers to rsb with b = 0 (Op::Rsb computes b - a).
+        assert!(insts.iter().any(|inst| matches!(
+            inst.op,
+            Op::Rsb {
+                set_flags: true,
+                b: Value::Const(0),
+                ..
+            }
+        )));
+        // hi-register add copies without touching flags.
+        assert!(insts.iter().any(|inst| matches!(
+            inst.op,
+            Op::Add {
+                set_flags: false,
+                ..
+            }
+        )));
+        // The pc-relative load is a literal reference at lift time.
+        let base = function
+            .blocks
+            .first()
+            .map(|_| ())
+            .and(insts.iter().find_map(|inst| match inst.op {
+                Op::Load { addr, .. } => Some(addr),
+                _ => None,
+            }));
+        assert!(matches!(base, Some(Value::Const(_))));
+        // The SWI stays inline as an intrinsic (it sits in a block
+        // after the bne split).
+        assert!(function.blocks.iter().any(|block| {
+            block
+                .insts
+                .iter()
+                .any(|inst| matches!(inst.op, Op::Intrinsic { name: "swi", .. }))
+        }));
+    }
+
+    /// The second BL halfword standing alone (F800, real games emit it
+    /// as a cheap call) is an indirect exit through LR.
+    #[test]
+    fn thumb_bl_from_lr_is_an_indirect_exit() {
+        let function = lift_thumb(&[0xF800], 1);
+        assert_eq!(function.blocks.len(), 1);
+        assert!(matches!(
+            function.blocks[0].term,
+            Terminator::IndirectExit { .. }
+        ));
+    }
+
+    #[test]
+    fn scratch_thumb_print() {
+        let halves: Vec<u16> = vec![
+            0x00D0, 0x4248, 0x4800, 0x4441, 0xB403, 0xB500, 0xBC01, 0xBD01,
+        ];
+        let f = lift_thumb(&halves, halves.len());
+        print!("{}", crate::print::fmt_function(&f));
     }
 
     #[test]

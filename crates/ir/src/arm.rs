@@ -16,7 +16,7 @@ use decode::{
 use crate::{Inst, Op, STATE_ARITY, Size, Value, ValueId};
 
 /// Slot index of the C flag within the flag tail.
-const C_SLOT: usize = 2;
+pub(crate) const C_SLOT: usize = 2;
 
 /// Per-instruction lifting state: the machine state array in play plus
 /// the SSA allocator and the instruction's own address.
@@ -36,14 +36,14 @@ pub(crate) struct ArmLift {
 
 impl ArmLift {
     /// A fresh value id.
-    fn fresh(&mut self) -> ValueId {
+    pub(crate) fn fresh(&mut self) -> ValueId {
         let id = self.next;
         self.next = ValueId(id.0 + 1);
         id
     }
 
     /// Emits one instruction binding `dests`.
-    fn emit(&mut self, op: Op, dests: Vec<ValueId>) {
+    pub(crate) fn emit(&mut self, op: Op, dests: Vec<ValueId>) {
         self.insts.push(Inst {
             guard: self.guard,
             dests,
@@ -52,8 +52,8 @@ impl ArmLift {
     }
 
     /// The operand reading `reg`: PC reads lower to `addr + 8` (ARM
-    /// ARM A2.3.1).
-    fn read(&self, reg: Register) -> Value {
+    /// ARM A2.3.1). THUMB lowering must use its own PC read (addr + 4).
+    pub(crate) fn read(&self, reg: Register) -> Value {
         if reg == Register::Pc {
             Value::Const(self.addr + 8)
         } else {
@@ -70,14 +70,14 @@ impl ArmLift {
 
     /// Binds one flag: a fresh id that becomes the flag's value.
     /// `slot` is 0..4 within N, Z, C, V.
-    fn flag_dest(&mut self, slot: usize) -> ValueId {
+    pub(crate) fn flag_dest(&mut self, slot: usize) -> ValueId {
         let id = self.fresh();
         self.current[16 + slot] = id;
         id
     }
 
     /// The incoming carry value.
-    fn carry_in(&self) -> Value {
+    pub(crate) fn carry_in(&self) -> Value {
         Value::Id(self.current[16 + C_SLOT])
     }
 
@@ -623,7 +623,7 @@ impl ArmLift {
     /// design's base rules: STM stores pre-instruction values, LDM
     /// with the base in the list lets the loaded value win (ARM ARM
     /// A4.1.10), and write-back updates the base after the accesses.
-    fn block_transfer(
+    pub(crate) fn block_transfer(
         &mut self,
         load: bool,
         writeback: bool,
