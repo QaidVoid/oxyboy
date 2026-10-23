@@ -103,6 +103,85 @@ fn headless_dump_matches_golden() {
     assert_bytes_matches(golden, &png);
 }
 
+/// Multiboot paint program placed at EWRAM 0xC0 and entered through
+/// the header's entry branch (the same listing the runtime multiboot
+/// tests document, assembler-verified with Binutils 2.32).
+const MB_HEADER_ENTRY: u32 = 0xEA00_002E; // b 0x020000c0
+const MB_PROGRAM: [u32; 17] = [
+    0xE59F_0024,
+    0xE59F_1024,
+    0xE1C0_10B0,
+    0xE59F_0020,
+    0xE59F_1020,
+    0xE1C0_10B0,
+    0xE59F_101C,
+    0xE1C0_10B2,
+    0xE59F_1018,
+    0xE1C0_10B4,
+    0xEAFF_FFFE,
+    0x0400_0000,
+    0x0000_0403,
+    0x0600_0000,
+    0x0000_7FFF,
+    0x0000_001F,
+    0x0000_7C00,
+];
+
+/// Writes a multiboot-classified synthetic ROM: the entry branch
+/// decodes into EWRAM, so the loader classifies it as multiboot and
+/// the boot copies the image to 0x02000000.
+fn multiboot_rom(dir: &Path, name: &str) -> PathBuf {
+    let mut bytes = RomBuilder::new()
+        .title("MBRUN")
+        .entry(MB_HEADER_ENTRY)
+        .min_size(0x140)
+        .build();
+    let mut code = Vec::new();
+    for word in MB_PROGRAM {
+        code.extend_from_slice(&word.to_le_bytes());
+    }
+    bytes[0xC0..0xC0 + code.len()].copy_from_slice(&code);
+    let path = dir.join(name);
+    fs::write(&path, &bytes).expect("write ROM");
+    path
+}
+
+#[test]
+fn multiboot_rom_boots_headless_to_its_frame() {
+    let dir = temp_dir("mb");
+    let rom = multiboot_rom(&dir, "mbrun.gba");
+    let dump = dir.join("frame.png");
+
+    let status = oxyboy()
+        .args([
+            "run",
+            "--rom",
+            rom.to_str().expect("utf-8 path"),
+            "--headless",
+            "--frames",
+            "1",
+            "--dump-frame",
+            dump.to_str().expect("utf-8 path"),
+            "--save-dir",
+            dir.join("saves").to_str().expect("utf-8 path"),
+        ])
+        .status()
+        .expect("spawn oxyboy");
+    assert!(status.success(), "run failed: {status}");
+
+    let file = fs::File::open(&dump).expect("open dumped frame");
+    let decoder = png::Decoder::new(std::io::BufReader::new(file));
+    let mut reader = decoder.read_info().expect("png info");
+    let size = reader.output_buffer_size().expect("frame size");
+    let mut buf = vec![0u8; size];
+    let info = reader.next_frame(&mut buf).expect("decode frame");
+    assert_eq!(info.width, 240);
+    assert_eq!(&buf[0..4], &[255, 255, 255, 255], "pixel 0: white");
+    assert_eq!(&buf[4..8], &[255, 0, 0, 255], "pixel 1: red");
+    assert_eq!(&buf[8..12], &[0, 0, 255, 255], "pixel 2: blue");
+    assert_eq!(&buf[40..44], &[0, 0, 0, 255], "backdrop untouched");
+}
+
 #[test]
 fn headless_without_dump_exits_successfully() {
     let dir = temp_dir("nodump");

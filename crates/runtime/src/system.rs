@@ -10,6 +10,10 @@ use crate::cpu::Cpu;
 use crate::input::Key;
 use crate::ppu::{Frame, Ppu};
 
+/// Execution base of a multiboot image, which the BIOS copies to EWRAM
+/// (GBATEK "GBA Multiboot").
+const MULTIBOOT_BASE: u32 = 0x0200_0000;
+
 /// A GBA machine: interpreter CPU, system bus, and video.
 pub struct System {
     /// The interpreter CPU.
@@ -44,6 +48,22 @@ impl System {
         System {
             cpu,
             bus: Bus::with_bios(rom, bios),
+            ppu: Ppu::new(),
+        }
+    }
+
+    /// Boots a multiboot image the way the BIOS would: the bytes land
+    /// in EWRAM at 0x02000000 and the CPU enters at the header's entry
+    /// branch (the `rom` multiboot classification guarantees the first
+    /// word branches into EWRAM). The image also stays mapped at the
+    /// cart window; a real multiboot boot streams it over the client
+    /// cable, so programs must not rely on that mapping.
+    pub fn with_multiboot(rom: Vec<u8>) -> Self {
+        let mut bus = Bus::new(rom.clone());
+        bus.load_ewram(&rom);
+        System {
+            cpu: Cpu::new(MULTIBOOT_BASE),
+            bus,
             ppu: Ppu::new(),
         }
     }

@@ -10,12 +10,15 @@
 //! The machine boots directly at 0x08000000 with no BIOS reset, the
 //! documented boot decision. Standard crt0 places
 //! its entry branch there, so header-carrying ROMs run unmodified.
+//! Multiboot-classified images boot the way the BIOS would: the bytes
+//! land in EWRAM at 0x02000000 and the header entry branch runs from
+//! there.
 
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 
-use rom::Image;
+use rom::{Image, ImageKind};
 use runtime::ppu::{CYCLES_PER_LINE, LINES_PER_FRAME, VISIBLE_LINES, WIDTH};
 use runtime::save::Save;
 use runtime::system::System;
@@ -70,7 +73,10 @@ pub fn run(args: RunArgs) -> i32 {
             return 1;
         }
     };
-    let mut system = System::new(image.bytes().to_vec(), CART_BASE);
+    let mut system = match image.kind() {
+        ImageKind::Multiboot => System::with_multiboot(image.bytes().to_vec()),
+        ImageKind::Cart => System::new(image.bytes().to_vec(), CART_BASE),
+    };
     let save_file = save_path(&args, &image);
     if let Some(Err(e)) = save_file.as_deref().map(|path| {
         path.parent()

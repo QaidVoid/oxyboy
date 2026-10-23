@@ -312,6 +312,13 @@ impl Bus {
         &self.ewram
     }
 
+    /// Copies `bytes` to the start of EWRAM, truncating at 256 KiB.
+    /// This is how a multiboot boot places the image the BIOS copied.
+    pub fn load_ewram(&mut self, bytes: &[u8]) {
+        let len = bytes.len().min(EWRAM_SIZE);
+        self.ewram[..len].copy_from_slice(&bytes[..len]);
+    }
+
     /// The 32 KiB IWRAM array (address 0x03000000).
     pub fn iwram(&self) -> &[u8] {
         &self.iwram

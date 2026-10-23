@@ -14,5 +14,6 @@ trace = { version = "0.1.0", path = "../trace" }
 [dev-dependencies]
 analysis = { version = "0.1.0", path = "../analysis" }
 ir = { version = "0.1.0", path = "../ir" }
+recomp = { version = "0.1.0", path = "../recomp" }
 rom = { version = "0.1.0", path = "../rom" }
 testutil = { path = "../testutil" }

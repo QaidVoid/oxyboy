@@ -521,13 +521,10 @@ fn smc_image(title: &str, words: &[u32]) -> Image {
 }
 
 /// Boots a multiboot image the way the BIOS would: the bytes land in
-/// EWRAM at 0x02000000 and the CPU enters at `pc`. `System::new` never
-/// sees a BIOS, so the copy is on us.
+/// EWRAM at 0x02000000 and the CPU enters at `pc`.
 fn boot_smc(image: &Image, pc: u32) -> System {
-    let mut system = System::new(image.bytes().to_vec(), pc);
-    for (index, byte) in image.bytes().iter().enumerate() {
-        system.bus_mut().write_u8(0x0200_0000 + index as u32, *byte);
-    }
+    let mut system = System::with_multiboot(image.bytes().to_vec());
+    system.cpu.set_pc(pc);
     system
 }
 
