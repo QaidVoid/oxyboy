@@ -184,7 +184,11 @@ fn thumb_system(rom: Vec<u8>) -> System {
 
 #[test]
 fn step_frame_advances_vcount_through_all_lines() {
-    let mut system = thumb_system(idle_rom());
+    // ARM state on purpose: `b .` then has one stable cost per step
+    // (two 16-bit ROM lanes), so the CPU-driven frame lands exactly on
+    // the PPU wrap at 228 * 1536 cycles.
+    let mut system = System::new(idle_rom(), 0x0800_0000);
+    system.cpu.set_cpsr_raw(0x13);
     let mut seen: HashSet<u16> = HashSet::new();
     let mut max_seen = 0u16;
     let mut total_cycles = 0u64;

@@ -88,6 +88,12 @@ pub struct Bus {
     keys: u16,
     /// The last evaluated KEYCNT condition, for the request edge.
     key_irq_line: bool,
+    /// The previous bus operation (address, width in bytes), for
+    /// sequential-access timing. Width 0 means "no previous access".
+    last_access: (u32, u8),
+    /// The opcode-fetch address held by the Game Pak prefetch buffer
+    /// (WAITCNT bit 14), if any. Hit-only model: see `fetch_cost`.
+    prefetch: Option<u32>,
 }
 
 impl Bus {
@@ -118,6 +124,8 @@ impl Bus {
             apu: Apu::new(),
             keys: 0,
             key_irq_line: false,
+            last_access: (0, 0),
+            prefetch: None,
         };
         // SOUNDBIAS resets to 0200h: bias level 100h, the 10-bit output
         // midpoint (GBATEK SOUNDBIAS).
@@ -126,14 +134,149 @@ impl Bus {
         bus
     }
 
+    /// Builds a bus with a real BIOS image mapped at 0x00000000. The
+    /// image is padded or truncated to the 16 KiB BIOS window; reads
+    /// outside the image return the zero padding as on an empty map.
+    pub fn with_bios(rom: Vec<u8>, bios: Vec<u8>) -> Self {
+        let mut bus = Self::new(rom);
+        let n = bios.len().min(0x4000);
+        bus.bios[..n].copy_from_slice(&bios[..n]);
+        bus
+    }
+
     /// Classifies a logical address into its bus region.
     pub fn region_of(&self, addr: u32) -> Region {
         region_of(addr)
     }
 
+    /// The WAITCNT register image (0x04000204), plain IO storage.
+    pub fn waitcnt(&self) -> u16 {
+        halfword(&self.io, Self::WAITCNT as usize)
+    }
+
+    /// True when an access at `addr` is sequential: same region as,
+    /// and immediately consecutive to, the previous bus operation, and
+    /// (Game Pak ROM only) not the start of a 128 KiB block, where the
+    /// cart forces a non-sequential access (GBATEK WAITCNT notes).
+    fn is_sequential(&self, addr: u32) -> bool {
+        let (last, last_width) = self.last_access;
+        if last_width == 0 {
+            return false;
+        }
+        let region = region_of(addr);
+        if region != region_of(last) {
+            return false;
+        }
+        if region == Region::Rom && addr & 0x0001_FFFF == 0 {
+            return false;
+        }
+        addr == last.wrapping_add(u32::from(last_width))
+    }
+
+    /// Bus-level cycle cost of one CPU data access or DMA unit,
+    /// updating the sequential-access tracker. Any bus operation
+    /// invalidates the opcode prefetch buffer. Public for the CPU,
+    /// the DMA engine, and timing tests.
+    pub fn access_cost(&mut self, addr: u32, width: u8) -> u32 {
+        self.prefetch = None;
+        let seq = self.is_sequential(addr);
+        self.last_access = (addr, width);
+        self.access_cycles(addr, width, seq)
+    }
+
+    /// Bus-level cycle cost of one opcode fetch, honoring the Game Pak
+    /// prefetch buffer (WAITCNT bit 14) with a hit-only model: a fetch
+    /// at the buffered successor address completes in one cycle, and
+    /// the buffer then advances; any miss charges the plain waitstate
+    /// cost. Hardware fills the buffer during idle bus cycles, which
+    /// are not modeled, so real code can hit where this model misses
+    /// (never the reverse). Only ROM fetches populate the buffer.
+    /// Public for the CPU and timing tests.
+    pub fn fetch_cost(&mut self, addr: u32, width: u8) -> u32 {
+        let hit = self.prefetch == Some(addr);
+        let cost = if hit {
+            self.last_access = (addr, width);
+            1
+        } else {
+            self.access_cost(addr, width)
+        };
+        self.prefetch = if self.waitcnt() & 0x4000 != 0 && region_of(addr) == Region::Rom {
+            Some(addr.wrapping_add(u32::from(width)))
+        } else {
+            None
+        };
+        cost
+    }
+
+    /// The WAITCNT-driven cost of one bus operation at `addr`.
+    ///
+    /// Game Pak ROM mirrors map to waitstate groups WS0-2 (GBATEK
+    /// WAITCNT bits 2-10); SRAM uses bits 0-1 for both access kinds.
+    /// A word access costs two 16-bit lanes, the second always
+    /// sequential because the cart bus is 16 bits wide.
+    fn access_cycles(&self, addr: u32, width: u8, seq: bool) -> u32 {
+        let wcnt = self.waitcnt();
+        match (region_of(addr), width) {
+            (Region::Rom, 4) => {
+                rom_lane_cost(wcnt, addr, seq) + rom_lane_cost(wcnt, addr.wrapping_add(2), true)
+            }
+            (Region::Rom, _) => rom_lane_cost(wcnt, addr, seq),
+            (Region::Sram, _) => first_access_cycles(wcnt),
+            (Region::Ewram, 4) => 6,
+            (Region::Ewram, _) => 3,
+            (Region::Palette | Region::Vram, 4) => 2,
+            _ => 1,
+        }
+    }
+
     /// The Game Pak ROM image backing the ROM window.
     pub fn rom(&self) -> &[u8] {
         &self.rom
+    }
+
+    /// Zeroes the backing storage behind `addr..addr+len` through each
+    /// region's own addressing rules (no byte-doubling side effects).
+    /// Used by the RegisterRamReset HLE; other regions and spans that
+    /// wrap a region boundary are ignored.
+    pub fn zero_mem(&mut self, addr: u32, len: u32) {
+        if len == 0 {
+            return;
+        }
+        let a = addr & 0x0FFF_FFFF;
+        let end = a.saturating_add(len);
+        let clear = |mem: &mut [u8], s: usize, e: usize| {
+            if e > s {
+                mem[s..e].fill(0);
+            }
+        };
+        match region_of(a) {
+            Region::Ewram => {
+                let s = (a & 0x0003_FFFF) as usize;
+                let e = (((end - 1) & 0x0003_FFFF) as usize) + 1;
+                clear(&mut self.ewram, s, e);
+            }
+            Region::Iwram => {
+                let s = (a & 0x0000_7FFF) as usize;
+                let e = (((end - 1) & 0x0000_7FFF) as usize) + 1;
+                clear(&mut self.iwram, s, e);
+            }
+            Region::Palette => {
+                let s = (a & 0x0000_03FF) as usize;
+                let e = (((end - 1) & 0x0000_03FF) as usize) + 1;
+                clear(&mut self.palette, s, e);
+            }
+            Region::Vram => {
+                let s = Self::vram_index(a) as usize;
+                let e = Self::vram_index(end - 1) as usize + 1;
+                clear(&mut self.vram, s, e);
+            }
+            Region::Oam => {
+                let s = (a & 0x0000_03FF) as usize;
+                let e = (((end - 1) & 0x0000_03FF) as usize) + 1;
+                clear(&mut self.oam, s, e);
+            }
+            _ => {}
+        }
     }
 
     /// The 256 KiB EWRAM array (address 0x02000000).
@@ -252,11 +395,13 @@ impl Bus {
 
     /// Reads a little-endian word.
     ///
-    /// Palette, VRAM, and OAM are 16-bit regions, so their word reads are
-    /// two halfword lanes; everywhere else the access is four byte lanes.
+    /// Palette, VRAM, OAM, and the 16-bit Game Pak ROM window resolve
+    /// word reads as two halfword lanes (GBATEK WAITCNT: a 32-bit
+    /// access on the cart bus is two 16-bit accesses); everywhere
+    /// else the access is four byte lanes.
     pub fn read_u32(&mut self, addr: u32) -> u32 {
         let a = addr & 0x0FFF_FFFF;
-        if matches!(a >> 24, 0x05..=0x07) {
+        if matches!(a >> 24, 0x05..=0x0D) {
             u32::from(self.read_u16(addr)) | (u32::from(self.read_u16(addr.wrapping_add(2))) << 16)
         } else {
             u32::from(self.read_u8(addr))
@@ -797,6 +942,7 @@ impl Bus {
     const IE: u32 = 0x200;
     const IF: u32 = 0x202;
     const IME: u32 = 0x208;
+    const WAITCNT: u32 = 0x204;
 }
 
 /// Classifies a logical address into its bus region, applying the
@@ -821,4 +967,50 @@ pub fn region_of(addr: u32) -> Region {
 /// Little-endian halfword at `i`, which must leave room for `i + 1`.
 fn halfword(bytes: &[u8], i: usize) -> u16 {
     u16::from(bytes[i]) | (u16::from(bytes[i + 1]) << 8)
+}
+
+/// First-access (non-sequential) cycles for a WAITCNT code field,
+/// bits carried in the low two bits of `code` (GBATEK WAITCNT:
+/// codes 0..3 cost 4, 3, 2, 8 cycles).
+fn first_access_cycles(code: u16) -> u32 {
+    const FIRST: [u32; 4] = [4, 3, 2, 8];
+    FIRST[(code & 3) as usize]
+}
+
+/// One 16-bit Game Pak ROM lane's cost from WAITCNT (GBATEK WAITCNT
+/// bits 2-10). The lane is non-sequential at 128 KiB block starts;
+/// otherwise the sequential bit selects the second-access setting
+/// (WS0 2/1, WS1 4/1, WS2 8/1 cycles).
+fn rom_lane_cost(wcnt: u16, addr: u32, seq: bool) -> u32 {
+    let ws = (addr >> 24).wrapping_sub(8) / 2;
+    if addr & 0x0001_FFFF == 0 || !seq {
+        return match ws {
+            0 => first_access_cycles(wcnt >> 2),
+            1 => first_access_cycles(wcnt >> 5),
+            _ => first_access_cycles(wcnt >> 8),
+        };
+    }
+    match ws {
+        0 => {
+            if wcnt & 0x0010 == 0 {
+                2
+            } else {
+                1
+            }
+        }
+        1 => {
+            if wcnt & 0x0080 == 0 {
+                4
+            } else {
+                1
+            }
+        }
+        _ => {
+            if wcnt & 0x0400 == 0 {
+                8
+            } else {
+                1
+            }
+        }
+    }
 }

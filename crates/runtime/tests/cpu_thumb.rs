@@ -323,6 +323,8 @@ fn branch_formats_and_swi() {
     ];
     let mut bus = thumb_rom(&words);
     let mut cpu = thumb_cpu();
+    // The SWI tests exception entry, not a BIOS call.
+    cpu.set_bios_hle(false);
 
     // 1 (mov) + 7*2 (not-taken pairs) + 7 (taken branches) = 22 steps
     // to reach the SWI.

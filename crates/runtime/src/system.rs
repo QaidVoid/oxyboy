@@ -32,6 +32,22 @@ impl System {
         }
     }
 
+    /// Boots a machine through a real BIOS image at 0x00000000: the
+    /// CPU starts at the reset vector in supervisor mode, BIOS-call
+    /// HLE is disabled (SWI vectors into the image), and the cartridge
+    /// hands off through the header checks the real BIOS performs (a
+    /// synthetic ROM therefore needs a genuine logo and header for the
+    /// boot to reach it). The image is padded or truncated to 16 KiB.
+    pub fn with_bios(rom: Vec<u8>, bios: Vec<u8>) -> Self {
+        let mut cpu = Cpu::new(0x0000_0000);
+        cpu.set_bios_hle(false);
+        System {
+            cpu,
+            bus: Bus::with_bios(rom, bios),
+            ppu: Ppu::new(),
+        }
+    }
+
     /// Runs one CPU instruction, advances the video clock by the
     /// cycles it consumed plus any immediate DMA the instruction armed,
     /// drives the timers and the APU on the same cycle budget, and

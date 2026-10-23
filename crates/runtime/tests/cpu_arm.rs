@@ -484,6 +484,8 @@ fn psr_transfers_between_modes() {
     ];
     let mut bus = rom(&words);
     let mut cpu = Cpu::new(0x0800_0000);
+    // SWI here is the vectoring path under test, not a BIOS call.
+    cpu.set_bios_hle(false);
 
     // SVC sp was stored through the plain STM.
     run(&mut cpu, &mut bus, 5);
@@ -545,6 +547,8 @@ fn system_mode_may_write_the_cpsr_control_field() {
 fn swi_entry_state() {
     let mut bus = rom(&[0xEF12_3456]);
     let mut cpu = Cpu::new(0x0800_0000);
+    // SWI here is the vectoring path under test, not a BIOS call.
+    cpu.set_bios_hle(false);
     cpu.set_cpsr_raw(0x0000_0053); // SVC, IRQ masked, FIQ clear
     run(&mut cpu, &mut bus, 1);
     assert_eq!(cpu.pc(), 8);
@@ -732,6 +736,8 @@ fn ldm_exception_return() {
     ];
     let mut bus = rom(&words);
     let mut cpu = Cpu::new(0x0800_0000);
+    // SWI here is the vectoring path under test, not a BIOS call.
+    cpu.set_bios_hle(false);
     run(&mut cpu, &mut bus, 4);
     assert_eq!(cpu.pc(), 8);
     assert_eq!(cpu.mode(), Mode::Supervisor);

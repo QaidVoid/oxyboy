@@ -111,6 +111,17 @@ enum Flow {
     Handled,
 }
 
+/// The CPU low-power state (GBATEK HALTCNT / BIOS Halt and IntrWait).
+/// `Any` wakes when any enabled interrupt is requested; `Wait(mask)`
+/// wakes when (IE & IF & mask) is nonzero, the IntrWait shape. IME and
+/// the CPSR I bit are don't care for the wake, per GBATEK SWI Halt.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Halt {
+    None,
+    Any,
+    Wait(u16),
+}
+
 /// The ARM7TDMI processor state.
 ///
 /// The visible register file is `regs`; r8..r12 have a second copy that
@@ -132,6 +143,11 @@ pub struct Cpu {
     pc: u32,
     /// Accumulated cycle count (coarse region-default approximation).
     cycles: u64,
+    /// The low-power state entered by BIOS Halt/IntrWait HLE.
+    halt: Halt,
+    /// True while BIOS calls are emulated instead of vectoring into
+    /// the (zero-filled) BIOS array; cleared by `System::with_bios`.
+    bios_hle: bool,
     /// The IRQ input line, sampled at the start of every step.
     irq_line: bool,
     /// Saved interrupted-context registers of in-flight BIOS-HLE IRQ
@@ -176,6 +192,8 @@ impl Cpu {
             cpsr: (u32::from(Mode::Supervisor.bits())) | 0x0000_00C0,
             pc,
             cycles: 0,
+            halt: Halt::None,
+            bios_hle: true,
             irq_line: false,
             irq_hle_saved: [[0; SAVED_IRQ_REGS]; IRQ_HLE_DEPTH],
             irq_hle_depth: 0,
@@ -268,6 +286,58 @@ impl Cpu {
     /// Writes a general register for tests.
     pub fn set_reg_for_test(&mut self, index: u8, value: u32) {
         self.regs[(index & 0xF) as usize] = value;
+    }
+
+    /// Raw GPR read for the BIOS-call HLE (arguments in r0-r3).
+    pub(crate) fn gpr(&self, index: u8) -> u32 {
+        self.reg_for_test(index)
+    }
+
+    /// Raw GPR write for the BIOS-call HLE (results in r0-r3).
+    pub(crate) fn set_gpr(&mut self, index: u8, value: u32) {
+        self.set_reg_for_test(index, value);
+    }
+
+    /// Charges HLE cycle cost onto the coarse cycle counter.
+    pub(crate) fn charge(&mut self, cycles: u32) {
+        self.cycles += u64::from(cycles);
+    }
+
+    /// Enters the halt state (BIOS HLE: SWI 02h Halt passes `None`,
+    /// SWI 04h IntrWait passes the waited flag mask).
+    pub(crate) fn halt(&mut self, wait: Option<u16>) {
+        self.halt = match wait {
+            Some(m) => Halt::Wait(m),
+            None => Halt::Any,
+        };
+    }
+
+    /// Executes a BIOS SoftReset (GBATEK SWI 00h): zeroes r0-r12, the
+    /// banked LR/SPSR of every mode, and the 200h-byte IWRAM tail was
+    /// cleared by the caller; installs the documented stack pointers,
+    /// enters System mode with IRQs masked (the real reset path runs
+    /// with IRQs disabled), and redirects to the reset entry: ROM when
+    /// the IWRAM flag byte is zero, else EWRAM, always in ARM state.
+    pub(crate) fn soft_reset(&mut self, flag: u8) {
+        self.regs = [0; 16];
+        self.r8_12_normal = [0; 5];
+        self.r8_12_fiq = [0; 5];
+        self.sp = [[0; 2]; BANK_COUNT];
+        self.spsr = [0; BANK_COUNT];
+        self.sp[bank_index(Bank::Irq)][0] = 0x0300_7FA0;
+        self.sp[bank_index(Bank::Svc)][0] = 0x0300_7FE0;
+        self.sp[bank_index(Bank::Usr)][0] = 0x0300_7F00;
+        self.switch_mode(Mode::System);
+        self.cpsr |= 0x80;
+        self.pc = if flag == 0 { 0x0800_0000 } else { 0x0200_0000 };
+    }
+
+    /// Enables or disables BIOS-call HLE. On by default: SWI executes
+    /// the HLE module instead of vectoring into the (zero-filled) BIOS
+    /// array. `System::with_bios` disables it; tests that exercise the
+    /// exception-entry path itself disable it too.
+    pub fn set_bios_hle(&mut self, hle: bool) {
+        self.bios_hle = hle;
     }
 
     /// The raw SPSR of the current mode; `None` in User/System.
@@ -503,21 +573,6 @@ fn sub_with_borrow(a: u32, b: u32, borrow: bool) -> (u32, bool, bool) {
     (res, c, v)
 }
 
-/// Region-default access cost in cycles (GBATEK bus-width table,
-/// default waitstates): "coarse" because sequential/overlapped timing
-/// and WAITCNT are not modeled yet. Shared with the DMA engine.
-pub(crate) fn access_cycles(bus: &Bus, addr: u32, width: u8) -> u32 {
-    match (bus.region_of(addr), width) {
-        (crate::bus::Region::Ewram, _) => 3,
-        (crate::bus::Region::Rom, 4) => 8,
-        (crate::bus::Region::Rom, 2) => 5,
-        (crate::bus::Region::Rom, _) => 5,
-        (crate::bus::Region::Sram, _) => 5,
-        (crate::bus::Region::Palette | crate::bus::Region::Vram, 4) => 2,
-        _ => 1,
-    }
-}
-
 impl Cpu {
     /// Executes one instruction at `self.pc` in the state selected by
     /// the T bit, accumulating coarse cycles. Undefined encodings take
@@ -532,6 +587,27 @@ impl Cpu {
             self.irq_hle_return();
             return (self.cycles - before) as u32;
         }
+        if self.halt != Halt::None {
+            let mask = match self.halt {
+                Halt::Wait(m) => m,
+                _ => 0xFFFF,
+            };
+            if bus.int_enable() & bus.int_flags() & mask != 0 {
+                let was_wait = matches!(self.halt, Halt::Wait(_));
+                self.halt = Halt::None;
+                if was_wait {
+                    // IntrWait clears the waited flags in the BIOS
+                    // interrupt-flag word on return (GBATEK SWI 04h).
+                    let flags = bus.read_u16(crate::swi::BIOS_INTR_FLAGS);
+                    bus.write_u16(crate::swi::BIOS_INTR_FLAGS, flags & !mask);
+                }
+            } else {
+                // The halted CPU draws no instructions; the system
+                // driver still advances hardware by the charged cycle.
+                self.cycles += 1;
+                return (self.cycles - before) as u32;
+            }
+        }
         if self.irq_line && self.cpsr & 0x80 == 0 {
             // IRQ entry: the not-yet-executed instruction at `self.pc`
             // is not executed. The return address is saved in ARM-style
@@ -539,7 +615,7 @@ impl Cpu {
             // performed by CPU when entering an exception") so
             // `subs pc, lr, #4` re-executes it.
             let width = if self.cpsr & 0x20 != 0 { 2 } else { 4 };
-            self.cycles += u64::from(access_cycles(bus, self.pc, width));
+            self.cycles += u64::from(bus.access_cost(self.pc, width));
             self.take_irq(bus);
             return (self.cycles - before) as u32;
         }
@@ -611,7 +687,7 @@ impl Cpu {
 
     /// One ARM-state instruction.
     fn step_arm(&mut self, bus: &mut Bus) {
-        self.cycles += u64::from(access_cycles(bus, self.pc, 4));
+        self.cycles += u64::from(bus.fetch_cost(self.pc, 4));
         let word = bus.read_u32(self.pc);
         let start_pc = self.pc;
         let cond = Condition::from_bits((word >> 28) as u8);
@@ -638,7 +714,7 @@ impl Cpu {
     /// One THUMB-state instruction: a 16-bit fetch (plus the following
     /// halfword, which only BL consumes) decoded by [`decode_thumb`].
     fn step_thumb(&mut self, bus: &mut Bus) {
-        self.cycles += u64::from(access_cycles(bus, self.pc, 2));
+        self.cycles += u64::from(bus.fetch_cost(self.pc, 2));
         let first = bus.read_u16(self.pc);
         let next = bus.read_u16(self.pc.wrapping_add(2));
         let start_pc = self.pc;
@@ -733,7 +809,7 @@ impl Cpu {
             }
             ArmInstr::Swap { byte, rd, rn, rm } => {
                 let addr = self.reg(rn);
-                self.cycles += u64::from(access_cycles(bus, addr, if byte { 1 } else { 4 }));
+                self.cycles += u64::from(bus.access_cost(addr, if byte { 1 } else { 4 }));
                 if byte {
                     let tmp = bus.read_u8(addr);
                     bus.write_u8(addr, self.reg(rm) as u8);
@@ -827,9 +903,15 @@ impl Cpu {
                 }
                 Flow::Handled
             }
-            ArmInstr::SoftwareInterrupt { .. } => {
-                let lr = self.pc.wrapping_add(4);
-                self.exception(Mode::Supervisor, lr, 0x08, false);
+            ArmInstr::SoftwareInterrupt { imm24 } => {
+                if self.bios_hle {
+                    if crate::swi::execute(self, bus, imm24) {
+                        self.pc = self.pc.wrapping_add(4);
+                    }
+                } else {
+                    let lr = self.pc.wrapping_add(4);
+                    self.exception(Mode::Supervisor, lr, 0x08, false);
+                }
                 Flow::Handled
             }
             ArmInstr::Undefined { .. } => {
@@ -1060,7 +1142,7 @@ impl Cpu {
         } else {
             base
         };
-        self.cycles += u64::from(access_cycles(bus, addr, if byte { 1 } else { 4 }));
+        self.cycles += u64::from(bus.access_cost(addr, if byte { 1 } else { 4 }));
         let mut flow = Flow::Sequential;
         if load {
             let value = if byte {
@@ -1129,7 +1211,7 @@ impl Cpu {
         } else {
             base
         };
-        self.cycles += u64::from(access_cycles(bus, addr, 2));
+        self.cycles += u64::from(bus.access_cost(addr, 2));
         let mut flow = Flow::Sequential;
         match kind {
             HalfwordKind::Strh => {
@@ -1254,7 +1336,7 @@ impl Cpu {
             if !transfer {
                 continue;
             }
-            self.cycles += u64::from(access_cycles(bus, addr, 4));
+            self.cycles += u64::from(bus.access_cost(addr, 4));
             if load {
                 let value = bus.read_u32(addr);
                 if r == Register::Pc {
@@ -1521,7 +1603,7 @@ impl Cpu {
             },
             ThumbInstr::PcRelativeLoad { rd, offset } => {
                 let addr = ((self.pc.wrapping_add(4)) & !3) + u32::from(offset) * 4;
-                self.cycles += u64::from(access_cycles(bus, addr, 4)) + 1;
+                self.cycles += u64::from(bus.access_cost(addr, 4)) + 1;
                 self.regs[rd.bits() as usize] = bus.read_u32(addr);
                 Flow::Sequential
             }
@@ -1615,10 +1697,16 @@ impl Cpu {
                     Flow::Sequential
                 }
             }
-            ThumbInstr::SoftwareInterrupt { value: _ } => {
-                // THUMB SWI: R14_svc = PC+2, vector 0x08, F unchanged
-                // (GBATEK THUMB.17 "Execution SWI/BKPT").
-                self.exception(Mode::Supervisor, self.pc.wrapping_add(2), 0x08, false);
+            ThumbInstr::SoftwareInterrupt { value } => {
+                if self.bios_hle {
+                    if crate::swi::execute(self, bus, u32::from(value)) {
+                        self.pc = self.pc.wrapping_add(2);
+                    }
+                } else {
+                    // THUMB SWI: R14_svc = PC+2, vector 0x08, F
+                    // unchanged (GBATEK THUMB.17 "Execution SWI/BKPT").
+                    self.exception(Mode::Supervisor, self.pc.wrapping_add(2), 0x08, false);
+                }
                 Flow::Handled
             }
             ThumbInstr::UnconditionalBranch { offset } => {
@@ -1675,20 +1763,20 @@ impl Cpu {
     ) {
         match kind {
             ThumbMemOp::Str => {
-                self.cycles += u64::from(access_cycles(bus, addr, 4));
+                self.cycles += u64::from(bus.access_cost(addr, 4));
                 bus.write_u32(addr, self.regs[rd.bits() as usize]);
             }
             ThumbMemOp::Ldr => {
-                self.cycles += u64::from(access_cycles(bus, addr, 4));
+                self.cycles += u64::from(bus.access_cost(addr, 4));
                 self.regs[rd.bits() as usize] =
                     bus.read_u32(addr & !3).rotate_right((addr & 3) * 8);
             }
             ThumbMemOp::Strb => {
-                self.cycles += u64::from(access_cycles(bus, addr, 1));
+                self.cycles += u64::from(bus.access_cost(addr, 1));
                 bus.write_u8(addr, self.regs[rd.bits() as usize] as u8);
             }
             ThumbMemOp::Ldrb => {
-                self.cycles += u64::from(access_cycles(bus, addr, 1));
+                self.cycles += u64::from(bus.access_cost(addr, 1));
                 self.regs[rd.bits() as usize] = u32::from(bus.read_u8(addr));
             }
         }
@@ -1707,11 +1795,11 @@ impl Cpu {
     ) {
         match kind {
             ThumbSignedMemOp::Strh => {
-                self.cycles += u64::from(access_cycles(bus, addr, 2));
+                self.cycles += u64::from(bus.access_cost(addr, 2));
                 bus.write_u16(addr, self.regs[rd.bits() as usize] as u16);
             }
             ThumbSignedMemOp::Ldrh => {
-                self.cycles += u64::from(access_cycles(bus, addr, 2));
+                self.cycles += u64::from(bus.access_cost(addr, 2));
                 let value = if addr & 1 == 1 {
                     u32::from(bus.read_u16(addr & !1)).rotate_right(8)
                 } else {
@@ -1720,11 +1808,11 @@ impl Cpu {
                 self.regs[rd.bits() as usize] = value;
             }
             ThumbSignedMemOp::Ldsb => {
-                self.cycles += u64::from(access_cycles(bus, addr, 1));
+                self.cycles += u64::from(bus.access_cost(addr, 1));
                 self.regs[rd.bits() as usize] = bus.read_u8(addr) as i8 as i32 as u32;
             }
             ThumbSignedMemOp::Ldsh => {
-                self.cycles += u64::from(access_cycles(bus, addr, 2));
+                self.cycles += u64::from(bus.access_cost(addr, 2));
                 let value = if addr & 1 == 1 {
                     bus.read_u8(addr) as i8 as i32 as u32
                 } else {
@@ -1758,7 +1846,7 @@ impl Cpu {
                 continue;
             }
             let r = Register::from_bits(i as u8);
-            self.cycles += u64::from(access_cycles(bus, addr, 4));
+            self.cycles += u64::from(bus.access_cost(addr, 4));
             if pop {
                 self.regs[r.bits() as usize] = bus.read_u32(addr);
             } else {
@@ -1770,7 +1858,7 @@ impl Cpu {
         if empty {
             // ARMv4: R15 is transferred (stored/loaded at the start
             // address), reading as $+4 like any THUMB operand.
-            self.cycles += u64::from(access_cycles(bus, addr, 4));
+            self.cycles += u64::from(bus.access_cost(addr, 4));
             if pop {
                 self.pc = bus.read_u32(addr) & !1;
                 flow = Flow::Handled;
@@ -1779,7 +1867,7 @@ impl Cpu {
             }
         } else if include_pc_or_lr {
             let tail = if pop { Register::Pc } else { Register::Lr };
-            self.cycles += u64::from(access_cycles(bus, addr, 4));
+            self.cycles += u64::from(bus.access_cost(addr, 4));
             if pop {
                 // POP {PC} ignores bit 0 and stays in THUMB state
                 // (GBATEK THUMB.14 note).
@@ -1823,7 +1911,7 @@ impl Cpu {
                 continue;
             }
             let r = Register::from_bits(i as u8);
-            self.cycles += u64::from(access_cycles(bus, addr, 4));
+            self.cycles += u64::from(bus.access_cost(addr, 4));
             if load {
                 let value = bus.read_u32(addr);
                 if r == rb {
@@ -1848,7 +1936,7 @@ impl Cpu {
         if empty {
             // ARMv4: R15 is transferred at the start address, reading
             // as $+4 like any THUMB operand; the base moves by 0x40.
-            self.cycles += u64::from(access_cycles(bus, addr, 4));
+            self.cycles += u64::from(bus.access_cost(addr, 4));
             if load {
                 self.pc = bus.read_u32(addr) & !1;
             } else {

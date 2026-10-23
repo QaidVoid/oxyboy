@@ -8,5 +8,6 @@ pub mod dma;
 pub mod input;
 pub mod ppu;
 pub mod save;
+mod swi;
 pub mod system;
 pub mod timer;

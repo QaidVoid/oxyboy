@@ -8,8 +8,9 @@
 //! adjust is inc+reload), so later register writes do not affect an
 //! armed channel. A word count of 0 means the channel maximum.
 //! Transfers are synchronous and run in channel order (channel 0 has
-//! highest priority); cycle charging is the coarse per-access model,
-//! not the full GBATEK timing window.
+//! highest priority); cycle charging follows the WAITCNT waitstate
+//! model on [`Bus::access_cost`] (GBATEK WAITCNT), not the full
+//! timing window.
 
 use crate::bus::Bus;
 
@@ -179,8 +180,8 @@ impl Dma {
             bus.save_mut().announce_eeprom_stream(count as u8);
         }
         for _ in 0..count {
-            cycles += crate::cpu::access_cycles(bus, sad, unit as u8);
-            cycles += crate::cpu::access_cycles(bus, dad, unit as u8);
+            cycles += bus.access_cost(sad, unit as u8);
+            cycles += bus.access_cost(dad, unit as u8);
             if unit == 4 {
                 let v = bus.read_u32(sad);
                 bus.write_u32(dad, v);
