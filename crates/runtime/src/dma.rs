@@ -116,12 +116,29 @@ impl Dma {
         self.run(bus, DmaTiming::Immediate)
     }
 
+    /// Runs the sound-FIFO drains the APU requested (bit 0 = FIFO A,
+    /// bit 1 = FIFO B): DMA channel 1 feeds FIFO A and channel 2
+    /// feeds FIFO B when enabled in special timing (GBATEK
+    /// "DMA-Sound Playback Procedure"). The charged cycles are not
+    /// added to the clock (the refill is synchronous with the timer
+    /// latch, under the coarse timing model).
+    pub(super) fn sound_refill(&mut self, bus: &mut Bus, requests: u8) {
+        for (ch, fifo_bit) in [(1usize, 0u8), (2usize, 1u8)] {
+            let cnt_h = bus.io_half(CNT_H[ch]);
+            if requests & (1 << fifo_bit) == 0
+                || cnt_h & 0x8000 == 0
+                || ((cnt_h >> 8) & 0x0003) as u8 != DmaTiming::Special as u8
+            {
+                continue;
+            }
+            self.transfer(bus, ch);
+        }
+    }
+
     /// Executes one channel transfer and returns the charged cycles.
     fn transfer(&mut self, bus: &mut Bus, ch: usize) -> u32 {
         let cnt_h = bus.io_half(CNT_H[ch]);
         let timing = ((cnt_h >> 8) & 0x0003) as u8;
-        let dst_adj = (cnt_h & 0x0003) as u8;
-        let src_adj = ((cnt_h >> 2) & 0x0003) as u8;
         let repeat = cnt_h & 0x0010 != 0;
         let irq_on_complete = cnt_h & 0x4000 != 0;
 
@@ -132,6 +149,11 @@ impl Dma {
         let fifo = timing == DmaTiming::Special as u8 && (1..=2).contains(&ch);
         let unit: u32 = if fifo || cnt_h & 0x0020 != 0 { 4 } else { 2 };
         let count = if fifo { 4 } else { self.channels[ch].count };
+        // FIFO drains write a fixed address regardless of the CNT_H
+        // destination adjust bits (GBATEK: "the destination address
+        // will not be incremented in FIFO mode").
+        let dst_adj = if fifo { 0b10 } else { (cnt_h & 0x0003) as u8 };
+        let src_adj = ((cnt_h >> 2) & 0x0003) as u8;
         let mut sad = self.channels[ch].sad;
         let mut dad = if fifo {
             FIFO_ADDR[ch]
@@ -166,11 +188,12 @@ impl Dma {
         cycles += count * 2; // DMA internal overhead, coarse model
 
         // End-of-transfer state: the latched addresses carry the final
-        // positions into the next repeat trigger.
-        if !fifo {
-            self.channels[ch].sad = sad;
-            self.channels[ch].dad = dad;
-        }
+        // positions into the next repeat trigger, so a FIFO drain's
+        // source keeps advancing across refills (only count and, for
+        // inc+reload, the destination re-latch per GBATEK repeat
+        // rules; the FIFO drain destination is fixed anyway).
+        self.channels[ch].sad = sad;
+        self.channels[ch].dad = dad;
 
         if irq_on_complete {
             bus.raise_if(0x0100 << ch);

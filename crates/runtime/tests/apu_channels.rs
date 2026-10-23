@@ -31,12 +31,18 @@ fn bus_with_sound() -> Bus {
 }
 
 /// Wave RAM bank `bank` (0 or 1) filled with the nibble pattern
-/// `v, v, v+1, v+1, ...` (two equal nibbles per byte).
+/// `v, v, v+1, v+1, ...` (two equal nibbles per byte). The CPU window
+/// at 0x090 addresses the bank NOT selected by NR30 bit 6 (GBATEK
+/// SOUND3CNT_L), so the helper flips the selection while writing.
 fn set_wave_ram(bus: &mut Bus, bank: u32, down: bool) {
+    let nr30 = bus.read_u16(BASE + 0x070);
+    let sel = if bank == 0 { 0x0040u16 } else { 0 };
+    bus.write_u16(BASE + 0x070, (nr30 & !0x0040) | sel);
     for i in 0..16u32 {
         let n = if down { 15 - i as u8 } else { i as u8 };
-        bus.write_u8(BASE + 0x090 + bank * 16 + i, (n << 4) | n);
+        bus.write_u8(BASE + 0x090 + i, (n << 4) | n);
     }
+    bus.write_u16(BASE + 0x070, nr30);
 }
 
 /// Steps `frames` frames and drains the captured samples.

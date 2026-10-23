@@ -18,21 +18,44 @@
 //! `7.8ms` units); the 8-step table follows Pan Docs. The mixer emits
 //! one stereo sample pair every 512 cycles (32768 Hz, the SOUNDBIAS
 //! default resolution); a sequencer step lands on every 64th sample
-//! and takes effect on the sample after the tick. Channel outputs are
-//! 4-bit levels; a side mix (sum of the channels NR51 routes to that
-//! side) is scaled by the NR50 volume (1..8) and the SOUNDCNT_H PSG
-//! volume (25/50/100 percent, code 3 treated as 100) and stored as
-//! `mix * vol * percent * 8` in i16 (full scale 15360). Sub-step
-//! remainders carry across [`Bus::step_apu`](crate::bus::Bus::step_apu)
-//! calls, so captures are exact for any step granularity.
+//! and takes effect on the sample after the tick.
 //!
-//! Documented simplifications: wave RAM is directly mapped (bank 0 at
-//! 0x090, bank 1 at 0x0A0) with no shift-register read corruption
+//! Sample values. The captured i16 is 30x the hardware 10-bit output
+//! count as a signed deviation from the bias midpoint: a full-level
+//! PSG spans +-128 counts (GBATEK: each PSG spans one quarter of the
+//! +-200h output range), a FIFO channel +-512 counts (signed 8-bit
+//! sample x 4, scaled 50/100 percent by SOUNDCNT_H bits 2-3), and the
+//! SOUNDBIAS level shifts the whole signal (default 100h = no shift).
+//! The summed sides clamp at the 10-bit rails (GBATEK: values outside
+//! 0..3FFh are clipped). A PSG side mix is the sum of the channels
+//! NR51 routes to that side, scaled by the NR50 volume (1..8) and the
+//! SOUNDCNT_H PSG volume (25/50/100 percent, code 3 treated as 100)
+//! times 8. Sub-step remainders carry across
+//! [`Bus::step_apu`](crate::bus::Bus::step_apu) calls, so captures are
+//! exact for any step granularity.
+//!
+//! FIFO channels A/B: each queue holds 32 bytes (GBATEK: 8x32-bit);
+//! writes append bytes LSB first, a timer 0/1 overflow latches the
+//! oldest byte into the sample register (held when the queue is
+//! empty), and a queue dropping to 16 bytes requests a 16-byte DMA
+//! refill (GBATEK "DMA-Sound Playback Procedure"). Writes to a full
+//! queue drop the oldest bytes (shift-register model; GBATEK is
+//! silent).
+//!
+//! Wave channels: WAVE_RAM is 16 CPU-visible bytes (0x090..0x09F)
+//! over two 16-byte banks; NR30 bit 6 selects which bank plays and
+//! the CPU window addresses the OTHER bank (GBATEK NR30: "the
+//! currently selected Bank Number will be played back, while
+//! reading/writing to/from wave RAM will address the other bank").
+//! In 64-digit mode playback runs the selected bank first and then
+//! the other. The master-enable reset keeps FIFO and wave-RAM state,
+//! as SOUNDCNT_H and WAVE_RAM are outside the reset range.
+//!
+//! Documented simplifications: no shift-register read corruption
 //! while the channel plays; register writes land at step-call
 //! granularity; the DAC pass is linear rather than the hardware's
-//! capacitor curve; SOUNDBIAS is not applied; and
-//! the DMG trigger-time sweep overflow pre-check when the shift is
-//! nonzero is not modeled.
+//! capacitor curve; and the DMG trigger-time sweep overflow pre-check
+//! when the shift is nonzero is not modeled.
 
 use crate::bus::Bus;
 
@@ -55,7 +78,52 @@ const NR43_NR44: u32 = 0x07C;
 const NR50_NR51: u32 = 0x080;
 const SOUNDCNT_H: u32 = 0x082;
 const SOUNDCNT_X: u32 = 0x084;
-const WAVE_RAM: u32 = 0x090;
+const SOUNDBIAS: u32 = 0x088;
+
+/// FIFO queue capacity in bytes (GBATEK: 8x32-bit).
+const FIFO_CAPACITY: usize = 32;
+/// The FIFO refill request level in bytes (GBATEK playback procedure:
+/// request a 16-byte DMA when only 4x32-bit remain).
+const FIFO_REFILL_LEVEL: usize = 16;
+
+/// One FIFO sound queue plus its current sample register.
+#[derive(Default)]
+struct Fifo {
+    bytes: [u8; FIFO_CAPACITY],
+    /// Index of the oldest queued byte.
+    head: usize,
+    len: usize,
+    /// The most recently latched byte; held while the queue is empty.
+    last: u8,
+}
+
+impl Fifo {
+    /// Appends one byte; a full queue drops the oldest byte.
+    fn push(&mut self, byte: u8) {
+        if self.len == FIFO_CAPACITY {
+            self.head = (self.head + 1) % FIFO_CAPACITY;
+            self.len -= 1;
+        }
+        let tail = (self.head + self.len) % FIFO_CAPACITY;
+        self.bytes[tail] = byte;
+        self.len += 1;
+    }
+
+    /// Latches the oldest byte into the sample register; an empty
+    /// queue keeps the previous sample.
+    fn pop(&mut self) {
+        if self.len > 0 {
+            self.last = self.bytes[self.head];
+            self.head = (self.head + 1) % FIFO_CAPACITY;
+            self.len -= 1;
+        }
+    }
+
+    fn clear(&mut self) {
+        self.head = 0;
+        self.len = 0;
+    }
+}
 
 /// Length counter, envelope, and sweep state for one square channel.
 /// The sweep fields are latched at restart and inert on channel 2
@@ -151,6 +219,11 @@ pub struct Apu {
     seq_step: u8,
     /// Interleaved stereo samples (left, right) awaiting capture.
     samples: Vec<i16>,
+    /// FIFO sound channels A and B.
+    fifo: [Fifo; 2],
+    /// Wave RAM: two 16-byte banks; the CPU window addresses the bank
+    /// not being played (NR30 bit 6 selects playback).
+    wave_ram: [[u8; 16]; 2],
 }
 
 impl Default for Apu {
@@ -204,15 +277,23 @@ impl Apu {
             seq_acc: 0,
             seq_step: 0,
             samples: Vec::new(),
+            fifo: [Fifo::default(), Fifo::default()],
+            wave_ram: [[0; 16]; 2],
         }
     }
 
     /// Restores the power-on channel state (SOUNDCNT_X master disable),
-    /// preserving any already-mixed samples in the capture buffer.
+    /// preserving the capture buffer and the FIFO and wave-RAM state
+    /// (the reset range 0x060..0x081 excludes SOUNDCNT_H and
+    /// WAVE_RAM).
     pub(crate) fn reset(&mut self) {
         let samples = std::mem::take(&mut self.samples);
+        let fifo = std::mem::take(&mut self.fifo);
+        let wave_ram = std::mem::take(&mut self.wave_ram);
         *self = Self::new();
         self.samples = samples;
+        self.fifo = fifo;
+        self.wave_ram = wave_ram;
     }
 
     /// Latches a channel-1 or channel-2 restart from the just-written
@@ -276,6 +357,48 @@ impl Apu {
     /// Drains the interleaved stereo sample buffer.
     pub(crate) fn take_samples(&mut self) -> Vec<i16> {
         std::mem::take(&mut self.samples)
+    }
+
+    /// Appends one byte to FIFO `which` (0 = A, 1 = B).
+    pub(crate) fn fifo_push_byte(&mut self, which: usize, byte: u8) {
+        self.fifo[which].push(byte);
+    }
+
+    /// Clears FIFO `which` (SOUNDCNT_H reset bits).
+    pub(crate) fn fifo_clear(&mut self, which: usize) {
+        self.fifo[which].clear();
+    }
+
+    /// The queued byte count of FIFO `which`.
+    pub(crate) fn fifo_len(&self, which: usize) -> usize {
+        self.fifo[which].len
+    }
+
+    /// One CPU-window wave RAM byte at `offset` (0..16) of `bank`.
+    pub(crate) fn wave_cpu_byte(&self, bank: usize, offset: u32) -> u8 {
+        self.wave_ram[bank][(offset & 0xF) as usize]
+    }
+
+    /// Stores one CPU-window wave RAM byte at `offset` (0..16).
+    pub(crate) fn wave_cpu_set_byte(&mut self, bank: usize, offset: u32, value: u8) {
+        self.wave_ram[bank][(offset & 0xF) as usize] = value;
+    }
+
+    /// Latches one byte per FIFO whose SOUNDCNT_H timer select
+    /// (`a_select`/`b_select`, 0 or 1) matches the overflowing timer,
+    /// returning a bitmask of FIFOs that now want a DMA refill.
+    pub(crate) fn timer_latch(&mut self, timer: usize, a_select: usize, b_select: usize) -> u8 {
+        let mut requests = 0u8;
+        for (which, select) in [(0usize, a_select), (1usize, b_select)] {
+            if select != timer {
+                continue;
+            }
+            self.fifo[which].pop();
+            if self.fifo[which].len <= FIFO_REFILL_LEVEL {
+                requests |= 1 << which;
+            }
+        }
+        requests
     }
 
     /// Advances the APU by `cycles` system cycles, mixing whole
@@ -430,7 +553,7 @@ impl Apu {
             }
         }
         if self.wave.on && bus.io_half(NR30) & 0x0080 != 0 {
-            let sample = u32::from(wave_nibble(bus, self.wave.pos));
+            let sample = u32::from(self.wave_nibble(bus, self.wave.pos));
             let len_vol = bus.io_half(NR31_NR32);
             outs[2] = if len_vol & 0x8000 != 0 {
                 // NR32 bit 15 forces 75% regardless of the volume code.
@@ -450,8 +573,55 @@ impl Apu {
         outs
     }
 
+    /// The 4-bit wave sample at playback position `pos`: nibbles play
+    /// MSB first within each byte (GBATEK "WAVE_RAM"); dimension bit 5
+    /// extends playback to 64 samples, running the NR30 bank first and
+    /// then the other bank.
+    fn wave_nibble(&self, bus: &Bus, pos: u8) -> u8 {
+        let nr30 = bus.io_half(NR30);
+        let play = ((nr30 >> 6) & 1) as usize;
+        let idx = if nr30 & 0x0020 != 0 { pos } else { pos & 31 };
+        let bank = play ^ usize::from(idx >= 32);
+        let byte = self.wave_ram[bank][(idx & 31) as usize / 2];
+        if idx & 1 == 0 { byte >> 4 } else { byte & 0x0F }
+    }
+
     /// Mixes one stereo sample pair from the live register image.
     fn mix(&self, bus: &Bus) -> (i16, i16) {
+        let (psg_left, psg_right) = self.psg_mix(bus);
+        let mut left = i32::from(psg_left);
+        let mut right = i32::from(psg_right);
+        let cnt_h = bus.io_half(SOUNDCNT_H);
+        if bus.io_half(SOUNDCNT_X) & 0x0080 != 0 {
+            // SOUNDCNT_H bits 2-3: FIFO volume (0=50%, 1=100%). A
+            // signed 8-bit sample spans +-512 output counts, which is
+            // x120 in the capture's 30x count domain.
+            let a = i32::from(self.fifo[0].last as i8);
+            let b = i32::from(self.fifo[1].last as i8);
+            let vol_a = if cnt_h & 0x0004 != 0 { 120 } else { 60 };
+            let vol_b = if cnt_h & 0x0008 != 0 { 120 } else { 60 };
+            if cnt_h & 0x0100 != 0 {
+                right += a * vol_a;
+            }
+            if cnt_h & 0x0200 != 0 {
+                left += a * vol_a;
+            }
+            if cnt_h & 0x1000 != 0 {
+                right += b * vol_b;
+            }
+            if cnt_h & 0x2000 != 0 {
+                left += b * vol_b;
+            }
+        }
+        // SOUNDBIAS bits 1-9 hold the bias level (default 100h = the
+        // 10-bit midpoint 200h, i.e. no shift).
+        let bias = (i32::from((bus.io_half(SOUNDBIAS) >> 1) & 0x1FF) - 0x100) * 60;
+        let clamp = |v: i32| v.clamp(-15360, 15360) as i16;
+        (clamp(left + bias), clamp(right + bias))
+    }
+
+    /// The PSG-only side mixes (zero when the master enable is clear).
+    fn psg_mix(&self, bus: &Bus) -> (i16, i16) {
         if bus.io_half(SOUNDCNT_X) & 0x0080 == 0 {
             return (0, 0);
         }
@@ -504,18 +674,6 @@ fn noise_period(bus: &Bus) -> u32 {
     let r = u32::from(reg & 0x7);
     let s = (reg >> 4) & 0xF;
     (if r == 0 { 16 } else { 32 * r }) << s
-}
-
-/// The 4-bit wave sample at playback position `pos`: nibbles play MSB
-/// first within each byte (GBATEK "WAVE_RAM"); dimension bit 5 extends
-/// playback to 64 samples, running the NR30 bank first and then the
-/// other bank.
-fn wave_nibble(bus: &Bus, pos: u8) -> u8 {
-    let nr30 = bus.io_half(NR30);
-    let idx = if nr30 & 0x0020 != 0 { pos } else { pos & 31 };
-    let bank = ((nr30 >> 6) & 1) ^ u16::from(idx >= 32);
-    let byte = bus.io_byte(WAVE_RAM + u32::from(bank) * 16 + u32::from(idx & 31) / 2);
-    if idx & 1 == 0 { byte >> 4 } else { byte & 0x0F }
 }
 
 #[cfg(test)]
@@ -652,26 +810,64 @@ mod tests {
     #[test]
     fn wave_nibbles_play_msb_first_across_both_banks() {
         let mut bus = bus_with(&[]);
-        bus.write_u16(0x0400_0000 + NR30, 0x0080); // one bank, bank 0
+        let mut apu = Apu::new();
+        apu.wave_cpu_set_byte(1, 0, 0x01);
+        apu.wave_cpu_set_byte(1, 1, 0x23);
+        apu.wave_cpu_set_byte(1, 8, 0x89);
+        // NR30 0x00A0: play, 64-digit dimension, playback selects
+        // bank 0 (GBATEK SOUND3CNT_L), so samples 0..32 run the empty
+        // bank 0.
+        bus.write_u16(0x0400_0000 + NR30, 0x00A0);
+        for pos in [0u8, 1, 2, 3, 31] {
+            assert_eq!(apu.wave_nibble(&bus, pos), 0x0);
+        }
+        // Two-bank dimension: samples 32..64 run bank 1, nibbles MSB
+        // first within each byte.
+        assert_eq!(apu.wave_nibble(&bus, 32), 0x0);
+        assert_eq!(apu.wave_nibble(&bus, 33), 0x1);
+        assert_eq!(apu.wave_nibble(&bus, 34), 0x2);
+        assert_eq!(apu.wave_nibble(&bus, 35), 0x3);
+        assert_eq!(apu.wave_nibble(&bus, 48), 0x8);
+        assert_eq!(apu.wave_nibble(&bus, 49), 0x9);
+
+        // One-bank dimension wraps inside the selected bank.
+        bus.write_u16(0x0400_0000 + NR30, 0x0080);
+        assert_eq!(apu.wave_nibble(&bus, 32), 0x0, "wraps to bank 0 pos 0");
+
+        // Selecting bank 1 plays the pattern from sample 0.
+        bus.write_u16(0x0400_0000 + NR30, 0x00E0);
+        assert_eq!(apu.wave_nibble(&bus, 1), 0x1);
+        assert_eq!(apu.wave_nibble(&bus, 3), 0x3);
+        assert_eq!(apu.wave_nibble(&bus, 17), 0x9);
+    }
+
+    #[test]
+    fn wave_window_addresses_the_non_playing_bank() {
+        let mut bus = bus_with(&[]);
+        // NR30 selects bank 0 for playback, so the CPU window at
+        // 0x090 holds bank 1 (GBATEK SOUND3CNT_L).
+        bus.write_u16(0x0400_0000 + NR30, 0x00A0);
         bus.write_u8(0x0400_0090, 0x01);
         bus.write_u8(0x0400_0091, 0x23);
-        bus.write_u8(0x0400_00A0, 0x89);
-        assert_eq!(wave_nibble(&bus, 0), 0x0);
-        assert_eq!(wave_nibble(&bus, 1), 0x1);
-        assert_eq!(wave_nibble(&bus, 2), 0x2);
-        assert_eq!(wave_nibble(&bus, 3), 0x3);
-        // Position 32+ reads bank 1 only in two-bank mode.
-        assert_eq!(wave_nibble(&bus, 32), 0x0);
+        bus.write_u8(0x0400_0098, 0x89);
+        assert_eq!(bus.read_u8(0x0400_0090), 0x01, "round-trips bank 1");
+        assert_eq!(bus.read_u8(0x0400_0098), 0x89);
+
+        // Selecting bank 1 flips the window to the empty bank 0.
+        bus.write_u16(0x0400_0000 + NR30, 0x00E0);
+        assert_eq!(bus.read_u8(0x0400_0090), 0x00);
+        // Switching back shows the untouched pattern.
         bus.write_u16(0x0400_0000 + NR30, 0x00A0);
-        assert_eq!(wave_nibble(&bus, 32), 0x8);
-        assert_eq!(wave_nibble(&bus, 33), 0x9);
+        assert_eq!(bus.read_u8(0x0400_0090), 0x01);
     }
 
     #[test]
     fn wave_volume_codes_scale_the_sample() {
+        // Playback selects bank 0, which holds constant 15s.
         let mut bus = bus_with(&[(NR30, 0x0080)]);
+        let mut apu = Apu::new();
         for i in 0..16u32 {
-            bus.write_u8(0x0400_0090 + i, 0xFF);
+            apu.wave_cpu_set_byte(0, i, 0xFF);
         }
         for (bits, expected) in [
             (0x0000u16, 0u32),
@@ -682,7 +878,7 @@ mod tests {
         ] {
             bus.write_u16(0x0400_0000 + NR31_NR32, bits);
             let len_vol = read(&bus, NR31_NR32);
-            let sample = u32::from(wave_nibble(&bus, 0));
+            let sample = u32::from(apu.wave_nibble(&bus, 0));
             let got = if len_vol & 0x8000 != 0 {
                 sample * 3 / 4
             } else {
@@ -750,9 +946,10 @@ mod tests {
         // Wave channel playing a constant 15 with routing to both
         // sides: sample = 15 * vol(8) * master(4) * 8 = 3840. NR50
         // (volumes) is the low byte of 0x080, NR51 (routing) the high
-        // byte: ch3 right = bit 10, ch3 left = bit 14.
+        // byte: ch3 right = bit 10, ch3 left = bit 14. Playback
+        // selects bank 1 while the CPU window fills bank 0.
         let mut bus = bus_with(&[
-            (NR30, 0x0080),
+            (NR30, 0x00C0),
             (NR31_NR32, 0x2000),
             (NR33_NR34, 0x8000 | 1792),
             (NR50_NR51, 0x77 | 0x4400),
@@ -761,26 +958,25 @@ mod tests {
         for i in 0..16u32 {
             bus.write_u8(0x0400_0090 + i, 0xFF);
         }
-        let mut apu = Apu::new();
-        apu.restart_wave(read(&bus, NR31_NR32));
-        apu.step(&mut bus, SAMPLE_PERIOD);
-        assert_eq!(apu.take_samples(), [3840, 3840]);
+        bus.write_u16(0x0400_0000 + NR30, 0x0080); // play bank 0
+        bus.step_apu(SAMPLE_PERIOD);
+        assert_eq!(bus.take_audio(), [3840, 3840]);
 
         // Right side only: left is silent.
         bus.write_u16(0x0400_0000 + NR50_NR51, 0x77 | 0x0400);
-        apu.step(&mut bus, SAMPLE_PERIOD);
-        assert_eq!(apu.take_samples(), [0, 3840]);
+        bus.step_apu(SAMPLE_PERIOD);
+        assert_eq!(bus.take_audio(), [0, 3840]);
 
         // SOUNDCNT_H 25 percent: 15 * 8 * 1 * 8 = 960.
         bus.write_u16(0x0400_0000 + NR50_NR51, 0x77 | 0x4400);
         bus.write_u16(0x0400_0000 + SOUNDCNT_H, 0x0000);
-        apu.step(&mut bus, SAMPLE_PERIOD);
-        assert_eq!(apu.take_samples(), [960, 960]);
+        bus.step_apu(SAMPLE_PERIOD);
+        assert_eq!(bus.take_audio(), [960, 960]);
 
         // Master disable mixes silence.
         bus.write_u16(0x0400_0000 + SOUNDCNT_X, 0x0000);
-        apu.step(&mut bus, SAMPLE_PERIOD);
-        assert_eq!(apu.take_samples(), [0, 0]);
+        bus.step_apu(SAMPLE_PERIOD);
+        assert_eq!(bus.take_audio(), [0, 0]);
     }
 
     #[test]
@@ -833,5 +1029,139 @@ mod tests {
         // clears and the strobe stores as zero, leaving freq 100.
         bus.write_u8(0x0400_0065, 0x80);
         assert_eq!(read(&bus, NR13_NR14), 100);
+    }
+
+    #[test]
+    fn fifo_queues_bytes_lsb_first_and_holds_the_last_sample() {
+        // A 32-bit write appends four bytes, data 0 replayed first.
+        let mut bus = bus_with(&[
+            // A at 100 percent on both sides.
+            (SOUNDCNT_H, 0x0002 | 0x0004 | 0x0300),
+        ]);
+        bus.write_u32(0x0400_00A0, 0x4433_2211);
+        bus.write_u8(0x0400_00A1, 0x55);
+        assert_eq!(bus.fifo_len(0), 5);
+
+        // Each timer 0 overflow latches the oldest byte into the
+        // sample register; the mix emits it on both sides.
+        let mut got = Vec::new();
+        for _ in 0..6 {
+            bus.apu_timer_latch(0);
+            bus.step_apu(SAMPLE_PERIOD);
+            let s = bus.take_audio();
+            got.push(s[0]);
+            assert_eq!(s[1], s[0], "routed to both sides");
+        }
+        // 17,34,51,68,85 latched in order, then the empty queue holds
+        // the last sample (85 * 120).
+        assert_eq!(got, [2040, 4080, 6120, 8160, 10200, 10200]);
+    }
+
+    #[test]
+    fn fifo_capacity_drops_oldest_and_reset_bits_clear() {
+        let mut bus = bus_with(&[(SOUNDCNT_H, 0x0008 | 0x3000 | 0x4000)]); // B 100%, timer 1
+        for i in 0..34u32 {
+            bus.write_u8(0x0400_00A4, i as u8);
+        }
+        assert_eq!(bus.fifo_len(1), 32, "capacity 32");
+
+        bus.apu_timer_latch(1);
+        bus.step_apu(SAMPLE_PERIOD);
+        // The oldest two bytes were dropped: 2 * 120 = 240.
+        assert_eq!(bus.take_audio(), [240, 240]);
+
+        // Preload FIFO A, then SOUNDCNT_H bit 15 resets FIFO B only.
+        bus.write_u8(0x0400_00A0, 0x7F);
+        bus.write_u16(0x0400_0082, 0x8000 | 0x0008 | 0x3000 | 0x4000);
+        assert_eq!(bus.fifo_len(1), 0);
+        assert_eq!(bus.fifo_len(0), 1, "bit 15 resets FIFO B only");
+    }
+
+    #[test]
+    fn timer_selects_route_latches_and_request_refills() {
+        let mut apu = Apu::new();
+        for _ in 0..4 {
+            apu.fifo_push_byte(0, 0x01);
+            apu.fifo_push_byte(1, 0x02);
+        }
+        // A on timer 0, B on timer 1: a timer 0 overflow pops A only
+        // and its queue of 3 requests a refill; timer 1 pops B only.
+        assert_eq!(apu.timer_latch(0, 0, 1), 0x1, "A queue at 3 wants refill");
+        assert_eq!(apu.fifo[0].last, 0x01);
+        assert_eq!(apu.fifo[1].last, 0);
+        assert_eq!(apu.timer_latch(1, 0, 1), 0x2, "B queue at 3 wants refill");
+        assert_eq!(apu.fifo[1].last, 0x02);
+        assert_eq!(apu.fifo[0].last, 0x01);
+        // A queue above the refill level requests nothing.
+        for i in 0..20u8 {
+            apu.fifo_push_byte(0, i);
+        }
+        assert_eq!(apu.timer_latch(0, 0, 1), 0x0);
+    }
+
+    #[test]
+    fn fifo_samples_scale_route_and_clamp() {
+        let mut bus = bus_with(&[
+            // SOUNDCNT_H: PSG 100 percent, A 100 percent, A right only.
+            (SOUNDCNT_H, 0x0002 | 0x0004 | 0x0100),
+        ]);
+        bus.write_u8(0x0400_00A0, 0x7F);
+        bus.apu_timer_latch(0);
+        bus.step_apu(SAMPLE_PERIOD);
+        // 127 * 120 = 15240 on the right, silence on the left.
+        assert_eq!(bus.take_audio(), [0, 15240]);
+
+        // 50 percent halves the scale: -128 * 60 = -7680.
+        bus.write_u16(0x0400_0082, 0x0002 | 0x0100);
+        bus.write_u8(0x0400_00A0, 0x80);
+        bus.apu_timer_latch(0);
+        bus.step_apu(SAMPLE_PERIOD);
+        assert_eq!(bus.take_audio(), [0, -7680]);
+
+        // Routing to the left side moves the signal.
+        bus.write_u16(0x0400_0082, 0x0002 | 0x0004 | 0x0200);
+        bus.write_u8(0x0400_00A0, 0x7F);
+        bus.apu_timer_latch(0);
+        bus.step_apu(SAMPLE_PERIOD);
+        assert_eq!(bus.take_audio(), [15240, 0]);
+
+        // The bias shifts the output: SOUNDBIAS 0300h is +256 output
+        // counts over the 200h midpoint = 7680 in the capture domain.
+        bus.write_u16(0x0400_0088, 0x0300);
+        bus.write_u8(0x0400_00A0, 0x00);
+        bus.apu_timer_latch(0);
+        bus.step_apu(SAMPLE_PERIOD);
+        assert_eq!(bus.take_audio(), [7680, 7680]);
+
+        // The rails clip: max FIFO plus max PSG stays at 15360.
+        bus.write_u16(0x0400_0082, 0x0002 | 0x0004 | 0x0100);
+        bus.write_u16(0x0400_0088, 0x0200);
+        bus.write_u16(0x0400_0068, 0xF080); // ch2 duty 50, vol 15
+        bus.write_u16(0x0400_0080, 0x77 | 0x0200); // ch2 right
+        bus.write_u16(0x0400_006C, 0x8000 | 512); // restart ch2
+        bus.write_u8(0x0400_00A0, 0x7F);
+        bus.apu_timer_latch(0);
+        bus.step_apu(SAMPLE_PERIOD);
+        assert_eq!(bus.take_audio()[1], 15360, "clamped at the rail");
+    }
+
+    #[test]
+    fn master_off_outputs_the_bias_level_and_keeps_fifo_state() {
+        let mut bus = bus_with(&[]);
+        bus.write_u32(0x0400_00A0, 0x7F7F_7F7F);
+        assert_eq!(bus.fifo_len(0), 4);
+
+        // Master disable resets the PSG image but keeps the FIFO (the
+        // reset range 0x060..0x081 excludes SOUNDCNT_H and WAVE_RAM).
+        bus.write_u16(0x0400_0084, 0x0000);
+        assert_eq!(bus.fifo_len(0), 4, "FIFO state survives");
+        bus.step_apu(SAMPLE_PERIOD);
+        assert_eq!(bus.take_audio(), [0, 0], "silence at the default bias");
+
+        // A non-default bias shows as a DC level even with sound off
+        // (GBATEK: SOUNDBIAS works while the master enable is clear).
+        bus.write_u16(0x0400_0088, 0x0300);
+        bus.step_apu(SAMPLE_PERIOD);
+        assert_eq!(bus.take_audio(), [7680, 7680]);
     }
 }

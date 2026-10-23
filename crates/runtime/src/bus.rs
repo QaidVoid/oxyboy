@@ -94,7 +94,7 @@ impl Bus {
         } else {
             rom.len().next_power_of_two() - 1
         };
-        Bus {
+        let mut bus = Bus {
             bios: vec![0; 0x4000].into_boxed_slice(),
             ewram: vec![0; EWRAM_SIZE].into_boxed_slice(),
             iwram: vec![0; IWRAM_SIZE].into_boxed_slice(),
@@ -108,7 +108,11 @@ impl Bus {
             dma: Dma::default(),
             timers: Timers::default(),
             apu: Apu::new(),
-        }
+        };
+        // SOUNDBIAS resets to 0200h: bias level 100h, the 10-bit output
+        // midpoint (GBATEK SOUNDBIAS).
+        bus.io[0x089] = 0x02;
+        bus
     }
 
     /// Classifies a logical address into its bus region.
@@ -170,6 +174,10 @@ impl Bus {
                     // channel-active flags are live APU state (GBATEK
                     // SOUNDCNT_X).
                     (self.io[off as usize] & 0x80) | self.apu.active_mask()
+                } else if (0x090..0x0A0).contains(&off) {
+                    // The WAVE_RAM window addresses the bank not being
+                    // played (GBATEK SOUND3CNT_L).
+                    self.apu.wave_cpu_byte(self.wave_window_bank(), off - 0x090)
                 } else {
                     self.io[(off) as usize]
                 }
@@ -328,6 +336,21 @@ impl Bus {
     /// halfword's register semantics.
     fn io_write_byte(&mut self, a: u32, value: u8) {
         let idx = (a & 0x03FF) as usize;
+        if (0x090..0x0A0).contains(&idx) {
+            // The WAVE_RAM window addresses the bank not being played
+            // (GBATEK SOUND3CNT_L); the data lives in the APU, not the
+            // register image.
+            let off = (idx - 0x090) as u32;
+            let bank = self.wave_window_bank();
+            self.apu.wave_cpu_set_byte(bank, off, value);
+            return;
+        }
+        if (0x0A0..=0x0A7).contains(&idx) {
+            // FIFO sound registers are write-only queues; each written
+            // byte enters the queue (GBATEK FIFO_A/B).
+            self.apu.fifo_push_byte((idx >> 2) & 1, value);
+            return;
+        }
         if idx == Self::IF as usize || idx == Self::IF as usize + 1 {
             // IF acknowledge applies to the written byte only: a byte
             // write cannot acknowledge pending bits in the other byte
@@ -397,6 +420,24 @@ impl Bus {
             }
             return;
         }
+        if (0x0A0..0x0A8).contains(&snd) {
+            // FIFO sound queues take halfword writes as two bytes,
+            // least significant first (a 32-bit write arrives as two
+            // halfword lanes).
+            let which = ((snd >> 2) & 1) as usize;
+            self.apu.fifo_push_byte(which, value as u8);
+            self.apu.fifo_push_byte(which, (value >> 8) as u8);
+            return;
+        }
+        if (0x090..0x0A0).contains(&snd) {
+            // WAVE_RAM window: two bytes into the non-playing bank.
+            let off = snd - 0x090;
+            let bank = self.wave_window_bank();
+            self.apu.wave_cpu_set_byte(bank, off, value as u8);
+            self.apu
+                .wave_cpu_set_byte(bank, off + 1, (value >> 8) as u8);
+            return;
+        }
         let dma_cnt_h = Self::dma_cnt_h_channel(snd);
         let timer_cnt_h = Self::timer_channel(snd, 2);
         let was_enabled = dma_cnt_h.is_some() && halfword(&self.io, off) & 0x8000 != 0
@@ -408,6 +449,15 @@ impl Bus {
             }
             Self::VCOUNT => return,
             Self::IF => halfword(&self.io, off) & !value,
+            Self::SOUNDCNT_H => {
+                if value & 0x0800 != 0 {
+                    self.apu.fifo_clear(0);
+                }
+                if value & 0x8000 != 0 {
+                    self.apu.fifo_clear(1);
+                }
+                value
+            }
             Self::SOUNDCNT_X => {
                 let was_on = halfword(&self.io, off) & 0x0080 != 0;
                 if was_on && value & 0x0080 == 0 {
@@ -455,8 +505,9 @@ impl Bus {
     }
 
     /// Advances every enabled timer by `cycles` (one system step's
-    /// worth, CPU plus DMA cycles).
-    pub(crate) fn step_timers(&mut self, cycles: u32) {
+    /// worth, CPU plus DMA cycles). Public so hardware tests can drive
+    /// timed events (sound FIFO latches) without a CPU.
+    pub fn step_timers(&mut self, cycles: u32) {
         let mut timers = std::mem::take(&mut self.timers);
         timers.step(self, cycles);
         self.timers = timers;
@@ -478,9 +529,34 @@ impl Bus {
         self.apu.take_samples()
     }
 
-    /// The raw IO byte at `off` (masked into the 1 KiB window).
-    pub(crate) fn io_byte(&self, off: u32) -> u8 {
-        self.io[(off & 0x3FF) as usize]
+    /// The queued byte count of FIFO sound channel `which` (0 = A,
+    /// 1 = B), for headless inspection of playback health.
+    pub fn fifo_len(&self, which: usize) -> usize {
+        self.apu.fifo_len(which)
+    }
+
+    /// Latches the next FIFO byte per the SOUNDCNT_H timer selects for
+    /// the overflowing timer (0 or 1) and runs any sound-FIFO DMA
+    /// refill the latch demands (GBATEK "DMA-Sound Playback
+    /// Procedure").
+    pub(crate) fn apu_timer_latch(&mut self, timer: usize) {
+        let cnt_h = self.io_half(Self::SOUNDCNT_H);
+        let a_select = ((cnt_h >> 10) & 1) as usize;
+        let b_select = ((cnt_h >> 14) & 1) as usize;
+        let mut apu = std::mem::take(&mut self.apu);
+        let requests = apu.timer_latch(timer, a_select, b_select);
+        self.apu = apu;
+        if requests != 0 {
+            let mut dma = std::mem::take(&mut self.dma);
+            dma.sound_refill(self, requests);
+            self.dma = dma;
+        }
+    }
+
+    /// The wave RAM bank the CPU window (0x090..) addresses: the one
+    /// NOT selected for playback by NR30 bit 6 (GBATEK SOUND3CNT_L).
+    fn wave_window_bank(&self) -> usize {
+        1 - usize::from(self.io_half(Self::NR30) & 0x0040 != 0)
     }
 
     /// The raw IO halfword at `off` (masked into the 1 KiB window).
@@ -620,6 +696,8 @@ impl Bus {
     const GREENSWAP: u32 = 0x002;
     const DISPSTAT: u32 = 0x004;
     const VCOUNT: u32 = 0x006;
+    const NR30: u32 = 0x070;
+    const SOUNDCNT_H: u32 = 0x082;
     const SOUNDCNT_X: u32 = 0x084;
     /// IO offsets of the four sound CNT_X halfwords whose bit 15
     /// restarts a channel (NR14/NR24/NR34/NR44).

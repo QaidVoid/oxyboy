@@ -7,9 +7,9 @@
 //! or, in cascade mode, once per overflow of the preceding timer. On
 //! the 0xFFFF -> 0x0000 wrap the channel reloads, raises its overflow
 //! IRQ (IF bits 3-6) when CNT_H bit 6 is set, and ticks the next
-//! channel when that channel's cascade bit is set. The sound
-//! FIFO latch hooks the same overflow event (timers 0/1 drive the
-//! direct-sound sample rate).
+//! channel when that channel's cascade bit is set. Overflows of timers
+//! 0/1 also latch the sound FIFOs and can trigger a sound-DMA refill
+//! (see `Bus::apu_timer_latch`).
 //!
 //! Cycle accounting is instruction-granular: `System::step` feeds the
 //! whole step's cycles (CPU plus DMA) into `Timers::step`, and the
@@ -62,9 +62,13 @@ impl Timers {
         if self.counters[ch] != 0 {
             return;
         }
-        // Overflow: reload, then the sound FIFO latch hooks here
-        // (timers 0/1 drive direct sound in hardware).
+        // Overflow: reload, then latch the sound FIFOs (timers 0/1
+        // drive direct sound; the latch can trigger a sound-DMA
+        // refill, GBATEK "DMA-Sound Playback Procedure").
         self.counters[ch] = bus.io_half(0x0100 + 4 * ch as u32);
+        if ch < 2 {
+            bus.apu_timer_latch(ch);
+        }
         if bus.io_half(0x0102 + 4 * ch as u32) & 0x0040 != 0 {
             bus.raise_if(0x0008 << ch);
         }
