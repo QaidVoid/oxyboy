@@ -6,6 +6,7 @@
 //! layouts follow GBATEK "LCD I/O Registers".
 
 use crate::bus::Bus;
+use crate::dma::DmaTiming;
 
 /// Pixels per scanline.
 pub const WIDTH: usize = 240;
@@ -87,6 +88,9 @@ impl Ppu {
                     // H-Blank IRQ enable (DISPSTAT bit 4) gates IF bit 1.
                     bus.raise_if(0x0002);
                 }
+                // H-Blank-timed DMA channels fire on this flag edge;
+                // their cycles advance the PPU clock too.
+                self.dot += bus.dma_flag_edge(DmaTiming::HBlank);
             }
             if self.dot >= CYCLES_PER_LINE {
                 self.finish_line(bus);
@@ -134,6 +138,8 @@ impl Ppu {
         // DISPSTAT enable is set (bits 3-5 gate IF bits 0-2).
         if vblank && !was_vblank {
             self.raise_irq(bus, 3, 0x0001);
+            // V-Blank-timed DMA channels fire on this flag edge.
+            self.dot += bus.dma_flag_edge(DmaTiming::VBlank);
         }
         if vcount_flag && !was_vcount {
             self.raise_irq(bus, 5, 0x0004);

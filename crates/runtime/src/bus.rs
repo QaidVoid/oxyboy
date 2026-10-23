@@ -9,6 +9,8 @@
 
 /// On-board work RAM (EWRAM): 256 KiB.
 pub const EWRAM_SIZE: usize = 256 * 1024;
+
+use crate::dma::{Dma, DmaTiming};
 /// On-chip work RAM (IWRAM): 32 KiB.
 pub const IWRAM_SIZE: usize = 32 * 1024;
 /// BG/OBJ palette RAM: 1 KiB.
@@ -72,6 +74,8 @@ pub struct Bus {
     sram: Box<[u8]>,
     /// 0x04000000: halfword-granular IO register image (1 KiB window).
     io: Box<[u8]>,
+    /// The four DMA channels (registers in `io`, engine state here).
+    dma: Dma,
 }
 
 impl Bus {
@@ -95,6 +99,7 @@ impl Bus {
             rom_mask,
             sram: vec![0; SRAM_MAX_SIZE].into_boxed_slice(),
             io: vec![0; 0x400].into_boxed_slice(),
+            dma: Dma::default(),
         }
     }
 
@@ -325,6 +330,8 @@ impl Bus {
     /// read-only, and IF acknowledges on written 1 bits.
     fn io_write_u16(&mut self, half: u32, value: u16) {
         let off = (half & 0x3FF) as usize;
+        let dma_cnt_h = Self::dma_cnt_h_channel(off as u32);
+        let was_enabled = dma_cnt_h.is_some() && halfword(&self.io, off) & 0x8000 != 0;
         let stored = match off as u32 {
             Self::DISPSTAT => {
                 let flags = halfword(&self.io, off) & 0x0007;
@@ -336,6 +343,60 @@ impl Bus {
         };
         self.io[off] = stored as u8;
         self.io[off + 1] = (stored >> 8) as u8;
+        if let Some(ch) = dma_cnt_h {
+            // Latch internal SAD/DAD/count on the enable 0 -> 1 edge
+            // (GBATEK "DMA Transfer Channels"), after the store so the
+            // new CNT_H timing bits are visible.
+            if !was_enabled && value & 0x8000 != 0 {
+                self.dma.on_enable(&self.io, ch);
+            }
+        }
+    }
+
+    /// The raw IO halfword at `off` (masked into the 1 KiB window).
+    pub(crate) fn io_half(&self, off: u32) -> u16 {
+        halfword(&self.io, (off & 0x3FF) as usize)
+    }
+
+    /// Overwrites the raw IO halfword at `off` without the usual write
+    /// side effects (write-1-to-clear and read-only masking are for
+    /// CPU-visible writes only).
+    pub(crate) fn io_set_half(&mut self, off: u32, value: u16) {
+        let i = (off & 0x3FF) as usize;
+        self.io[i] = value as u8;
+        self.io[i + 1] = (value >> 8) as u8;
+    }
+
+    /// Arms and runs every channel triggered by a rising `timing`
+    /// flag edge (DISPSTAT V-Blank / H-Blank), returning the charged
+    /// cycle count.
+    pub(crate) fn dma_flag_edge(&mut self, timing: DmaTiming) -> u32 {
+        let mut engine = std::mem::take(&mut self.dma);
+        engine.rearm(&self.io, timing);
+        let cycles = engine.run(self, timing);
+        self.dma = engine;
+        cycles
+    }
+
+    /// Runs immediate-timing channels deferred from a CNT_H enable
+    /// write, returning the charged cycle count.
+    pub(crate) fn dma_run_deferred(&mut self) -> u32 {
+        let mut engine = std::mem::take(&mut self.dma);
+        let cycles = engine.run_deferred(self);
+        self.dma = engine;
+        cycles
+    }
+
+    /// The channel index if `off` is one of the four CNT_H halfword
+    /// offsets (`0x040000B0 + 12*N + 0xA`).
+    fn dma_cnt_h_channel(off: u32) -> Option<usize> {
+        match off {
+            0x0BA => Some(0),
+            0x0C6 => Some(1),
+            0x0D2 => Some(2),
+            0x0DE => Some(3),
+            _ => None,
+        }
     }
 
     /// The current line (0..=227) as seen through the VCOUNT register.

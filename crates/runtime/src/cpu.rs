@@ -505,8 +505,8 @@ fn sub_with_borrow(a: u32, b: u32, borrow: bool) -> (u32, bool, bool) {
 
 /// Region-default access cost in cycles (GBATEK bus-width table,
 /// default waitstates): "coarse" because sequential/overlapped timing
-/// and WAITCNT are not modeled yet.
-fn access_cycles(bus: &Bus, addr: u32, width: u8) -> u32 {
+/// and WAITCNT are not modeled yet. Shared with the DMA engine.
+pub(crate) fn access_cycles(bus: &Bus, addr: u32, width: u8) -> u32 {
     match (bus.region_of(addr), width) {
         (crate::bus::Region::Ewram, _) => 3,
         (crate::bus::Region::Rom, 4) => 8,
