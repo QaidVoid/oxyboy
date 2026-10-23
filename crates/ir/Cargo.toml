@@ -5,5 +5,6 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+rom = { version = "0.1.0", path = "../rom" }
 analysis = { version = "0.1.0", path = "../analysis" }
 decode = { version = "0.1.0", path = "../decode" }

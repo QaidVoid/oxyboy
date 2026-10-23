@@ -6,6 +6,7 @@
 //! ARM conditions are per-instruction guards; unresolved indirect
 //! control flow is an explicit terminator.
 
+pub mod lift;
 pub mod print;
 
 use decode::Condition;
