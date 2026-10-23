@@ -3,13 +3,14 @@ GBA analyzer, decompiler, and runtime
 Usage: oxyboy <COMMAND>
 
 Commands:
-  info     Print header fields, hashes, and identification for a ROM
-  disasm   Emit matching, re-assemblable assembly from a ROM
-  analyze  Recover code and data layout and function boundaries
-  lift     Lift a ROM into the intermediate representation
-  recomp   Statically recompile a ROM to host code
-  run      Execute a ROM in the GBA runtime
-  help     Print this message or the help of the given subcommand(s)
+  info        Print header fields, hashes, and identification for a ROM
+  disasm      Emit matching, re-assemblable assembly from a ROM
+  analyze     Recover code and data layout and function boundaries
+  lift        Lift a ROM into the intermediate representation
+  recomp      Statically recompile a ROM to host code
+  run         Execute a ROM in the GBA runtime
+  trace-diff  Compare two execution traces and report the first divergence
+  help        Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help     Print help

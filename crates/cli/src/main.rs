@@ -35,6 +35,8 @@ enum Command {
     Recomp(RomArgs),
     /// Execute a ROM in the GBA runtime.
     Run(commands::run::RunArgs),
+    /// Compare two execution traces and report the first divergence.
+    TraceDiff(commands::trace_diff::TraceDiffArgs),
 }
 
 /// Arguments shared by every subcommand.
@@ -58,6 +60,7 @@ fn main() {
         Command::Lift(args) => commands::lift::run(args),
         Command::Recomp(_) => not_implemented("recomp"),
         Command::Run(args) => commands::run::run(args),
+        Command::TraceDiff(args) => commands::trace_diff::run(args),
     };
     std::process::exit(code);
 }

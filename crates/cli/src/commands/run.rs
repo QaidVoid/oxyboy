@@ -16,9 +16,10 @@ use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 
 use rom::Image;
-use runtime::ppu::{VISIBLE_LINES, WIDTH};
+use runtime::ppu::{CYCLES_PER_LINE, LINES_PER_FRAME, VISIBLE_LINES, WIDTH};
 use runtime::save::Save;
 use runtime::system::System;
+use trace::Writer;
 
 use crate::RomArgs;
 
@@ -52,6 +53,12 @@ pub struct RunArgs {
     /// the backup medium auto-detection.
     #[arg(long, value_name = "FILE", env = "OXYBOY_ROM_DB")]
     pub db: Option<PathBuf>,
+
+    /// Write an execution trace (`.oxytrace`) of the headless run to
+    /// this file. Traces are only meaningful in `--headless` mode:
+    /// windowed runs depend on wall-clock input.
+    #[arg(long, value_name = "FILE")]
+    pub trace: Option<PathBuf>,
 }
 
 /// Runs `oxyboy run` and returns the process exit code.
@@ -83,9 +90,19 @@ pub fn run(args: RunArgs) -> i32 {
         }
     }
     if args.headless {
-        for _ in 0..args.frames {
-            system.step_frame();
+        if let Some(path) = &args.trace {
+            if let Err(code) = run_traced(&mut system, path, args.frames) {
+                eprintln!("oxyboy run: {code}");
+                return 1;
+            }
+        } else {
+            for _ in 0..args.frames {
+                system.step_frame();
+            }
         }
+    } else if args.trace.is_some() {
+        eprintln!("oxyboy run: --trace requires --headless");
+        return 1;
     } else if let Err(code) = run_windowed(&mut system) {
         eprintln!("oxyboy run: {code}");
         return 1;
@@ -106,6 +123,35 @@ pub fn run(args: RunArgs) -> i32 {
         return 1;
     }
     0
+}
+
+/// Runs headless for `frames` frames, recording every instruction to
+/// the trace file at `path`. The step budget is the same cycle count
+/// plain headless mode charges (`frames * CYCLES_PER_FRAME`), spent
+/// through `System::step_recorded` one instruction at a time.
+///
+/// # Errors
+///
+/// Returns a printable message when the trace file cannot be written.
+fn run_traced(system: &mut System, path: &Path, frames: u32) -> Result<(), String> {
+    let file = File::create(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut writer =
+        Writer::new(BufWriter::new(file)).map_err(|e| format!("{}: {e}", path.display()))?;
+    let budget = u64::from(frames)
+        * u64::from(CYCLES_PER_LINE)
+        * u64::try_from(LINES_PER_FRAME).unwrap_or(0);
+    let mut spent = 0u64;
+    while spent < budget {
+        let (cycles, record) = system.step_recorded();
+        writer
+            .write(&record)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        spent += u64::from(cycles);
+    }
+    writer
+        .finish()
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(())
 }
 
 /// Presents frames in a window until it closes or Escape is pressed.

@@ -312,6 +312,13 @@ impl Cpu {
         };
     }
 
+    /// True while the CPU is halted (halt or wait-for-interrupt);
+    /// halted steps charge one cycle and change nothing.
+    #[must_use]
+    pub fn is_halted(&self) -> bool {
+        self.halt != Halt::None
+    }
+
     /// Executes a BIOS SoftReset (GBATEK SWI 00h): zeroes r0-r12, the
     /// banked LR/SPSR of every mode, and the 200h-byte IWRAM tail was
     /// cleared by the caller; installs the documented stack pointers,

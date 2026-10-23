@@ -75,6 +75,52 @@ impl System {
         }
     }
 
+    /// Runs one step and records what it did as a
+    /// [`trace::Record`]: the PC after the instruction, the Thumb and
+    /// halted state bits, the register writes (indices 0-14; R15 is
+    /// the recorded PC itself), and every bus write the step
+    /// performed, including immediate DMA. This is the oracle-mode
+    /// driver: run it in a loop over a headless system and feed the
+    /// records to [`trace::Writer`], advancing by the returned cycle
+    /// count exactly as [`System::step`] would.
+    ///
+    /// The record covers one [`System::step`]; halted steps produce a
+    /// record with the halted flag and no deltas.
+    pub fn step_recorded(&mut self) -> (u32, trace::Record) {
+        let before: [u32; 15] = core::array::from_fn(|i| self.cpu.reg_for_test(i as u8));
+        self.bus.set_write_trace(true);
+        let cycles = self.step();
+        let writes = self.bus.take_writes();
+        self.bus.set_write_trace(false);
+
+        let mut reg_delta = Vec::new();
+        for (i, was) in before.iter().enumerate() {
+            let now = self.cpu.reg_for_test(i as u8);
+            if now != *was {
+                reg_delta.push(trace::RegWrite {
+                    index: i as u8,
+                    value: now,
+                });
+            }
+        }
+        let mut flags = 0;
+        if self.cpu.cpsr() & 0x20 != 0 {
+            flags |= trace::FLAG_THUMB;
+        }
+        if self.cpu.is_halted() {
+            flags |= trace::FLAG_HALTED;
+        }
+        (
+            cycles,
+            trace::Record {
+                pc: self.cpu.pc(),
+                flags,
+                reg_delta,
+                writes,
+            },
+        )
+    }
+
     /// The captured framebuffer: exact RGBA8888 bytes, row-major,
     /// 240x160.
     pub fn framebuffer(&self) -> &Frame {

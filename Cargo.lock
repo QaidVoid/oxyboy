@@ -615,6 +615,7 @@ dependencies = [
  "rom",
  "runtime",
  "testutil",
+ "trace",
 ]
 
 [[package]]
@@ -707,6 +708,7 @@ dependencies = [
  "rom",
  "testutil",
  "thiserror",
+ "trace",
 ]
 
 [[package]]
@@ -897,6 +899,10 @@ checksum = "b52fd3255258d26fac7264ab5a76b53c13367136dc011d3d6ad4f8ed070396a3"
 dependencies = [
  "pin-project-lite",
 ]
+
+[[package]]
+name = "trace"
+version = "0.1.0"
 
 [[package]]
 name = "typenum"

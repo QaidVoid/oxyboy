@@ -8,6 +8,7 @@ license.workspace = true
 decode = { version = "0.1.0", path = "../decode" }
 rom = { version = "0.1.0", path = "../rom" }
 thiserror = "2.0.21"
+trace = { version = "0.1.0", path = "../trace" }
 
 [dev-dependencies]
 rom = { version = "0.1.0", path = "../rom" }

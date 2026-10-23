@@ -9,6 +9,7 @@ members = [
     "crates/rom",
     "crates/runtime",
     "crates/testutil",
+    "crates/trace",
 ]
 
 [workspace.package]

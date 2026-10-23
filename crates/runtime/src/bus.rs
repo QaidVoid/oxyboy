@@ -15,6 +15,7 @@ use crate::dma::{Dma, DmaTiming};
 use crate::input::Key;
 use crate::save::{Save, SaveKind};
 use crate::timer::Timers;
+
 /// On-chip work RAM (IWRAM): 32 KiB.
 pub const IWRAM_SIZE: usize = 32 * 1024;
 /// BG/OBJ palette RAM: 1 KiB.
@@ -94,6 +95,15 @@ pub struct Bus {
     /// The opcode-fetch address held by the Game Pak prefetch buffer
     /// (WAITCNT bit 14), if any. Hit-only model: see `fetch_cost`.
     prefetch: Option<u32>,
+    /// Whether bus writes are recorded for the tracer. The log only
+    /// fills while a [`System::step_recorded`](crate::system::System::step_recorded)
+    /// step is in progress.
+    write_trace: bool,
+    /// Bus writes captured since the last drain, oldest first.
+    write_log: Vec<trace::MemWrite>,
+    /// Nesting depth of the capture guard: write widths funnel into
+    /// narrower writes, and only the outermost call is recorded.
+    capture_depth: u32,
 }
 
 impl Bus {
@@ -126,6 +136,9 @@ impl Bus {
             key_irq_line: false,
             last_access: (0, 0),
             prefetch: None,
+            write_trace: false,
+            write_log: Vec::new(),
+            capture_depth: 0,
         };
         // SOUNDBIAS resets to 0200h: bias level 100h, the 10-bit output
         // midpoint (GBATEK SOUNDBIAS).
@@ -418,6 +431,7 @@ impl Bus {
     /// Pak ROM have no write path, and IO byte writes go through the
     /// containing halfword's register semantics.
     pub fn write_u8(&mut self, addr: u32, value: u8) {
+        self.begin_capture(addr, 1, u32::from(value));
         let a = addr & 0x0FFF_FFFF;
         match a >> 24 {
             0x02 => self.ewram[(a & 0x0003_FFFF) as usize] = value,
@@ -434,10 +448,12 @@ impl Bus {
             0x0E | 0x0F => self.save.write_u8((a & 0x0000_FFFF) as u16, value),
             _ => {}
         }
+        self.end_capture();
     }
 
     /// Writes a little-endian halfword.
     pub fn write_u16(&mut self, addr: u32, value: u16) {
+        self.begin_capture(addr, 2, u32::from(value));
         let a = addr & 0x0FFF_FFFF;
         let lo = value as u8;
         let hi = (value >> 8) as u8;
@@ -474,12 +490,41 @@ impl Bus {
             }
             _ => {}
         }
+        self.end_capture();
     }
 
     /// Writes a little-endian word as two halfword lanes.
     pub fn write_u32(&mut self, addr: u32, value: u32) {
+        self.begin_capture(addr, 4, value);
         self.write_u16(addr, value as u16);
         self.write_u16(addr.wrapping_add(2), (value >> 16) as u16);
+        self.end_capture();
+    }
+
+    /// Records one outermost bus write while tracing is on.
+    fn begin_capture(&mut self, addr: u32, width: u8, value: u32) {
+        if self.write_trace && self.capture_depth == 0 {
+            self.write_log.push(trace::MemWrite { addr, width, value });
+        }
+        self.capture_depth += 1;
+    }
+
+    /// Closes the capture guard opened by [`Bus::begin_capture`].
+    fn end_capture(&mut self) {
+        self.capture_depth -= 1;
+    }
+
+    /// Turns bus-write capture for the tracer on or off and discards
+    /// anything captured so far. Owned by
+    /// [`System::step_recorded`](crate::system::System::step_recorded).
+    pub fn set_write_trace(&mut self, on: bool) {
+        self.write_trace = on;
+        self.write_log.clear();
+    }
+
+    /// Drains the captured bus writes, oldest first.
+    pub fn take_writes(&mut self) -> Vec<trace::MemWrite> {
+        std::mem::take(&mut self.write_log)
     }
 
     /// Maps an address in the VRAM window onto the 96 KiB array.
