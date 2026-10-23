@@ -230,6 +230,14 @@ impl Bus {
             0x02 => self.ewram[(a & 0x0003_FFFF) as usize] = value,
             0x03 => self.iwram[(a & 0x0000_7FFF) as usize] = value,
             0x04 if a < 0x0400_0400 => self.io_write_byte(a, value),
+            // VRAM has no 8-bit store: the byte lands in both halves
+            // of the containing halfword (GBATEK "VRAM": 8-bit writes
+            // "write 8bit data to both upper and lower bytes").
+            0x06 => {
+                let i = (Self::vram_index(a) & !1) as usize;
+                self.vram[i] = value;
+                self.vram[i + 1] = value;
+            }
             0x0E | 0x0F => self.sram[(a & 0x0000_FFFF) as usize] = value,
             _ => {}
         }

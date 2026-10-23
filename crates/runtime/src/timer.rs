@@ -12,7 +12,7 @@
 //! direct-sound sample rate).
 //!
 //! Cycle accounting is instruction-granular: `System::step` feeds the
-//! whole step's cycles (CPU plus DMA) into [`Timers::step`], and the
+//! whole step's cycles (CPU plus DMA) into `Timers::step`, and the
 //! per-channel sub-count carries the remainder across steps, so a
 //! prescaler-1024 timer ticks exactly once per 1024 elapsed cycles
 //! even when steps are 3 cycles apart. The counter readback exposes

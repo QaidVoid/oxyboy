@@ -180,15 +180,6 @@ fn sram_wide_accesses_split_into_byte_lanes() {
 }
 
 #[test]
-fn vram_eight_bit_writes_are_discarded() {
-    let mut bus = Bus::new(Vec::new());
-    bus.write_u16(0x0600_0010, 0xABCD);
-    bus.write_u8(0x0600_0010, 0x11);
-    bus.write_u8(0x0600_0011, 0x11);
-    assert_eq!(bus.read_u16(0x0600_0010), 0xABCD);
-}
-
-#[test]
 fn vram_eight_bit_reads_return_low_byte_of_halfword() {
     let mut bus = Bus::new(Vec::new());
     bus.write_u16(0x0600_0010, 0xABCD);
@@ -284,4 +275,19 @@ fn no_panics_across_region_boundaries() {
         bus.write_u16(addr, 0x5AA5);
         bus.write_u32(addr, 0xA55A_5AA5);
     }
+}
+
+#[test]
+fn vram_byte_writes_fill_both_halves_of_the_cell() {
+    let mut bus = Bus::new(Vec::new());
+    bus.write_u8(0x0600_0100, 0xAB);
+    // The byte lands in both bytes of the containing halfword (GBATEK
+    // "VRAM": 8-bit writes store to upper and lower bytes), and reads
+    // of the odd lane return the containing cell's low byte.
+    assert_eq!(bus.read_u8(0x0600_0100), 0xAB);
+    assert_eq!(bus.read_u16(0x0600_0100), 0xABAB);
+    // A byte write to the high lane of a halfword still lands low in
+    // the cell, mirroring the 8-bit read rule.
+    bus.write_u8(0x0600_0103, 0x5A);
+    assert_eq!(bus.read_u16(0x0600_0102), 0x5A5A);
 }
