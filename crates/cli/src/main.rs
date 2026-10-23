@@ -35,6 +35,8 @@ enum Command {
     Recomp(RomArgs),
     /// Execute a ROM in the GBA runtime.
     Run(commands::run::RunArgs),
+    /// Run one external-suite ROM and decode its on-screen verdict.
+    SuiteTest(commands::suite::SuiteTestArgs),
     /// Compare two execution traces and report the first divergence.
     TraceDiff(commands::trace_diff::TraceDiffArgs),
 }
@@ -60,6 +62,7 @@ fn main() {
         Command::Lift(args) => commands::lift::run(args),
         Command::Recomp(_) => not_implemented("recomp"),
         Command::Run(args) => commands::run::run(args),
+        Command::SuiteTest(args) => commands::suite::run(args),
         Command::TraceDiff(args) => commands::trace_diff::run(args),
     };
     std::process::exit(code);
