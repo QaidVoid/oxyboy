@@ -6,7 +6,7 @@
 
 use decode::Condition;
 use runtime::bus::Bus;
-use runtime::cpu::{Cpu, Mode};
+use runtime::cpu::{Cpu, IRQ_HLE_RETURN, Mode};
 
 /// Builds a bus whose ROM contains `words` at `0x08000000`, padded with
 /// zeros.
@@ -526,6 +526,22 @@ fn psr_transfers_between_modes() {
 }
 
 #[test]
+fn system_mode_may_write_the_cpsr_control_field() {
+    // msr CPSR_c,#0x9F (System, I set); msr CPSR_c,#0x1F (unmask IRQs)
+    // Regression: System mode is privileged; its control-field writes
+    // were being dropped along with User's, so ROM setup code could not
+    // enable IRQs from System state.
+    let mut bus = rom(&[0xE321_F09F, 0xE321_F01F]);
+    let mut cpu = Cpu::new(0x0800_0000);
+    run(&mut cpu, &mut bus, 1);
+    assert_eq!(cpu.mode(), Mode::System);
+    assert_eq!(cpu.cpsr() & 0x80, 0x80, "I set");
+    run(&mut cpu, &mut bus, 1);
+    assert_eq!(cpu.mode(), Mode::System);
+    assert_eq!(cpu.cpsr() & 0xC0, 0, "I and F cleared from System state");
+}
+
+#[test]
 fn swi_entry_state() {
     let mut bus = rom(&[0xEF12_3456]);
     let mut cpu = Cpu::new(0x0800_0000);
@@ -550,25 +566,32 @@ fn undefined_instruction_exception() {
 }
 
 #[test]
-fn irq_entry_and_return() {
-    let mut bus = rom(&[0xE3A0_0001, 0xE25E_F004]);
+fn irq_entry_dispatches_through_bios_hle_and_returns() {
+    let mut bus = rom(&[0xE3A0_0001]); // mov r0, #1 (interrupted)
+    bus.write_u32(0x0200_0000, 0xE12F_FF1E); // handler: bx lr
+    bus.write_u32(0x0300_7FFC, 0x0200_0000);
     let mut cpu = Cpu::new(0x0800_0000);
     cpu.set_cpsr_raw(0x0000_0013); // SVC with I clear
+    cpu.set_reg_for_test(14, 0x0ADC_0DE0);
     cpu.set_irq_line(true);
     run(&mut cpu, &mut bus, 1);
-    assert_eq!(cpu.pc(), 0x18);
-    assert_eq!(cpu.mode(), Mode::Irq);
-    assert_eq!(cpu.spsr_for_test(), Some(0x13));
-    assert_eq!(reg(&cpu, 14), 0x0800_0004);
+    // HLE dispatch: the handler runs in ARM System state with IRQs
+    // disabled, lr parks on the HLE sentinel, r0 = IE & IF (0 here).
+    assert_eq!(cpu.pc(), 0x0200_0000);
+    assert_eq!(cpu.mode(), Mode::System);
     assert_eq!(cpu.cpsr() & 0x80, 0x80);
+    assert_eq!(reg(&cpu, 0), 0);
+    assert_eq!(reg(&cpu, 14), IRQ_HLE_RETURN);
 
-    // subs pc, lr, #4 re-executes the interrupted instruction.
-    cpu.set_irq_line(false);
-    cpu.set_pc(0x0800_0004);
-    run(&mut cpu, &mut bus, 1);
+    // bx lr (to the sentinel) performs the interrupt return: the
+    // interrupted context is restored and the not-yet-executed
+    // instruction re-executes.
+    run(&mut cpu, &mut bus, 2);
     assert_eq!(cpu.pc(), 0x0800_0000);
     assert_eq!(cpu.mode(), Mode::Supervisor);
     assert_eq!(cpu.cpsr(), 0x13);
+    assert_eq!(reg(&cpu, 14), 0x0ADC_0DE0);
+    cpu.set_irq_line(false);
     run(&mut cpu, &mut bus, 1);
     assert_eq!(reg(&cpu, 0), 1);
 }

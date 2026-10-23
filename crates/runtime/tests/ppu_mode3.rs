@@ -226,25 +226,53 @@ fn step_frame_advances_vcount_through_all_lines() {
 }
 
 #[test]
-fn vblank_irq_stub_raises_if_and_the_cpu_takes_the_exception() {
+fn vblank_irq_dispatches_through_the_bios_hle_path() {
     let mut system = System::new(idle_rom(), 0x0800_0000);
     // Unmask IRQs (I bit clear, SVC mode, ARM state).
     system.cpu.set_cpsr_raw(0x13);
     system.bus_mut().write_u16(DISPSTAT, 0x0008); // V-Blank IRQ enable
     system.bus_mut().write_u16(IE, 0x0001);
     system.bus_mut().write_u16(IME, 0x0001);
+    // Install a parked handler (`b .`) and its [0x03007FFC] pointer.
+    system.bus_mut().write_u32(0x0200_0000, 0xEAFF_FFFE);
+    system.bus_mut().write_u32(0x0300_7FFC, 0x0200_0000);
 
     let mut steps = 0;
-    while system.cpu.mode() != Mode::Irq {
+    while system.cpu.pc() != 0x0200_0000 {
         system.step();
         steps += 1;
-        assert!(steps < 200_000, "IRQ never fired");
+        assert!(steps < 200_000, "IRQ never dispatched");
     }
     assert_ne!(system.bus().int_flags() & 0x0001, 0);
     assert!(system.vcount() >= 160);
-    // IRQ entry masks further IRQs and vectors to 0x18.
-    assert_eq!(system.cpu.pc(), 0x0000_0018);
+    // HLE dispatch contract: the handler runs in ARM System state
+    // with IRQs disabled, r0 = IE & IF, lr on the HLE return sentinel.
+    assert_eq!(system.cpu.mode(), Mode::System);
     assert_eq!(system.cpu.cpsr() & 0x80, 0x80);
+    assert_eq!(system.cpu.cpsr() & 0x20, 0);
+    assert_eq!(system.cpu.reg_for_test(0), 0x0001);
+    assert_eq!(system.cpu.reg_for_test(14), runtime::cpu::IRQ_HLE_RETURN);
+}
+
+#[test]
+fn irq_without_an_installed_handler_stays_pending() {
+    let mut system = System::new(idle_rom(), 0x0800_0000);
+    system.cpu.set_cpsr_raw(0x13);
+    system.bus_mut().write_u16(DISPSTAT, 0x0008);
+    system.bus_mut().write_u16(IE, 0x0001);
+    system.bus_mut().write_u16(IME, 0x0001);
+    // [0x03007FFC] is zero: nothing to dispatch to, so the request
+    // stays pending and the CPU keeps running the interrupted code.
+
+    let mut steps = 0;
+    while system.vcount() < 200 {
+        system.step();
+        steps += 1;
+        assert!(steps < 400_000, "vblank never arrived");
+    }
+    assert_ne!(system.bus().int_flags() & 0x0001, 0, "IF must be pending");
+    assert_eq!(system.cpu.pc(), 0x0800_0000, "ROM must keep running");
+    assert_eq!(system.cpu.mode(), Mode::Supervisor);
 }
 
 #[test]

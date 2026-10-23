@@ -9,4 +9,5 @@ decode = { version = "0.1.0", path = "../decode" }
 rom = { version = "0.1.0", path = "../rom" }
 
 [dev-dependencies]
+rom = { version = "0.1.0", path = "../rom" }
 testutil = { path = "../testutil" }

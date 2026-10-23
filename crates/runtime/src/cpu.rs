@@ -134,7 +134,32 @@ pub struct Cpu {
     cycles: u64,
     /// The IRQ input line, sampled at the start of every step.
     irq_line: bool,
+    /// Saved interrupted-context registers of in-flight BIOS-HLE IRQ
+    /// dispatches, innermost last: r0, r1, r2, r3, r12, lr. The real
+    /// BIOS preamble parks these on the IRQ-mode stack; the HLE
+    /// dispatcher keeps them CPU-side so ROMs see the documented
+    /// preservation without needing r13_irq to be valid. Depth bounds
+    /// nested dispatches (a handler that clears the I bit).
+    irq_hle_saved: [[u32; SAVED_IRQ_REGS]; IRQ_HLE_DEPTH],
+    /// How many dispatches are in flight (0 = none).
+    irq_hle_depth: usize,
 }
+
+/// Registers preserved across a BIOS-HLE IRQ dispatch: r0..r3, r12,
+/// lr (the BIOS preamble pushes r0-r3, r12, lr).
+const SAVED_IRQ_REGS: usize = 6;
+
+/// How many nested BIOS-HLE dispatches can be in flight.
+const IRQ_HLE_DEPTH: usize = 8;
+
+/// Where the BIOS-HLE dispatcher parks `lr` for the user IRQ handler;
+/// fetching this address performs the interrupt return (the real BIOS
+/// postamble inlined). Lives in BIOS space, which stays unmapped.
+pub const IRQ_HLE_RETURN: u32 = 0x0000_00A0;
+
+/// The IWRAM slot holding the user IRQ handler address (GBATEK "BIOS
+/// IRQ dispatcher": the dispatch at 0x18 jumps through `[0x03007FFC]`).
+const IRQ_HANDLER_PTR: u32 = 0x0300_7FFC;
 
 impl Cpu {
     /// Builds a CPU in supervisor mode with interrupts masked, as after
@@ -152,6 +177,8 @@ impl Cpu {
             pc,
             cycles: 0,
             irq_line: false,
+            irq_hle_saved: [[0; SAVED_IRQ_REGS]; IRQ_HLE_DEPTH],
+            irq_hle_depth: 0,
         }
     }
 
@@ -497,6 +524,14 @@ impl Cpu {
     /// the undefined-instruction exception; nothing panics.
     pub fn step(&mut self, bus: &mut Bus) -> u32 {
         let before = self.cycles;
+        if self.pc == IRQ_HLE_RETURN && self.irq_hle_depth > 0 {
+            // Fetching the HLE sentinel performs the interrupt return
+            // (the BIOS postamble inlined): restore the interrupted
+            // registers, CPSR, and resume at r14_irq - 4.
+            self.cycles += 3;
+            self.irq_hle_return();
+            return (self.cycles - before) as u32;
+        }
         if self.irq_line && self.cpsr & 0x80 == 0 {
             // IRQ entry: the not-yet-executed instruction at `self.pc`
             // is not executed. The return address is saved in ARM-style
@@ -505,7 +540,7 @@ impl Cpu {
             // `subs pc, lr, #4` re-executes it.
             let width = if self.cpsr & 0x20 != 0 { 2 } else { 4 };
             self.cycles += u64::from(access_cycles(bus, self.pc, width));
-            self.exception(Mode::Irq, self.pc.wrapping_add(4), 0x18, false);
+            self.take_irq(bus);
             return (self.cycles - before) as u32;
         }
         if self.cpsr & 0x20 != 0 {
@@ -514,6 +549,64 @@ impl Cpu {
             self.step_arm(bus);
         }
         (self.cycles - before) as u32
+    }
+
+    /// Takes a pending IRQ through the BIOS-HLE dispatch path.
+    ///
+    /// With no BIOS ROM mapped, the vector at 0x18 is emulated at the
+    /// documented dispatch level instead: the interrupted caller-saved
+    /// registers (r0-r3, r12, lr) are preserved CPU-side, the CPU
+    /// enters ARM System state with IRQs disabled, `r0` carries the
+    /// `IE & IF` mask, `lr` parks on the [`IRQ_HLE_RETURN`] sentinel,
+    /// and execution resumes at `[0x03007FFC]`. The handler
+    /// acknowledges IF itself (write-1-to-clear) and returns with
+    /// `bx lr`; a handler address of 0 leaves the request pending
+    /// (nothing installed it, so there is nothing to dispatch to).
+    fn take_irq(&mut self, bus: &mut Bus) {
+        let handler = bus.read_u32(IRQ_HANDLER_PTR);
+        if handler == 0 {
+            return;
+        }
+        // Preserve the interrupted context before the mode switch
+        // banks r14 away (r0-r3 and r12 are unbanked).
+        let saved = [
+            self.regs[0],
+            self.regs[1],
+            self.regs[2],
+            self.regs[3],
+            self.regs[12],
+            self.regs[14],
+        ];
+        if self.irq_hle_depth < IRQ_HLE_DEPTH {
+            self.irq_hle_saved[self.irq_hle_depth] = saved;
+            self.irq_hle_depth += 1;
+        }
+        self.exception(Mode::Irq, self.pc.wrapping_add(4), 0x18, false);
+        // The BIOS preamble runs the handler in ARM System state with
+        // IRQs still disabled, r0 = IE & IF (GBATEK "Interrupt
+        // Dispatch").
+        self.switch_mode(Mode::System);
+        self.regs[Register::Lr.bits() as usize] = IRQ_HLE_RETURN;
+        self.regs[0] = u32::from(bus.int_enable() & bus.int_flags());
+        self.pc = handler;
+    }
+
+    /// Performs the interrupt return for one in-flight HLE dispatch:
+    /// restores the interrupted registers and CPSR and resumes at
+    /// `r14_irq - 4` (the not-yet-executed instruction).
+    fn irq_hle_return(&mut self) {
+        self.irq_hle_depth -= 1;
+        let saved = self.irq_hle_saved[self.irq_hle_depth];
+        let spsr = self.spsr[bank_index(Bank::Irq)];
+        let resume = self.sp[bank_index(Bank::Irq)][1].wrapping_sub(4);
+        self.restore_cpsr(spsr);
+        self.regs[0] = saved[0];
+        self.regs[1] = saved[1];
+        self.regs[2] = saved[2];
+        self.regs[3] = saved[3];
+        self.regs[12] = saved[4];
+        self.regs[Register::Lr.bits() as usize] = saved[5];
+        self.pc = resume;
     }
 
     /// One ARM-state instruction.
@@ -861,9 +954,8 @@ impl Cpu {
     /// f). ARM7TDMI has no S or E bits, so those fields are ignored; in
     /// User mode only the flags field is writable (ARM ARM A2.6/A4.1.8).
     fn msr(&mut self, spsr: bool, fields: u8, value: u32) {
-        let user = matches!(self.mode(), Mode::User | Mode::System);
         if spsr {
-            if !user {
+            if !matches!(self.mode(), Mode::User | Mode::System) {
                 let i = bank_index(self.mode().bank());
                 let old = self.spsr[i];
                 self.spsr[i] = self.apply_psr_fields(old, fields, value);
@@ -874,8 +966,10 @@ impl Cpu {
             // Flags field: NZCV, writable from any mode.
             self.set_flag_bits(0xF000_0000, value);
         }
-        if fields & 0b0001 != 0 && !user {
-            // Control field: I, F, T and the mode bits. A mode write
+        if fields & 0b0001 != 0 && self.mode() != Mode::User {
+            // Control field: I, F, T and the mode bits. System mode is
+            // privileged and may write it (real ROM setup code enables
+            // IRQs from System state); only User may not. A mode write
             // banks the registers for the following instructions. The
             // ARMv4T architecture makes T-bit writes via MSR
             // UNPREDICTABLE (ARM ARM); they are honored here, matching

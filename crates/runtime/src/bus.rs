@@ -291,6 +291,19 @@ impl Bus {
     /// Writes one byte of the IO window through the containing
     /// halfword's register semantics.
     fn io_write_byte(&mut self, a: u32, value: u8) {
+        let idx = (a & 0x03FF) as usize;
+        if idx == Self::IF as usize || idx == Self::IF as usize + 1 {
+            // IF acknowledge applies to the written byte only: a byte
+            // write cannot acknowledge pending bits in the other byte
+            // (GBATEK IF: "Writing 1 to a bit acknowledges it").
+            let half = Self::IF as usize;
+            let shift = if idx == half { 0 } else { 8 };
+            let cur = halfword(&self.io, half);
+            let cleared = cur & !(u16::from(value) << shift);
+            self.io[half] = cleared as u8;
+            self.io[half + 1] = (cleared >> 8) as u8;
+            return;
+        }
         let half = a & 0x03FE;
         let old = halfword(&self.io, half as usize);
         let merged = if a & 1 == 0 {
