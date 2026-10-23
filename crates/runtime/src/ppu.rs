@@ -1,16 +1,18 @@
-//! PPU scanline renderer (modes 0-3 backgrounds, OBJ) and video timing.
+//! PPU scanline renderer (modes 0-5 backgrounds, OBJ) and video timing.
 //!
 //! Renders text backgrounds (modes 0-1), affine backgrounds (modes 1-2),
-//! the mode-3 bitmap, and sprites through one layer pipeline: enabled
+//! the mode-3 bitmap, the page-flipped mode-4 palette bitmap and the
+//! mode-5 16bpp bitmap, and sprites through one layer pipeline: enabled
 //! layers are resolved front-to-back by priority (OBJ beats a BG of the
 //! same priority, lower OAM index beats higher), with the first opaque
 //! pixel as the top layer and the next opaque pixel as the alpha
 //! second target (GBATEK "Color Special Effects"). GREENSWAP bit 0
 //! exchanges the green components of each two-pixel group at output.
+//! BG mosaic (BGxCNT bit 6) samples the block's top-left screen pixel;
+//! OBJ mosaic (attr0 bit 12) anchors its grid at the sprite origin.
 //! Register addresses and bit layouts follow GBATEK "LCD I/O
 //! Registers" and "LCD OBJ" (OAM attributes, OBJ tile mapping,
-//! windows, BLDCNT/BLDALPHA/BLDY); BG and OBJ mosaic (BGxCNT bit 4,
-//! OAM attr0 bit 12) and modes 4-5 are not implemented yet.
+//! windows, BLDCNT/BLDALPHA/BLDY, MOSAIC).
 
 use crate::bus::Bus;
 use crate::dma::DmaTiming;
@@ -206,14 +208,18 @@ impl Ppu {
         // per pixel by the key (priority, OBJ-before-BG, BG number);
         // the backdrop sits behind everything.
         let mut bg_prio = [0u8; 4];
+        let mut bg_mosaic = [false; 4];
         let mut bgs: Vec<(usize, BgKind)> = Vec::with_capacity(4);
         for (id, kind) in enabled_bgs(dispcnt, mode) {
             bg_prio[id] = (bus.io_half(0x0008 + 2 * id as u32) & 0x0003) as u8;
+            // BGxCNT bit 6 enables BG mosaic for this layer.
+            bg_mosaic[id] = bus.io_half(0x0008 + 2 * id as u32) & 0x0040 != 0;
             bgs.push((id, kind));
         }
         let obj_on = dispcnt & 0x1000 != 0;
 
         let bldcnt = bus.io_half(0x0050);
+        let mosaic = bus.io_half(0x004C);
         let bldalpha = bus.io_half(0x0052);
         let eva = u32::from(bldalpha & 0x001F).min(16);
         let evb = u32::from((bldalpha >> 8) & 0x001F).min(16);
@@ -238,9 +244,34 @@ impl Ppu {
                     continue;
                 }
                 let color = match kind {
-                    BgKind::Text => text_pixel(bus, id, line as u32, x as u32),
-                    BgKind::Affine => affine_pixel(bus, id, line as u32, x as u32),
+                    BgKind::Text => {
+                        let (sx, sy) = if bg_mosaic[id] {
+                            mosaic_coords(x as u32, line as u32, mosaic)
+                        } else {
+                            (x as u32, line as u32)
+                        };
+                        text_pixel(bus, id, sy, sx)
+                    }
+                    BgKind::Affine => {
+                        let (sx, sy) = if bg_mosaic[id] {
+                            mosaic_coords(x as u32, line as u32, mosaic)
+                        } else {
+                            (x as u32, line as u32)
+                        };
+                        affine_pixel(bus, id, sy, sx)
+                    }
                     BgKind::Bitmap3 => Some(bus.vram_u16(((line * WIDTH + x) * 2) as u32)),
+                    BgKind::Bitmap4 => {
+                        let page = u32::from(dispcnt & 0x0010 != 0) * 0xA000;
+                        let index =
+                            bus.vram()[(page + line as u32 * WIDTH as u32 + x as u32) as usize];
+                        (index != 0).then(|| bus.palette_u16(2 * u32::from(index)))
+                    }
+                    BgKind::Bitmap5 => {
+                        let page = u32::from(dispcnt & 0x0010 != 0) * 0xA000;
+                        (x < 160 && line < 128)
+                            .then(|| bus.vram_u16(page + 2 * (line as u32 * 160 + x as u32)))
+                    }
                 };
                 let Some(color) = color else { continue };
                 let key = (bg_prio[id], 1, id as u8);
@@ -343,6 +374,18 @@ fn enabled_bgs(dispcnt: u16, mode: u16) -> impl Iterator<Item = (usize, BgKind)>
             (0, BgKind::Text),
             (0, BgKind::Text),
         ],
+        4 => [
+            (2, BgKind::Bitmap4),
+            (0, BgKind::Text),
+            (0, BgKind::Text),
+            (0, BgKind::Text),
+        ],
+        5 => [
+            (2, BgKind::Bitmap5),
+            (0, BgKind::Text),
+            (0, BgKind::Text),
+            (0, BgKind::Text),
+        ],
         _ => [
             (0, BgKind::Text),
             (0, BgKind::Text),
@@ -354,7 +397,7 @@ fn enabled_bgs(dispcnt: u16, mode: u16) -> impl Iterator<Item = (usize, BgKind)>
         0 => 4,
         1 => 3,
         2 => 2,
-        3 => 1,
+        3..=5 => 1,
         _ => 0,
     };
     kinds
@@ -373,6 +416,10 @@ enum BgKind {
     Affine,
     /// The mode-3 240x160 16bpp bitmap (BG2 only).
     Bitmap3,
+    /// The mode-4 240x160 8bpp palette bitmap (BG2 only, page-flipped).
+    Bitmap4,
+    /// The mode-5 160x128 16bpp bitmap (BG2 only, page-flipped).
+    Bitmap5,
 }
 
 /// The BGR555 color of text BG `id` at line `y`, pixel `x`, or None
@@ -542,12 +589,25 @@ fn obj_line(
         let semi = mode == 1;
         let window_sprite = mode == 2;
         let pal_bank = (a2 >> 12) & 0x000F;
+        // OBJ mosaic (attr0 bit 12) quantizes display coordinates into
+        // blocks anchored at the sprite origin (GBATEK "MOSAIC").
+        let (obj_hw, obj_vv) = if a0 & 0x1000 != 0 {
+            let m = bus.io_half(0x004C);
+            (
+                u32::from((m >> 8) & 0x000F) + 1,
+                u32::from((m >> 12) & 0x000F) + 1,
+            )
+        } else {
+            (1, 1)
+        };
         for px in 0..w_disp {
             // X is 9 bits and wraps in 512-pixel OBJ space.
             let sx = ((x0 + px) & 0x1FF) as usize;
             if sx >= WIDTH {
                 continue;
             }
+            let px = px - px % obj_hw;
+            let py = py - py % obj_vv;
             let index = if rot {
                 let sel = (a1 >> 9) & 0x001F;
                 affine_texture(bus, sel, px, py, dims).and_then(|(tx, ty)| {
@@ -676,6 +736,15 @@ fn obj_param(bus: &Bus, sel: u16, idx: usize) -> i32 {
     let oam = bus.oam();
     let off = (sel as usize * 32 + idx * 8 + 6) & 0x3FF;
     i32::from(i16::from_le_bytes([oam[off], oam[off + 1]]))
+}
+
+/// The mosaic block origin for screen pixel (x, y): the grid is
+/// anchored at the screen's top-left, blocks are (H+1) x (V+1) pixels
+/// (GBATEK "MOSAIC").
+fn mosaic_coords(x: u32, y: u32, mosaic: u16) -> (u32, u32) {
+    let hw = u32::from(mosaic & 0x000F) + 1;
+    let vv = u32::from((mosaic >> 4) & 0x000F) + 1;
+    (x - x % hw, y - y % vv)
 }
 
 /// The per-pixel window region: a 6-bit layer mask (bits 0-3 BG0-3,

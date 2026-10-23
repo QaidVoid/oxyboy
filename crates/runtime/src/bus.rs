@@ -514,6 +514,11 @@ impl Bus {
         self.io[off + 1] = (cur >> 8) as u8;
     }
 
+    /// The raw IF register (pending IRQ request bits).
+    pub fn int_flags(&self) -> u16 {
+        halfword(&self.io, Self::IF as usize)
+    }
+
     /// Whether an interrupt is reaching the CPU: IE selecting a pending
     /// IF bit and IME set (GBATEK "Interrupt Control").
     pub fn irq_pending(&self) -> bool {
@@ -523,11 +528,6 @@ impl Bus {
     /// The IE register (IRQ enable mask).
     pub fn int_enable(&self) -> u16 {
         halfword(&self.io, Self::IE as usize)
-    }
-
-    /// The IF register (pending IRQs).
-    pub fn int_flags(&self) -> u16 {
-        halfword(&self.io, Self::IF as usize)
     }
 
     /// The IME register (master IRQ enable).
