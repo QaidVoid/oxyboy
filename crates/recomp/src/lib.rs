@@ -99,12 +99,21 @@ fn emit_block(
     let _ = writeln!(out, "b{}:;", index);
     // A block containing an intrinsic is opaque: the model does not
     // cover the instruction, so the interpreter runs the whole block
-    // from its leader and nothing re-executes.
+    // from its leader and nothing re-executes. The leader state is
+    // the block's parameters, so flush them: the resumed interpreter
+    // must see what earlier blocks computed.
     if block
         .insts
         .iter()
         .any(|inst| matches!(inst.op, Op::Intrinsic { .. }))
     {
+        let state: Vec<Value> = block
+            .params
+            .iter()
+            .take(STATE_ARITY)
+            .map(|&id| Value::Id(id))
+            .collect();
+        flush_state(out, &state);
         let _ = writeln!(
             out,
             "    st->pc = 0x{:x}u; st->exited = 1u; return;",
@@ -1045,6 +1054,10 @@ mod tests {
             "opaque block: {body}"
         );
         assert!(!body.contains("oxy_add"), "no effects emitted: {body}");
+        // The exit hands the block-leader state back: the interpreter
+        // reruns the block from real registers, not the entry
+        // snapshot.
+        assert!(body.contains("st->r[0] = v0;"), "leader flush: {body}");
     }
 
     #[test]

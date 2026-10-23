@@ -9,7 +9,11 @@
 //! included). Any control transfer the IR model does not cover (SWI,
 //! CPSR intrinsics, indirect exits, untranslated callees) or a
 //! backward-branch budget exhaustion sets `exited`, and the driver
-//! resumes interpretation at the recorded PC.
+//! resumes interpretation at the recorded PC. Opaque (SWI) blocks
+//! hand the interpreter the block-leader state, so the HLE call and
+//! its continuation run on the interpreter's cycle model; native
+//! chunks feed the scheduler through [`System::advance_clock`] with
+//! the chunk's charged cycles.
 //!
 //! Accuracy level: native chunks charge
 //! memory ops at real waitstate costs plus one cycle per IR
@@ -26,6 +30,11 @@ use recomp::abi::{GuestOps, GuestState, SIZE_BYTE, SIZE_HALF, SIZE_WORD};
 
 /// The default native-instruction budget per call.
 pub const DEFAULT_BUDGET: u64 = 1_000_000;
+
+/// The link-register value [`Driver::call_function`] plants for a
+/// host-initiated call: a guest that returns lands here, and the host
+/// owns the machine from that point. Not a mapped address.
+pub const HOST_RETURN_SENTINEL: u32 = 0xFFFF_0000;
 
 /// A loaded translation plus its entry table.
 pub struct Driver {
@@ -67,6 +76,11 @@ impl Driver {
     /// a translated entry, one interpreter instruction otherwise.
     /// Returns the cycles charged.
     ///
+    /// A native call that leaves the PC where it started handed
+    /// control to the interpreter at its own entry (an opaque block at
+    /// the function head); interpreting one instruction makes progress
+    /// where re-entering the same entry would loop forever.
+    ///
     /// # Errors
     ///
     /// Returns a printable message when the native call fails (missing
@@ -74,7 +88,13 @@ impl Driver {
     pub fn step(&mut self, system: &mut System) -> Result<u32, String> {
         let pc = system.cpu.pc();
         match self.thumb_at(pc) {
-            Some(thumb) => self.run_native(system, pc, thumb),
+            Some(thumb) => {
+                let cycles = self.run_native(system, pc, thumb)?;
+                if system.cpu.pc() == pc {
+                    return Ok(system.step());
+                }
+                Ok(cycles)
+            }
             None => Ok(system.step()),
         }
     }
@@ -91,6 +111,35 @@ impl Driver {
         }
         system.step_frame();
         Ok(())
+    }
+
+    /// Calls a translated guest function from the host with the ARM
+    /// procedure-call convention: `args` land in r0-r3, lr is planted
+    /// with [`HOST_RETURN_SENTINEL`], and the function runs natively
+    /// exactly like the native half of [`Driver::step`]. The outgoing
+    /// r0 is the return value; every other register, flag, and memory
+    /// effect stays in the machine, and the chunk's cycles feed the
+    /// scheduler.
+    ///
+    /// # Errors
+    ///
+    /// Returns a printable message when `start` is not a translated
+    /// entry or the native call fails.
+    pub fn call_function(
+        &mut self,
+        system: &mut System,
+        start: u32,
+        args: [u32; 4],
+    ) -> Result<u32, String> {
+        let Some(thumb) = self.thumb_at(start) else {
+            return Err(format!("{start:#010x} is not a translated entry"));
+        };
+        for (index, value) in args.iter().enumerate() {
+            system.cpu.set_reg_for_test(index as u8, *value);
+        }
+        system.cpu.set_reg_for_test(14, HOST_RETURN_SENTINEL);
+        self.run_native(system, start, thumb)?;
+        Ok(system.cpu.reg_for_test(0))
     }
 
     fn run_native(&mut self, system: &mut System, entry: u32, thumb: bool) -> Result<u32, String> {

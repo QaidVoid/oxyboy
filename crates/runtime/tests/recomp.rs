@@ -46,8 +46,9 @@ fn micro_image() -> Image {
 
 /// Lifts, optimizes, translates, compiles, and loads one function per
 /// `(start, end)` mark. Marks are code ranges; each start becomes a
-/// translated entry.
-fn build_driver(image: &Image, marks: &[(u32, u32)]) -> Result<Driver, String> {
+/// translated entry. `tag` namespaces the compile scratch directory:
+/// tests in one binary run in parallel and must not share one.
+fn build_driver(image: &Image, marks: &[(u32, u32)], tag: &str) -> Result<Driver, String> {
     let mut map = FlagMap::from_image(image);
     let base = map.canonical().base();
     for (start, end) in marks {
@@ -72,7 +73,7 @@ fn build_driver(image: &Image, marks: &[(u32, u32)]) -> Result<Driver, String> {
         .map(|(i, f)| (entries[i].0, f))
         .collect();
     let source = recomp::emit_module(&refs);
-    let module = recomp::Module::build(&source.c_source, "recomp-test")?;
+    let module = recomp::Module::build(&source.c_source, tag)?;
     Ok(Driver::new(module, entries))
 }
 
@@ -97,7 +98,7 @@ fn micro_corpus_recompiled_state_matches_interpreted() {
     );
 
     let marks = [(0x100u32, 0x130u32), (0x130, 0x138)];
-    let mut driver = build_driver(&image, &marks).expect("module builds");
+    let mut driver = build_driver(&image, &marks, "recomp-micro").expect("module builds");
     let mut recompiled = System::new(image.bytes().to_vec(), 0x0800_0100);
     let mut steps = 0;
     while recompiled.cpu.pc() != PARK && steps < 10_000 {
@@ -151,6 +152,164 @@ fn micro_corpus_recompiled_state_matches_interpreted() {
     };
     assert_eq!(word(0x0200_0000), 10, "loop counter");
     assert_eq!(word(0x0200_0100), 20, "helper result");
+}
+
+/// The host-call target: `r0 += r1; mov pc, lr`.
+fn abi_image() -> Image {
+    let words: [u32; 2] = [0xE080_0001, 0xE1A0_F00E];
+    let mut bytes = RomBuilder::new().title("ABIC").build();
+    let mut code = Vec::new();
+    for word in words {
+        code.extend_from_slice(&word.to_le_bytes());
+    }
+    bytes[0x100..0x100 + code.len()].copy_from_slice(&code);
+    Image::from_bytes(bytes).expect("parse")
+}
+
+#[test]
+fn host_call_passes_args_and_preserves_callee_state() {
+    if !recomp::Module::compiler_available() {
+        println!("skipping: no host C compiler on PATH");
+        return;
+    }
+    let image = abi_image();
+    let mut driver = build_driver(&image, &[(0x100, 0x108)], "recomp-abi").expect("module builds");
+    let mut system = System::new(image.bytes().to_vec(), 0x0800_0100);
+
+    // Distinct callee-saved state: the function must leave it alone.
+    for i in 4..13u8 {
+        system.cpu.set_reg_for_test(i, 0x300 + u32::from(i));
+    }
+    let r0 = driver
+        .call_function(&mut system, 0x0800_0100, [40, 2, 7, 9])
+        .expect("native call");
+    assert_eq!(r0, 42, "r0+r1 returned in r0");
+    assert_eq!(system.cpu.reg_for_test(1), 2, "r1 keeps the incoming arg");
+    for i in 4..13u8 {
+        assert_eq!(system.cpu.reg_for_test(i), 0x300 + u32::from(i), "r{i}");
+    }
+    assert_eq!(
+        system.cpu.reg_for_test(14),
+        runtime::recomp::HOST_RETURN_SENTINEL,
+        "lr survives the call"
+    );
+    assert_eq!(
+        system.cpu.pc(),
+        runtime::recomp::HOST_RETURN_SENTINEL,
+        "the guest returns to the sentinel"
+    );
+    assert_eq!(system.cpu.cpsr() & 0xF000_0000, 0, "plain add keeps flags");
+
+    assert!(
+        driver
+            .call_function(&mut system, 0x0800_0104, [0; 4])
+            .is_err(),
+        "a non-entry address is rejected"
+    );
+}
+
+/// `mov r4, #EWRAM; b .+8; filler; mov r0,#25; mov r1,#4; swi 6;
+/// str r0,[r4]; b .`: the SWI sits in a block the native side can
+/// only exit, so the HLE call must run interpreted over the state the
+/// earlier native block computed.
+fn swi_image() -> Image {
+    let words: [u32; 8] = [
+        0xE3A0_4402, // mov r4, #0x02000000
+        0xEA00_0000, // b 0x10c
+        0xE1A0_0000, // (filler, never executed)
+        0xE3A0_0019, // mov r0, #25
+        0xE3A0_1004, // mov r1, #4
+        0xEF00_0006, // swi 6 (Div)
+        0xE584_0000, // str r0, [r4]
+        0xEAFF_FFFE, // b .
+    ];
+    let mut bytes = RomBuilder::new().title("SWIR").build();
+    let mut code = Vec::new();
+    for word in words {
+        code.extend_from_slice(&word.to_le_bytes());
+    }
+    bytes[0x100..0x100 + code.len()].copy_from_slice(&code);
+    Image::from_bytes(bytes).expect("parse")
+}
+
+#[test]
+fn swi_in_translated_function_dispatches_hle_and_matches_interpreted() {
+    if !recomp::Module::compiler_available() {
+        println!("skipping: no host C compiler on PATH");
+        return;
+    }
+    let image = swi_image();
+    let park = 0x0800_011C;
+
+    let mut interpreted = System::new(image.bytes().to_vec(), 0x0800_0100);
+    let mut steps = 0;
+    let mut interpreted_cycles = 0;
+    while interpreted.cpu.pc() != park && steps < 10_000 {
+        interpreted_cycles += interpreted.step();
+        steps += 1;
+    }
+    assert_eq!(
+        interpreted.cpu.pc(),
+        park,
+        "interpreted run reaches the park"
+    );
+
+    let mut driver = build_driver(&image, &[(0x100, 0x120)], "recomp-swi").expect("module builds");
+    assert!(
+        driver.is_translated(0x0800_0100),
+        "the SWI function is translated"
+    );
+    let mut hybrid = System::new(image.bytes().to_vec(), 0x0800_0100);
+    let mut steps = 0;
+    let mut hybrid_cycles = 0;
+    while hybrid.cpu.pc() != park && steps < 10_000 {
+        hybrid_cycles += driver.step(&mut hybrid).expect("native call");
+        steps += 1;
+    }
+    assert_eq!(hybrid.cpu.pc(), park, "hybrid run reaches the park");
+
+    // The HLE Div dispatched: quotient in r0, remainder in r1, abs
+    // quotient in r3 (the swi module's documented convention), and the
+    // store after the SWI landed the quotient in EWRAM.
+    assert_eq!(hybrid.cpu.reg_for_test(0), 6, "25/4");
+    assert_eq!(hybrid.cpu.reg_for_test(1), 1, "25%4");
+    assert_eq!(hybrid.cpu.reg_for_test(3), 6, "|25/4|");
+    let word = u32::from_le_bytes(hybrid.bus().ewram()[0..4].try_into().expect("slice"));
+    assert_eq!(word, 6, "the post-SWI store used the native block's r4");
+
+    // Full state parity with the interpreter.
+    for i in 0..15u8 {
+        assert_eq!(
+            interpreted.cpu.reg_for_test(i),
+            hybrid.cpu.reg_for_test(i),
+            "r{i}"
+        );
+    }
+    assert_eq!(
+        interpreted.cpu.cpsr() & 0xF000_0000,
+        hybrid.cpu.cpsr() & 0xF000_0000,
+        "flags"
+    );
+    let mismatch = interpreted
+        .bus()
+        .ewram()
+        .iter()
+        .zip(hybrid.bus().ewram().iter())
+        .position(|(a, b)| a != b);
+    assert_eq!(mismatch, None, "EWRAM");
+
+    // Cycle accounting within the documented tolerance: every unit
+    // charges the scheduler (the sums are nonzero and of the same
+    // order), while native chunks omit fetch and internal cycles, so
+    // the video clock may lag the interpreted run by less than a
+    // scanline over this program.
+    assert!(hybrid_cycles > 0, "the hybrid run charged cycles");
+    assert!(
+        hybrid_cycles <= interpreted_cycles * 2,
+        "hybrid {hybrid_cycles} vs interpreted {interpreted_cycles} cycles"
+    );
+    let drift = (i32::from(interpreted.vcount()) - i32::from(hybrid.vcount())).abs();
+    assert!(drift <= 1, "scheduler drift {drift} scanlines");
 }
 
 #[test]
