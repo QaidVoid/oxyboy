@@ -29,6 +29,7 @@
 pub mod arm;
 pub mod bios;
 pub mod condition;
+pub mod mmio;
 pub mod register;
 pub mod text;
 pub mod thumb;

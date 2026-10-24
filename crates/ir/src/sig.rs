@@ -248,7 +248,9 @@ fn arg_flow(function: &Function, slot: usize) -> (bool, Option<Type>) {
             continue;
         }
         let block = &function.blocks[index];
-        let arg = block.params[slot];
+        let Some(arg) = block.params.get(slot).copied() else {
+            continue;
+        };
         let pointer = addresses.contains(&arg).then_some(Type::Ptr);
         for (inst_index, inst) in block.insts.iter().enumerate() {
             if operand_uses(inst, arg) {
@@ -389,7 +391,9 @@ fn signed_branch(block: &Block, index: usize) -> bool {
 /// sp-relative offsets.
 fn stack_args(function: &Function) -> usize {
     let entry = &function.blocks[0];
-    let sp = entry.params[Reg::Sp as usize];
+    let Some(sp) = entry.params.get(Reg::Sp as usize).copied() else {
+        return 0;
+    };
     let mut max_slot = 0usize;
     let mut found = false;
     for inst in &entry.insts {
@@ -444,7 +448,7 @@ fn sp_offset(addr: &Value, sp: ValueId, entry: &Block) -> Option<u32> {
 /// The return evidence: `Some(None)` for proven-void, `Some(Some(t))`
 /// for a returning function, `None` when the body has no returns.
 fn return_type(function: &Function) -> Option<Option<Type>> {
-    let incoming = function.blocks[0].params[Reg::R0 as usize];
+    let incoming = function.blocks[0].params.get(Reg::R0 as usize).copied();
     let mut any_return = false;
     let mut value: Option<Type> = None;
     for block in &function.blocks {
@@ -453,7 +457,7 @@ fn return_type(function: &Function) -> Option<Option<Type>> {
         };
         any_return = true;
         match state.first() {
-            Some(Value::Id(id)) if *id == incoming => {}
+            Some(Value::Id(id)) if Some(*id) == incoming => {}
             Some(Value::Id(id)) => value = Some(def_type(function, *id)),
             Some(Value::Const(_)) => value = Some(Type::U32),
             None => {}
@@ -518,7 +522,7 @@ fn call_sites(function: &Function) -> Vec<CallSite> {
             match state.get(slot) {
                 Some(Value::Id(id)) => {
                     *value = Some(*id);
-                    written[slot] = *id != block.params[slot];
+                    written[slot] = !block.params.get(slot).is_some_and(|param| param == id);
                 }
                 Some(Value::Const(_)) => written[slot] = true,
                 None => written[slot] = false,
@@ -579,7 +583,7 @@ fn propagate(functions: &[Function], bodies: &mut [Body]) {
                     let Some(value) = value else {
                         continue;
                     };
-                    if *value != caller.blocks[0].params[slot] {
+                    if caller.blocks[0].params.get(slot) != Some(value) {
                         continue;
                     }
                     let hint = bodies[caller_index].arg_types[slot];

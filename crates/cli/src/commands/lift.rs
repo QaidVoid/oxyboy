@@ -23,7 +23,19 @@ pub fn run(args: LiftArgs) -> i32 {
     let mut map = FlagMap::from_image(&image);
     let seeds = map.seed(&[]);
     let _analysis = analyze(&image, &mut map, &seeds, &seeds, Thresholds::default(), &[]);
-    let mut printed = 0;
+    let annotations = match &args.config {
+        Some(path) => match analysis::config::Config::load(path) {
+            Ok(config) => ir::emit_c::Annotations::from_config(&config),
+            Err(e) => {
+                eprintln!("oxyboy lift: {}: {e}", path.display());
+                return 1;
+            }
+        },
+        None => ir::emit_c::Annotations::default(),
+    };
+    let mut addrs: Vec<u32> = Vec::new();
+    let mut functions: Vec<ir::Function> = Vec::new();
+    let mut dumped = String::new();
     for region in ir::lift::function_regions(&image, &map) {
         if let Some(addr) = args.function
             && region.start != addr
@@ -32,34 +44,51 @@ pub fn run(args: LiftArgs) -> i32 {
         }
         let mut function = ir::lift::lift_function(&image, &map, region);
         if args.print_after_all {
-            optimize_with_dumps(&mut function);
+            optimize_with_dumps(&mut function, &mut dumped);
         } else {
             opt::optimize(&mut function);
-            println!("{}", fmt_function(&function));
+            dumped.push_str(&fmt_function(&function));
+            dumped.push('\n');
+        }
+        if let Some(name) = annotations.names.get(&region.start) {
+            function.name = name.clone();
         }
         if args.cfg || args.cfg_dot {
             let cfg = ir::cfg::Cfg::build(&function);
             if args.cfg {
-                println!("{}", ir::cfg::dump_text(&cfg));
+                dumped.push_str(&ir::cfg::dump_text(&cfg));
             }
             if args.cfg_dot {
-                println!("{}", ir::cfg::dump_dot(&cfg));
+                dumped.push_str(&ir::cfg::dump_dot(&cfg));
             }
         }
-        printed += 1;
+        addrs.push(region.start);
+        functions.push(function);
     }
-    if printed == 0 {
+    if addrs.is_empty() {
         eprintln!("oxyboy lift: no matching function");
         return 1;
+    }
+    if args.c {
+        print!(
+            "{}",
+            ir::emit_c::emit_unit(&addrs, &functions, &annotations)
+        );
+    } else {
+        for function in &functions {
+            dumped.push_str(&fmt_function(function));
+        }
+        print!("{dumped}");
     }
     0
 }
 
 /// Prints the IR after each pipeline stage, pass name first.
-fn optimize_with_dumps(function: &mut ir::Function) {
+fn optimize_with_dumps(function: &mut ir::Function, out: &mut String) {
     opt::optimize_with_dumps(function, &mut |name, f| {
-        println!("=== {name} ===");
-        println!("{}", fmt_function(f));
+        out.push_str(&format!("=== {name} ===\n"));
+        out.push_str(&fmt_function(f));
+        out.push('\n');
     });
 }
 
@@ -86,6 +115,16 @@ pub struct LiftArgs {
     /// Print the control-flow graph in dot form.
     #[arg(long)]
     pub cfg_dot: bool,
+
+    /// Emit the functions as one compilable C translation unit
+    /// instead of the IR text.
+    #[arg(long)]
+    pub c: bool,
+
+    /// Analysis config naming functions and modules; named functions
+    /// keep their configured names in the C output.
+    #[arg(long, value_name = "PATH")]
+    pub config: Option<std::path::PathBuf>,
 }
 
 /// Parses an address literal in hex (`0x` prefix) or decimal.

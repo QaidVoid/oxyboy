@@ -11,12 +11,13 @@
 //! two emits labels only where control actually jumps, keeping the
 //! structured output free of stray labels.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
-use decode::Condition;
+use analysis::config::{Config, sanitize_identifier};
+use decode::{Condition, bios, mmio};
 
 use crate::cfg::{Cfg, Loop};
-use crate::{BlockId, Flag, Function, Inst, Op, SLOTS, Terminator, Value};
+use crate::{BlockId, Flag, Function, Inst, Op, SLOTS, Terminator, Value, ValueId};
 
 /// How a recognized loop closes.
 #[derive(Clone)]
@@ -47,6 +48,68 @@ enum Action {
     Fallthrough,
 }
 
+/// User-provided names for C output, keyed by function entry address.
+/// Built from the analysis config: editing the config and
+/// re-running `lift --c` renames functions and called subs.
+#[derive(Debug, Default, Clone)]
+pub struct Annotations {
+    /// Entry address to C identifier.
+    pub names: BTreeMap<u32, String>,
+}
+
+impl Annotations {
+    /// Collects every named function spec from the config, sanitized
+    /// into a valid C identifier.
+    #[must_use]
+    pub fn from_config(config: &Config) -> Self {
+        let mut names = BTreeMap::new();
+        for spec in &config.functions {
+            if let Some(name) = &spec.name {
+                let clean = sanitize_identifier(name);
+                if !clean.is_empty() {
+                    names.insert(spec.addr, clean);
+                }
+            }
+        }
+        Annotations { names }
+    }
+}
+
+/// Extern declarations the unit form relies on: memory accessors,
+/// flag helpers, and the intrinsics. Every referenced name must
+/// appear here or `gcc -fsyntax-only` fails on an implicit
+/// declaration.
+const UNIT_PREAMBLE: &str = r#"typedef unsigned int u32;
+typedef signed int i32;
+typedef unsigned long long u64;
+extern u32 load_u8(u32);
+extern u32 load_u16(u32);
+extern u32 load_u32(u32);
+extern u32 load_i8(u32);
+extern u32 load_i16(u32);
+extern u32 load_i32(u32);
+extern void store_u8(u32, u32);
+extern void store_u16(u32, u32);
+extern void store_u32(u32, u32);
+extern void flags_cmp(u32, u32);
+extern void flags_cmn(u32, u32);
+extern void flags_tst(u32, u32);
+extern void flags_teq(u32, u32);
+extern void __discard(u32);
+extern void __mov(u32);
+extern void __mvn(u32);
+extern u32 __asr(u32, u32);
+extern u32 __ror(u32, u32);
+extern u32 __rrx(u32);
+extern void __indirect_call(u32);
+extern void unhandled(void);
+extern u32 mrs_cpsr(void);
+extern u32 mrs_spsr(void);
+extern void msr_cpsr(u32, u32);
+extern void msr_spsr(u32, u32);
+extern void swi(u32);
+"#;
+
 /// The structured emitter state.
 struct Emitter<'a> {
     function: &'a Function,
@@ -57,6 +120,11 @@ struct Emitter<'a> {
     goto_targets: BTreeSet<BlockId>,
     consumed: BTreeSet<BlockId>,
     loop_stack: Vec<(BlockId, BlockId, Close)>,
+    /// Compilable unit form: assignments instead of declarations,
+    /// threaded call arguments, `load_*`/`store_*` helper names.
+    unit: bool,
+    /// Name source for called subs, keyed by entry address.
+    callees: &'a BTreeMap<u32, String>,
     out: String,
     indent: usize,
 }
@@ -65,6 +133,7 @@ struct Emitter<'a> {
 pub fn emit_function(function: &Function) -> String {
     let cfg = Cfg::build(function);
     let shapes = recognize_loops(&cfg, function);
+    let callees = BTreeMap::new();
     let mut emitter = Emitter {
         function,
         cfg: &cfg,
@@ -72,6 +141,8 @@ pub fn emit_function(function: &Function) -> String {
         goto_targets: BTreeSet::new(),
         consumed: BTreeSet::new(),
         loop_stack: Vec::new(),
+        unit: false,
+        callees: &callees,
         out: String::new(),
         indent: 1,
     };
@@ -94,6 +165,106 @@ pub fn emit_function(function: &Function) -> String {
     }
     emitter.out.push_str("}\n");
     emitter.out
+}
+
+/// Emits the functions as one compilable C translation unit:
+/// the same structured walk, wrapped in a preamble,
+/// prototypes, and SSA-local declarations so `gcc -fsyntax-only`
+/// accepts the output. `addrs[i]` is the entry address of
+/// `functions[i]`; names come from each function's `name` field, so
+/// apply config names before calling. Recovered signatures render as
+/// comments above each definition.
+#[must_use]
+pub fn emit_unit(addrs: &[u32], functions: &[Function], annotations: &Annotations) -> String {
+    let signatures = crate::sig::recover(functions);
+    // Every callee the unit can name: internal functions by entry
+    // address, then configured externals.
+    let mut callees: BTreeMap<u32, String> = annotations.names.clone();
+    for (addr, function) in addrs.iter().zip(functions) {
+        if !function.name.is_empty() {
+            callees.insert(*addr, function.name.clone());
+        }
+    }
+    let mut out = String::from(UNIT_PREAMBLE);
+    let mut rendered: BTreeSet<u32> = BTreeSet::new();
+    rendered.extend(addrs.iter().copied());
+    // Prototypes: internal functions first, then referenced external
+    // calls, so forward references always resolve.
+    for function in functions {
+        let name = display_name(function);
+        out.push_str(&format!("u32 {name}(u32, u32, u32, u32);\n"));
+    }
+    for function in functions {
+        for addr in call_targets(function) {
+            if !rendered.contains(&addr) {
+                rendered.insert(addr);
+                let name = callees
+                    .get(&addr)
+                    .cloned()
+                    .unwrap_or_else(|| format!("sub_{addr:08x}"));
+                out.push_str(&format!("u32 {name}(u32, u32, u32, u32);\n"));
+            }
+        }
+    }
+    for function in functions {
+        let name = display_name(function);
+        if let Some(sig) = signatures.get(&function.name) {
+            let text = crate::sig::fmt_signature(&name, sig)
+                .replace("/*", "")
+                .replace("*/", "");
+            out.push_str(&format!("/* sig: {text} */\n"));
+        }
+        let cfg = Cfg::build(function);
+        let shapes = recognize_loops(&cfg, function);
+        let mut emitter = Emitter {
+            function,
+            cfg: &cfg,
+            shapes,
+            goto_targets: BTreeSet::new(),
+            consumed: BTreeSet::new(),
+            loop_stack: Vec::new(),
+            unit: true,
+            callees: &callees,
+            out: String::new(),
+            indent: 1,
+        };
+        emitter.run();
+        emitter.out.clear();
+        emitter.consumed.clear();
+        emitter.loop_stack.clear();
+        emitter.indent = 1;
+        emitter.run();
+        out.push_str(&format!("u32 {name}({}) {{\n", emitter.unit_params()));
+        out.push_str(&emitter.unit_declarations());
+        out.push_str(&emitter.out);
+        if emitter.goto_targets.contains(&BlockId(u32::MAX)) {
+            out.push_str("    b_indirect:;\n    return 0;\n");
+        }
+        out.push_str("}\n\n");
+    }
+    out
+}
+
+/// The function's display name, with a fallback for unnamed ones.
+fn display_name(function: &Function) -> String {
+    if function.name.is_empty() {
+        "sub_0".to_string()
+    } else {
+        function.name.clone()
+    }
+}
+
+/// Every direct-call target address in the function.
+fn call_targets(function: &Function) -> Vec<u32> {
+    let mut targets = Vec::new();
+    for block in &function.blocks {
+        if let Terminator::Call { target, .. } = &block.term
+            && let Value::Const(addr) = target
+        {
+            targets.push(*addr);
+        }
+    }
+    targets
 }
 
 /// Finds the simple loops worth structuring: exactly one back edge,
@@ -327,7 +498,8 @@ impl Emitter<'_> {
             let term = self.function.blocks[block.0 as usize].term.clone();
             match term {
                 Terminator::Unreachable => {
-                    self.line("/* unreachable */ return;");
+                    let empty = if self.unit { "return 0;" } else { "return;" };
+                    self.line(&format!("/* unreachable */ {empty}"));
                     return false;
                 }
                 Terminator::Return { state, .. } => {
@@ -340,8 +512,12 @@ impl Emitter<'_> {
                     self.goto(BlockId(u32::MAX));
                     return false;
                 }
-                Terminator::Call { target, cont, .. } => {
-                    self.emit_call(&target);
+                Terminator::Call {
+                    target,
+                    cont,
+                    state,
+                } => {
+                    self.emit_call(&target, &state);
                     match cont {
                         Some((cont, _)) => {
                             if self.consumed.contains(&cont) || self.goto_targets.contains(&cont) {
@@ -351,7 +527,8 @@ impl Emitter<'_> {
                             block = cont;
                         }
                         None => {
-                            self.line("return;");
+                            let empty = if self.unit { "return 0;" } else { "return;" };
+                            self.line(empty);
                             return false;
                         }
                     }
@@ -520,7 +697,10 @@ impl Emitter<'_> {
                 let value = self.value(value);
                 self.line(&format!("return {value};"));
             }
-            None => self.line("return;"),
+            None => {
+                let empty = if self.unit { "return 0;" } else { "return;" };
+                self.line(empty);
+            }
         }
     }
 
@@ -542,9 +722,27 @@ impl Emitter<'_> {
             .is_some_and(|inst| matches!(inst.op, Op::Cmp { .. }))
     }
 
-    fn emit_call(&mut self, target: &Value) {
+    fn emit_call(&mut self, target: &Value, state: &[Value]) {
         match target {
-            Value::Const(addr) => self.line(&format!("sub_{addr:x}();")),
+            Value::Const(addr) => {
+                let name = self.callee_name(*addr);
+                if self.unit {
+                    let mut args: Vec<String> = state
+                        .iter()
+                        .take(4)
+                        .map(|value| self.value(value))
+                        .collect();
+                    args.resize(4, "0u".to_string());
+                    let stack = if state.len() > 4 {
+                        format!(" /* + {} stack args */", state.len() - 4)
+                    } else {
+                        String::new()
+                    };
+                    self.line(&format!("{}({});{stack}", name, args.join(", ")));
+                } else {
+                    self.line(&format!("{name}();"));
+                }
+            }
             value => {
                 let value = self.value(value);
                 self.line(&format!("__indirect_call({value});"));
@@ -830,7 +1028,7 @@ impl Emitter<'_> {
             Op::Mov { a, .. } => match dest.as_deref() {
                 Some(dest) => {
                     let value = self.value(a);
-                    format!("u32 {dest} = {value};")
+                    format!("{}{value};", self.def_prefix(dest))
                 }
                 None => {
                     let value = self.value(a);
@@ -840,7 +1038,7 @@ impl Emitter<'_> {
             Op::Mvn { a, .. } => match dest.as_deref() {
                 Some(dest) => {
                     let value = self.value(a);
-                    format!("u32 {dest} = ~{value};")
+                    format!("{}~{value};", self.def_prefix(dest))
                 }
                 None => {
                     let value = self.value(a);
@@ -871,7 +1069,19 @@ impl Emitter<'_> {
                 };
                 let a = self.value(a);
                 let b = self.value(b);
-                format!("u64 {lo}:{hi} = ({sign}64){a} * ({sign}64){b}{acc};")
+                if self.unit {
+                    if inst.dests.is_empty() {
+                        format!(
+                            "{{ u64 __pair = ({sign}64){a} * ({sign}64){b}{acc}; (void)__pair; }}"
+                        )
+                    } else {
+                        format!(
+                            "{{ u64 __pair = ({sign}64){a} * ({sign}64){b}{acc}; {lo} = (u32)__pair; {hi} = (u32)(__pair >> 32); }}"
+                        )
+                    }
+                } else {
+                    format!("u64 {lo}:{hi} = ({sign}64){a} * ({sign}64){b}{acc};")
+                }
             }
             Op::Cmp { a, b } => {
                 let (a, b) = (self.value(a), self.value(b));
@@ -911,7 +1121,10 @@ impl Emitter<'_> {
                 match dest.as_deref() {
                     Some(dest) => {
                         let flags = if *set_flags { " /* sets flags */" } else { "" };
-                        format!("u32 {dest} = (u32)((i32){a} >> {amount});{flags}")
+                        format!(
+                            "{}(u32)((i32){a} >> {amount});{flags}",
+                            self.def_prefix(dest)
+                        )
                     }
                     None => format!("__asr({a}, {amount});"),
                 }
@@ -926,7 +1139,7 @@ impl Emitter<'_> {
                 match dest.as_deref() {
                     Some(dest) => {
                         let flags = if *set_flags { " /* sets flags */" } else { "" };
-                        format!("u32 {dest} = __ror({a}, {amount});{flags}")
+                        format!("{}__ror({a}, {amount});{flags}", self.def_prefix(dest))
                     }
                     None => format!("__ror({a}, {amount});"),
                 }
@@ -936,7 +1149,7 @@ impl Emitter<'_> {
                 match dest.as_deref() {
                     Some(dest) => {
                         let flags = if *set_flags { " /* sets flags */" } else { "" };
-                        format!("u32 {dest} = __rrx({a});{flags}")
+                        format!("{}__rrx({a});{flags}", self.def_prefix(dest))
                     }
                     None => format!("__rrx({a});"),
                 }
@@ -953,10 +1166,17 @@ impl Emitter<'_> {
                     crate::Size::Word => "32",
                 };
                 let sign = if *signed { "i" } else { "u" };
+                let helper = if self.unit { "load" } else { "mem" };
+                let comment = Self::io_comment(addr).unwrap_or_default();
                 let addr = self.value(addr);
                 let line = match dest.as_deref() {
-                    Some(dest) => format!("u32 {dest} = mem_{sign}{width}({addr});"),
-                    None => format!("mem_{sign}{width}({addr});"),
+                    Some(dest) => {
+                        format!(
+                            "{}{helper}_{sign}{width}({addr});{comment}",
+                            self.def_prefix(dest)
+                        )
+                    }
+                    None => format!("{helper}_{sign}{width}({addr});{comment}"),
                 };
                 if matches!(mode, crate::LoadMode::Swap | crate::LoadMode::Block) {
                     line.trim_end_matches(';').to_string() + "; /* swap or block mode */"
@@ -970,18 +1190,32 @@ impl Emitter<'_> {
                     crate::Size::Half => "16",
                     crate::Size::Word => "32",
                 };
+                let helper = if self.unit { "store_u" } else { "mem_u" };
+                let comment = Self::io_comment(addr).unwrap_or_default();
                 let (addr, value) = (self.value(addr), self.value(value));
-                format!("mem_u{width}({addr}, {value});")
+                format!("{helper}{width}({addr}, {value});{comment}")
             }
             Op::Intrinsic { name, args } => {
+                let comment = if name == &"swi" {
+                    Self::swi_comment(args).unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                let name = if self.unit {
+                    name.replace('-', "_")
+                } else {
+                    (*name).to_string()
+                };
                 let args = args
                     .iter()
                     .map(|a| self.value(a))
                     .collect::<Vec<_>>()
                     .join(", ");
                 match dest.as_deref() {
-                    Some(dest) => format!("u32 {dest} = {name}({args});"),
-                    None => format!("{name}({args});"),
+                    Some(dest) => {
+                        format!("{}{name}({args});{comment}", self.def_prefix(dest))
+                    }
+                    None => format!("{name}({args});{comment}"),
                 }
             }
         };
@@ -992,7 +1226,7 @@ impl Emitter<'_> {
         let (a, b) = (self.value(a), self.value(b));
         let flags = if set_flags { " /* sets flags */" } else { "" };
         match dest {
-            Some(dest) => format!("u32 {dest} = {a} {op} {b};{flags}"),
+            Some(dest) => format!("{}{a} {op} {b};{flags}", self.def_prefix(dest)),
             None => format!("__discard({a} {op} {b});"),
         }
     }
@@ -1009,7 +1243,7 @@ impl Emitter<'_> {
         let (a, b, carry) = (self.value(a), self.value(b), self.value(carry));
         let flags = if set_flags { " /* sets flags */" } else { "" };
         match dest {
-            Some(dest) => format!("u32 {dest} = {a} {op} {b} + {carry};{flags}"),
+            Some(dest) => format!("{}{a} {op} {b} + {carry};{flags}", self.def_prefix(dest)),
             None => format!("__discard({a} {op} {b} + {carry});"),
         }
     }
@@ -1021,6 +1255,132 @@ impl Emitter<'_> {
         }
     }
 
+    /// A dest binding: a declaration in the readable form, a plain
+    /// assignment in the unit form (declared once at the top).
+    fn def_prefix(&self, dest: &str) -> String {
+        if self.unit {
+            format!("{dest} = ")
+        } else {
+            format!("u32 {dest} = ")
+        }
+    }
+
+    /// The C name of a called sub: unit-form names resolve through
+    /// the unit's callee table; the readable form keeps `sub_ADDR`.
+    fn callee_name(&self, addr: u32) -> String {
+        if self.unit {
+            self.callees
+                .get(&addr)
+                .cloned()
+                .unwrap_or_else(|| format!("sub_{addr:08x}"))
+        } else {
+            format!("sub_{addr:x}")
+        }
+    }
+
+    /// The unit-form parameter list: the entry block's first four
+    /// value slots become the C parameters r0..r3.
+    fn unit_params(&self) -> String {
+        let entry = &self.function.blocks[0].params;
+        (0..4)
+            .map(|slot| {
+                entry
+                    .get(slot)
+                    .map(|id| format!("u32 v{}", id.0))
+                    .unwrap_or_else(|| format!("u32 a{slot}"))
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// The unit-form declaration block: every referenced SSA id that
+    /// is not an entry parameter, one local per line.
+    fn unit_declarations(&self) -> String {
+        let entry: Vec<ValueId> = self.function.blocks[0]
+            .params
+            .iter()
+            .take(4)
+            .copied()
+            .collect();
+        let mut text = String::new();
+        for id in self.referenced_ids() {
+            if entry.contains(&id) {
+                continue;
+            }
+            text.push_str(&format!("    u32 v{};\n", id.0));
+        }
+        text
+    }
+
+    /// Every SSA id the rendered text can mention: instruction dests
+    /// and operands, plus call, return, and indirect-exit state.
+    fn referenced_ids(&self) -> BTreeSet<ValueId> {
+        let mut ids = BTreeSet::new();
+        for block in &self.function.blocks {
+            for param in &block.params {
+                ids.insert(*param);
+            }
+            for inst in &block.insts {
+                for dest in &inst.dests {
+                    ids.insert(*dest);
+                }
+                for value in crate::opt::operands(&inst.op) {
+                    if let Value::Id(id) = value {
+                        ids.insert(id);
+                    }
+                }
+            }
+            let mut state: Vec<Value> = Vec::new();
+            match &block.term {
+                Terminator::Return { state: out, .. }
+                | Terminator::IndirectExit { state: out, .. } => {
+                    state = out.clone();
+                }
+                Terminator::Call {
+                    target, state: out, ..
+                } => {
+                    state = out.clone();
+                    if let Value::Id(id) = target {
+                        ids.insert(*id);
+                    }
+                }
+                _ => {}
+            }
+            for value in state {
+                if let Value::Id(id) = value {
+                    ids.insert(id);
+                }
+            }
+        }
+        ids
+    }
+
+    /// The MMIO register name when `addr` is a constant in the IO
+    /// block, for the inline comment.
+    fn io_comment(addr: &Value) -> Option<String> {
+        match addr {
+            Value::Const(c) => mmio::io_name(*c).map(|name| format!(" /* {name} */")),
+            _ => None,
+        }
+    }
+
+    /// The SWI service comment for a `swi` intrinsic: the number sits
+    /// in bits 16-23 of the ARM immediate, plain in THUMB.
+    fn swi_comment(args: &[Value]) -> Option<String> {
+        let Value::Const(raw) = args.first()? else {
+            return None;
+        };
+        let number = if *raw > 0xFF {
+            (raw >> 16) & 0xFF
+        } else {
+            *raw
+        };
+        let name = bios::swi_name(u8::try_from(number).ok()?)
+            .map(|name| format!(": {name}"))
+            .unwrap_or_default();
+        Some(format!(" /* swi 0x{number:02x}{name} */"))
+    }
+
     /// Renders `cond` against the block's trailing `cmp` when
     /// present, else as a flag expression. `invert` negates.
     fn condition_text(&self, cond: Condition, block: BlockId, invert: bool) -> String {
@@ -1030,12 +1390,12 @@ impl Emitter<'_> {
             (Some(cond), false)
         };
         let Some(cond) = cond else {
-            let text = self.flag_expr(Condition::Al);
+            let text = self.flag_expr(Condition::Al, block);
             return format!("!({text})");
         };
         let text = match self.block_cmp(block) {
-            Some((a, b)) => self.comparison_text(cond, a, b),
-            None => self.flag_expr(cond),
+            Some((a, b)) => self.comparison_text(cond, a, b, block),
+            None => self.flag_expr(cond, block),
         };
         if wrapped { format!("!({text})") } else { text }
     }
@@ -1050,7 +1410,7 @@ impl Emitter<'_> {
         }
     }
 
-    fn comparison_text(&self, cond: Condition, a: Value, b: Value) -> String {
+    fn comparison_text(&self, cond: Condition, a: Value, b: Value, block: BlockId) -> String {
         let (a, b) = (self.value(&a), self.value(&b));
         match cond {
             Condition::Eq => format!("({a} == {b})"),
@@ -1063,15 +1423,15 @@ impl Emitter<'_> {
             Condition::Lt => format!("((i32){a} < (i32){b})"),
             Condition::Gt => format!("((i32){a} > (i32){b})"),
             Condition::Le => format!("((i32){a} <= (i32){b})"),
-            _ => format!("{} /* {cond:?} */", self.flag_expr(cond)),
+            _ => format!("{} /* {cond:?} */", self.flag_expr(cond, block)),
         }
     }
 
-    fn flag_expr(&self, cond: Condition) -> String {
-        let n = self.flag_slot(Flag::N);
-        let z = self.flag_slot(Flag::Z);
-        let c = self.flag_slot(Flag::C);
-        let v = self.flag_slot(Flag::V);
+    fn flag_expr(&self, cond: Condition, block: BlockId) -> String {
+        let n = self.flag_slot(block, Flag::N);
+        let z = self.flag_slot(block, Flag::Z);
+        let c = self.flag_slot(block, Flag::C);
+        let v = self.flag_slot(block, Flag::V);
         match cond {
             Condition::Eq => z,
             Condition::Ne => format!("!{z}"),
@@ -1091,14 +1451,22 @@ impl Emitter<'_> {
         }
     }
 
-    /// The SSA name of one flag slot, or a placeholder when the slot
-    /// table does not carry it.
-    fn flag_slot(&self, flag: Flag) -> String {
-        match SLOTS
+    /// The SSA name of one flag slot in `block`'s parameters, or a
+    /// placeholder when the block does not carry it.
+    fn flag_slot(&self, block: BlockId, flag: Flag) -> String {
+        let index = SLOTS
             .iter()
-            .position(|slot| matches!(slot, crate::Slot::Flag(f) if *f == flag))
+            .position(|slot| matches!(slot, crate::Slot::Flag(f) if *f == flag));
+        let Some(index) = index else {
+            return format!("0u /* {flag:?} */");
+        };
+        match self
+            .function
+            .blocks
+            .get(block.0 as usize)
+            .and_then(|b| b.params.get(index))
         {
-            Some(index) => format!("v{index}"),
+            Some(param) => format!("v{}", param.0),
             None => format!("0u /* {flag:?} */"),
         }
     }
@@ -1483,5 +1851,125 @@ mod tests {
         let text = emit_function(&function);
         assert_wellformed(&text);
         assert!(text.contains("return v40;"), "{text}");
+    }
+
+    #[test]
+    fn annotation_comments_render_io_and_swi_names() {
+        let store_dispcnt = inst(
+            Vec::new(),
+            Op::Store {
+                addr: Value::Const(0x0400_0000),
+                value: Value::Const(0x0400),
+                size: crate::Size::Word,
+            },
+        );
+        let read_keys = inst(
+            vec![ValueId(0)],
+            Op::Load {
+                addr: Value::Const(0x0400_0130),
+                size: crate::Size::Half,
+                signed: false,
+                mode: crate::LoadMode::Ldr,
+            },
+        );
+        let software_interrupt = inst(
+            Vec::new(),
+            Op::Intrinsic {
+                name: "swi",
+                args: vec![Value::Const(0x0006_0000)],
+            },
+        );
+        let text = emitted(vec![
+            block(
+                vec![store_dispcnt, read_keys, software_interrupt],
+                branch(BlockId(1)),
+            ),
+            block(Vec::new(), ret()),
+        ]);
+        assert!(
+            text.contains("mem_u32(0x4000000u, 0x400u); /* DISPCNT */"),
+            "{text}"
+        );
+        assert!(text.contains("/* KEYINPUT */"), "{text}");
+        assert!(
+            text.contains("swi(0x60000u); /* swi 0x06: Div */"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn unit_form_names_functions_and_renders_signatures() {
+        // mov r0, #5; loop: cmp r0, #0; bne loop; bx lr
+        let mut callee = lift_arm(&[0xE3A0_0005, 0xE350_0000, 0x1AFF_FFFE, 0xE12F_FF1E], 4);
+        let base = callee.blocks[0].addr;
+        callee.name = "count_down".to_string();
+        let caller = Function {
+            name: "caller_fn".to_string(),
+            blocks: vec![block(
+                Vec::new(),
+                Terminator::Call {
+                    target: Value::Const(base),
+                    cont: None,
+                    state: vec![Value::Const(0); crate::STATE_ARITY],
+                },
+            )],
+        };
+        let mut annotations = Annotations::default();
+        annotations.names.insert(base, "count_down".to_string());
+        let text = emit_unit(&[base], &[caller, callee], &annotations);
+        assert!(
+            text.contains("u32 count_down(u32, u32, u32, u32);"),
+            "{text}"
+        );
+        assert!(
+            text.contains("u32 caller_fn(u32, u32, u32, u32);"),
+            "{text}"
+        );
+        assert!(text.contains("count_down("), "{text}");
+        assert!(text.contains("/* sig:"), "{text}");
+        assert!(!text.contains("/* /*"), "{text}");
+        assert_wellformed(&text);
+    }
+
+    #[test]
+    fn unit_form_passes_gcc_syntax_when_available() {
+        // mov r0, #5; loop: cmp r0, #0; bne loop; bx lr
+        let mut callee = lift_arm(&[0xE3A0_0005, 0xE350_0000, 0x1AFF_FFFE, 0xE12F_FF1E], 4);
+        let base = callee.blocks[0].addr;
+        callee.name = "count_down".to_string();
+        let caller = Function {
+            name: "caller_fn".to_string(),
+            blocks: vec![block(
+                Vec::new(),
+                Terminator::Call {
+                    target: Value::Const(base),
+                    cont: None,
+                    state: vec![Value::Const(0); crate::STATE_ARITY],
+                },
+            )],
+        };
+        let text = emit_unit(&[base], &[caller, callee], &Annotations::default());
+        let Ok(check) = std::process::Command::new("gcc").arg("--version").output() else {
+            eprintln!("skipping: gcc not runnable");
+            return;
+        };
+        assert!(check.status.success(), "gcc --version failed");
+        let path = std::env::temp_dir().join(format!("oxyboy_unit_{}.c", std::process::id()));
+        std::fs::write(&path, &text).expect("writes temp unit");
+        let result = std::process::Command::new("gcc")
+            .arg("-fsyntax-only")
+            .arg(&path)
+            .output();
+        let _ = std::fs::remove_file(&path);
+        match result {
+            Ok(output) => {
+                assert!(
+                    output.status.success(),
+                    "gcc rejected the unit: {}\n{text}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            Err(e) => eprintln!("skipping: gcc not runnable: {e}"),
+        }
     }
 }
