@@ -223,6 +223,7 @@ mod tests {
                     Inst {
                         guard: None,
                         dests: vec![ValueId(20)],
+                        fallbacks: Vec::new(),
                         op: Op::Add {
                             set_flags: false,
                             a: reg(0),
@@ -234,6 +235,7 @@ mod tests {
                     Inst {
                         guard: None,
                         dests: vec![],
+                        fallbacks: Vec::new(),
                         op: Op::Store {
                             addr: reg(20),
                             value: reg(1),

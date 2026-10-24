@@ -1481,6 +1481,7 @@ mod tests {
         Inst {
             guard: None,
             dests,
+            fallbacks: Vec::new(),
             op,
             pc: 0,
             state: Vec::new(),

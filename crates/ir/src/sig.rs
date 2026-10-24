@@ -633,6 +633,7 @@ mod tests {
         Inst {
             guard: None,
             dests: vec![dest],
+            fallbacks: Vec::new(),
             op,
             pc: 0,
             state: Vec::new(),
@@ -643,6 +644,7 @@ mod tests {
         Inst {
             guard: None,
             dests: Vec::new(),
+            fallbacks: Vec::new(),
             op,
             pc: 0,
             state: Vec::new(),

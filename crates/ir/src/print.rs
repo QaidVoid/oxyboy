@@ -69,6 +69,9 @@ fn fmt_inst(inst: &Inst) -> String {
         out.push_str(" = ");
     }
     out.push_str(&fmt_op(&inst.op));
+    for fallback in inst.fallbacks.iter().flatten() {
+        out.push_str(&format!(" (else {})", fmt_value(fallback)));
+    }
     out.push('\n');
     out
 }
@@ -495,6 +498,7 @@ pub(crate) fn sample_function() -> Function {
                     Inst {
                         guard: None,
                         dests: vec![ValueId(20)],
+                        fallbacks: Vec::new(),
                         op: Op::Add {
                             set_flags: false,
                             a: reg(0),
@@ -512,6 +516,7 @@ pub(crate) fn sample_function() -> Function {
                             ValueId(24),
                             ValueId(25),
                         ],
+                        fallbacks: Vec::new(),
                         op: Op::Add {
                             set_flags: true,
                             a: reg(20),
@@ -523,6 +528,7 @@ pub(crate) fn sample_function() -> Function {
                     Inst {
                         guard: Some(Condition::Ne),
                         dests: vec![],
+                        fallbacks: Vec::new(),
                         op: Op::Store {
                             addr: reg(20),
                             value: reg(2),
@@ -534,6 +540,7 @@ pub(crate) fn sample_function() -> Function {
                     Inst {
                         guard: None,
                         dests: vec![ValueId(26)],
+                        fallbacks: Vec::new(),
                         op: Op::Load {
                             addr: reg(20),
                             size: crate::Size::Half,
@@ -573,6 +580,7 @@ pub(crate) fn sample_function() -> Function {
                 insts: vec![Inst {
                     guard: None,
                     dests: vec![ValueId(30), ValueId(31)],
+                    fallbacks: Vec::new(),
                     op: Op::Rrx {
                         set_flags: true,
                         a: reg(29),

@@ -169,7 +169,17 @@ fn emit_inst(out: &mut String, inst: &Inst) {
             out.push_str(&body);
             // A failed condition costs the interpreter one internal
             // cycle (ARM step model); the fetch already went out.
-            out.push_str("    } else {\n        st->cycles += 1u;\n    }\n");
+            out.push_str("    } else {\n");
+            // Guard-fail fallbacks: slot writes that a later read can
+            // observe outside the guard take the slot's previous
+            // value, exactly like the interpreter leaving the register
+            // untouched.
+            for (dest, fallback) in inst.dests.iter().zip(&inst.fallbacks) {
+                if let Some(prev) = fallback {
+                    let _ = writeln!(out, "        v{} = {};", dest.0, expr(prev));
+                }
+            }
+            out.push_str("        st->cycles += 1u;\n    }\n");
         }
     }
 }
@@ -1056,6 +1066,7 @@ mod tests {
                     Inst {
                         guard: None,
                         dests: vec![ValueId(20)],
+                        fallbacks: Vec::new(),
                         op: Op::Add {
                             set_flags: false,
                             a: reg(0),
@@ -1067,6 +1078,7 @@ mod tests {
                     Inst {
                         guard: Some(Condition::Ne),
                         dests: vec![],
+                        fallbacks: Vec::new(),
                         op: Op::Store {
                             addr: reg(20),
                             value: reg(1),
@@ -1112,6 +1124,45 @@ mod tests {
     }
 
     #[test]
+    fn guarded_writes_materialize_their_fallback_in_the_else_arm() {
+        let mut f = sample();
+        // movne r3, #1 between the sample's add and store: the store's
+        // r3 operand reads the guarded dest, so the emitted else arm
+        // must assign the dest its fallback (r3's incoming value).
+        f.blocks[0].insts.insert(
+            1,
+            Inst {
+                guard: Some(Condition::Ne),
+                dests: vec![ValueId(40)],
+                fallbacks: vec![Some(Value::Id(ValueId(3)))],
+                op: Op::Mov {
+                    set_flags: false,
+                    a: Value::Const(1),
+                    carry_in: Value::Const(0),
+                },
+                pc: 0x0800_0102,
+                state: Vec::new(),
+            },
+        );
+        // Point the store at the guarded dest so its read is outside
+        // the guard.
+        f.blocks[0].insts[2].op = Op::Store {
+            addr: Value::Id(ValueId(40)),
+            value: reg(1),
+            size: Size::Word,
+        };
+        let source = emit_module(&[(0x0800_0100, &f)]).c_source;
+        assert!(
+            source.contains("if (!st->z) {\n    st->icount++;"),
+            "{source}"
+        );
+        assert!(
+            source.contains("} else {\n        v40 = v3;\n        st->cycles += 1u;\n    }"),
+            "fallback in the else arm: {source}"
+        );
+    }
+
+    #[test]
     fn cycle_charges_go_through_the_host_fetch_callback() {
         let mut f = sample();
         let source = emit_module(&[(0x0800_0100, &f)]).c_source;
@@ -1149,6 +1200,7 @@ mod tests {
             Inst {
                 guard: None,
                 dests: vec![],
+                fallbacks: Vec::new(),
                 op: Op::Intrinsic {
                     name: "swi",
                     args: vec![],

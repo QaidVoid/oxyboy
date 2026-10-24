@@ -161,6 +161,78 @@ fn micro_corpus_recompiled_state_matches_interpreted() {
     assert_eq!(word(0x0200_0100), 20, "helper result");
 }
 
+/// The boolean idiom that broke the hybrid: `cmp` + `movne rX,#1` +
+/// `moveq rX,#0` + an unconditional store of rX. The guarded writes
+/// must leave rX at the selected value when the store (outside the
+/// guards) reads it - an earlier defect stored the not-taken arm's
+/// never-assigned local.
+#[test]
+fn conditional_boolean_idiom_stores_the_selected_value() {
+    if !recomp::Module::compiler_available() {
+        println!("skipping: no host C compiler on PATH");
+        return;
+    }
+    let words: [u32; 12] = [
+        0xE3A0_0402, // mov r0, #0x02000000
+        0xE3A0_1007, // mov r1, #7
+        0xE351_0000, // cmp r1, #0
+        0x13A0_2001, // movne r2, #1
+        0x03A0_2000, // moveq r2, #0
+        0xE480_2004, // str r2, [r0], #4
+        0xE3A0_1000, // mov r1, #0
+        0xE351_0000, // cmp r1, #0
+        0x13A0_2001, // movne r2, #1
+        0x03A0_2000, // moveq r2, #0
+        0xE480_2004, // str r2, [r0], #4
+        0xEA00_0003, // b 0x140 (the park)
+    ];
+    let mut bytes = RomBuilder::new().title("BOOL").build();
+    let mut code = Vec::new();
+    for word in words {
+        code.extend_from_slice(&word.to_le_bytes());
+    }
+    bytes[0x100..0x100 + code.len()].copy_from_slice(&code);
+    let image = Image::from_bytes(bytes).expect("parse");
+
+    let mut interpreted = System::new(image.bytes().to_vec(), 0x0800_0100);
+    let mut steps = 0;
+    while interpreted.cpu.pc() != PARK && steps < 10_000 {
+        interpreted.step();
+        steps += 1;
+    }
+    assert_eq!(
+        interpreted.cpu.pc(),
+        PARK,
+        "interpreted run reaches the park"
+    );
+
+    let mut driver = build_driver(&image, &[(0x100u32, 0x130u32)], "recomp-bool").expect("builds");
+    let mut recompiled = System::new(image.bytes().to_vec(), 0x0800_0100);
+    let mut steps = 0;
+    while recompiled.cpu.pc() != PARK && steps < 10_000 {
+        driver.step(&mut recompiled).expect("native call");
+        steps += 1;
+    }
+    assert_eq!(recompiled.cpu.pc(), PARK, "recompiled run reaches the park");
+
+    let word = |system: &System, addr: usize| {
+        u32::from_le_bytes(
+            system.bus().ewram()[addr - 0x0200_0000..addr - 0x0200_0000 + 4]
+                .try_into()
+                .unwrap(),
+        )
+    };
+    assert_eq!(word(&interpreted, 0x0200_0000), 1, "NE stores 1");
+    assert_eq!(word(&interpreted, 0x0200_0004), 0, "EQ stores 0");
+    assert_eq!(word(&recompiled, 0x0200_0000), 1, "NE stores 1 natively");
+    assert_eq!(word(&recompiled, 0x0200_0004), 0, "EQ stores 0 natively");
+    assert_eq!(
+        interpreted.cpu.reg_for_test(2),
+        recompiled.cpu.reg_for_test(2),
+        "r2"
+    );
+}
+
 /// Cycle parity: the recompiled run of the micro
 /// corpus charges exactly the interpreter's cycle count for the same
 /// instruction sequence - opcode fetches through the bus's real cost

@@ -32,6 +32,10 @@ pub(crate) struct ArmLift {
     pub addr: u32,
     /// The decoded condition guarding this instruction.
     pub(crate) guard: Option<Condition>,
+    /// Slot writes under the current guard: dest id to the slot's
+    /// previous representative. Consumed by the next [`ArmLift::emit`]
+    /// into `Inst::fallbacks`.
+    pub(crate) fallbacks: Vec<(ValueId, ValueId)>,
 }
 
 impl ArmLift {
@@ -50,9 +54,25 @@ impl ArmLift {
         let state = matches!(&op, Op::Store { .. })
             .then(|| self.current.iter().map(|id| Value::Id(*id)).collect())
             .unwrap_or_default();
+        // Slot writes under a real condition carry the slot's previous
+        // representative as the guard-fail fallback.
+        let fallbacks = if self.guard.is_some_and(|cond| cond != Condition::Al) {
+            dests
+                .iter()
+                .map(|dest| {
+                    self.fallbacks
+                        .iter()
+                        .find(|(id, _)| id == dest)
+                        .map(|(_, prev)| Value::Id(*prev))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         self.insts.push(Inst {
             guard: self.guard,
             dests,
+            fallbacks,
             op,
             pc: self.addr,
             state,
@@ -70,18 +90,32 @@ impl ArmLift {
     }
 
     /// Writes `reg`: allocates a fresh id and updates the state.
+    /// Under a real condition the previous representative is recorded
+    /// as the write's guard-fail fallback.
     pub(crate) fn write(&mut self, reg: Register) -> ValueId {
         let id = self.fresh();
+        self.record_fallback(reg.bits() as usize, id);
         self.current[reg.bits() as usize] = id;
         id
     }
 
     /// Binds one flag: a fresh id that becomes the flag's value.
-    /// `slot` is 0..4 within N, Z, C, V.
+    /// `slot` is 0..4 within N, Z, C, V. Under a real condition the
+    /// previous representative is recorded as the write's guard-fail
+    /// fallback.
     pub(crate) fn flag_dest(&mut self, slot: usize) -> ValueId {
         let id = self.fresh();
+        self.record_fallback(16 + slot, id);
         self.current[16 + slot] = id;
         id
+    }
+
+    /// Records `slot`'s current representative as the fallback for a
+    /// write binding `id`, when a real condition guards the write.
+    fn record_fallback(&mut self, slot: usize, id: ValueId) {
+        if self.guard.is_some_and(|cond| cond != Condition::Al) {
+            self.fallbacks.push((id, self.current[slot]));
+        }
     }
 
     /// The incoming carry value.

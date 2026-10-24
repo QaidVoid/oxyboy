@@ -326,6 +326,19 @@ fn substitute_inst(inst: &mut Inst, subs: &[(ValueId, u32)]) {
             }
         }
     }
+    // Guard-fail fallbacks fold with their slot's previous value: the
+    // defining inst may have been folded away, so the fallback must
+    // carry the constant itself.
+    for fallback in inst.fallbacks.iter_mut().flatten() {
+        if let Value::Id(id) = *fallback {
+            for (from, to) in subs {
+                if *from == id {
+                    *fallback = Value::Const(*to);
+                    break;
+                }
+            }
+        }
+    }
 }
 
 /// Dead-flag elimination: clears the set-flags bit of ops whose flag
@@ -366,6 +379,7 @@ pub fn dead_flag_elimination(function: &mut Function) {
                 }
             } else if keep < inst.dests.len() {
                 inst.dests.truncate(keep);
+                inst.fallbacks.truncate(keep);
                 if plain {
                     set_plain(inst);
                 }
@@ -531,6 +545,7 @@ fn block_facts(function: &Function) -> Vec<BlockFacts> {
                     operands(&inst.op)
                         .iter()
                         .chain(inst.state.iter())
+                        .chain(inst.fallbacks.iter().flatten())
                         .filter_map(|v| match v {
                             Value::Id(id) => Some(*id),
                             Value::Const(_) => None,

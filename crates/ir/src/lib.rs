@@ -297,6 +297,13 @@ pub struct Inst {
     pub guard: Option<Condition>,
     /// Values bound by the op, in the order the op documents.
     pub dests: Vec<ValueId>,
+    /// Per-dest values taken when the guard fails, parallel to
+    /// `dests`: the machine slot's previous representative for slot
+    /// writes (registers and flags), so a later read outside the
+    /// guard still sees the pre-instruction value. Empty when the
+    /// instruction is unconditional; slot writes without a recorded
+    /// predecessor are `None` (read only under this guard).
+    pub fallbacks: Vec<Option<Value>>,
     /// The operation and its operands.
     pub op: Op,
     /// Canonical guest address of the source instruction. Effects that

@@ -227,6 +227,7 @@ impl Lifter<'_> {
             insts: Vec::new(),
             addr: from,
             guard: None,
+            fallbacks: Vec::new(),
         };
         // One cycle charge per executed guest instruction, in order.
         let mut cycles: Vec<CycleCharge> = Vec::new();
@@ -257,6 +258,7 @@ impl Lifter<'_> {
                                 lift.insts.push(crate::Inst {
                                     guard: None,
                                     dests: vec![lr],
+                                    fallbacks: Vec::new(),
                                     op: Op::Mov {
                                         set_flags: false,
                                         a: Value::Const(addr + 4),
@@ -394,6 +396,7 @@ impl Lifter<'_> {
                             lift.insts.push(crate::Inst {
                                 guard: None,
                                 dests: vec![lr],
+                                fallbacks: Vec::new(),
                                 op: Op::Mov {
                                     set_flags: false,
                                     a: Value::Const(addr + 4),
@@ -690,6 +693,41 @@ mod tests {
             Terminator::Return { state, .. } => assert_eq!(state.len(), STATE_COUNT),
             other => panic!("expected return, got {other:?}"),
         }
+    }
+
+    /// A conditional write followed by an unconditional read of the
+    /// same register: the read consumes the write's dest, and the
+    /// write carries the register's incoming value as its guard-fail
+    /// fallback (the `movne rX / moveq rX` boolean idiom reads it).
+    #[test]
+    fn guarded_write_carries_the_previous_value_as_fallback() {
+        // movne r2, #1; add r3, r2, r2; bx lr
+        let function = lift_arm(&[0x13A0_2001, 0xE082_3002, 0xE12F_FF1E], 2);
+        let entry = &function.blocks[0];
+        assert_eq!(entry.insts.len(), 2);
+        let (mov, add) = (&entry.insts[0], &entry.insts[1]);
+        assert_eq!(mov.guard, Some(Condition::Ne));
+        let dest = mov.dests[0];
+        let Some(crate::Value::Id(prev)) = &mov.fallbacks[0] else {
+            panic!("the movne must record a fallback")
+        };
+        // The fallback is r2's incoming block parameter (slot 2).
+        assert_eq!(*prev, entry.params[2]);
+        // The add reads the movne's dest, not the parameter.
+        assert!(
+            crate::opt::operands(&add.op).contains(&crate::Value::Id(dest)),
+            "the unconditional read must see the guarded dest"
+        );
+    }
+
+    /// The unconditional twin records no fallback: its dest always
+    /// executes, so the else arm would be noise.
+    #[test]
+    fn unconditional_write_records_no_fallback() {
+        // mov r2, #1; add r3, r2, r2; bx lr
+        let function = lift_arm(&[0xE3A0_2001, 0xE082_3002, 0xE12F_FF1E], 2);
+        let entry = &function.blocks[0];
+        assert!(entry.insts[0].fallbacks.is_empty());
     }
 
     #[test]
