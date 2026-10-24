@@ -127,7 +127,7 @@ fn flag_dests(op: &Op, dests: &[ValueId]) -> [Option<ValueId>; 4] {
 
 /// Values an op reads. Every operand field appears, including the
 /// `carry_in` chains: liveness depends on seeing all of them.
-fn operands(op: &Op) -> Vec<Value> {
+pub(crate) fn operands(op: &Op) -> Vec<Value> {
     match op {
         Op::Add { a, b, .. }
         | Op::Sub { a, b, .. }

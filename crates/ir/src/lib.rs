@@ -13,6 +13,7 @@ pub mod eval;
 pub mod lift;
 pub mod opt;
 pub mod print;
+pub mod sig;
 pub mod thumb;
 
 use decode::Condition;
