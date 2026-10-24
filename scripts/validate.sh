@@ -1,11 +1,14 @@
 #!/bin/sh
-# External conformance suite validation.
+# External conformance suite validation and regression corpus
+# checks.
 #
 # Fetches the pinned revisions of the external test suites into a cache
 # directory, runs every category ROM headless through the interpreter,
-# and prints a per-category pass-rate report. Exit code is 0 whenever a
-# report is produced; pass-rate thresholds will gate this
-# script later.
+# and prints a per-category pass-rate report. Suite pass rates are
+# report-only until thresholds are set. The regression corpus
+# (corpus.json) gates the exit code: a determinism failure, a pinned
+# state-hash mismatch, or a frame-time budget regression fails the
+# script and names the entry.
 #
 # Fetch policy: revisions are pinned below; suites are cloned over the
 # network once into the cache and reused offline afterwards. When a
@@ -73,6 +76,14 @@ suite_test() {
     else
         cargo run --release --quiet -p oxyboy -- \
             suite-test --rom "$1" --glyphs "$2" --frames "$FRAMES"
+    fi
+}
+
+corpus_bin() {
+    if [ -n "${OXYBOY_BIN:-}" ]; then
+        "$OXYBOY_BIN" "$@"
+    else
+        cargo run --release --quiet -p oxyboy -- "$@"
     fi
 }
 
@@ -180,6 +191,20 @@ else
     echo "SKIP: mgba-emu/suite is unavailable (offline or GitHub"
     echo "  unreachable). Reconnect and rerun, or point"
     echo "  OXYBOY_SUITE_CACHE at a populated cache directory."
+fi
+
+echo
+
+echo "== regression corpus =="
+if [ ! -f corpus.json ]; then
+    echo "SKIP: corpus.json is missing at the repository root."
+else
+    if corpus_bin corpus --manifest corpus.json; then
+        echo "corpus: PASS (determinism, pinned hashes, budgets)"
+    else
+        echo "corpus: FAILED (see the named entries above)" >&2
+        exit 1
+    fi
 fi
 
 echo "== validation report complete =="

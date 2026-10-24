@@ -10,6 +10,7 @@ Commands:
   recomp      Statically recompile a ROM to host code
   run         Execute a ROM in the GBA runtime
   diff        Compare interpreter and recomp-hybrid execution of one ROM
+  corpus      Run the regression corpus: determinism and frame-time budgets
   suite-test  Run one external-suite ROM and decode its on-screen verdict
   trace-diff  Compare two execution traces and report the first divergence
   help        Print this message or the help of the given subcommand(s)

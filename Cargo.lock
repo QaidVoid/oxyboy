@@ -615,6 +615,8 @@ dependencies = [
  "recomp",
  "rom",
  "runtime",
+ "serde",
+ "serde_json",
  "testutil",
  "trace",
 ]

@@ -1,0 +1,81 @@
+{
+  "entries": [
+    {
+      "name": "eeprom512test",
+      "rom": "target/test-roms/eeprom512test.gba",
+      "frames": 60,
+      "budget_ms": 20,
+      "hash": "4c22200b67ff8c13"
+    },
+    {
+      "name": "eeprom8ktest",
+      "rom": "target/test-roms/eeprom8ktest.gba",
+      "frames": 60,
+      "budget_ms": 20,
+      "hash": "360d4a88840da27f"
+    },
+    {
+      "name": "flash128test",
+      "rom": "target/test-roms/flash128test.gba",
+      "frames": 60,
+      "budget_ms": 20,
+      "hash": "26a80db9d04e3c4f"
+    },
+    {
+      "name": "flash64test",
+      "rom": "target/test-roms/flash64test.gba",
+      "frames": 60,
+      "budget_ms": 20,
+      "hash": "a45aded21807381d"
+    },
+    {
+      "name": "inputtest",
+      "rom": "target/test-roms/inputtest.gba",
+      "frames": 60,
+      "budget_ms": 20,
+      "hash": "51757889c98a71aa"
+    },
+    {
+      "name": "irqtest",
+      "rom": "target/test-roms/irqtest.gba",
+      "frames": 60,
+      "budget_ms": 20,
+      "hash": "4a1eb67431856c23"
+    },
+    {
+      "name": "mb-thumbptr",
+      "rom": "target/test-roms/mb-thumbptr.gba",
+      "frames": 60,
+      "budget_ms": 60,
+      "hash": "ced5691977486bd5"
+    },
+    {
+      "name": "mode3",
+      "rom": "target/test-roms/mode3.gba",
+      "frames": 60,
+      "budget_ms": 20,
+      "hash": "b2e87600bf03d847"
+    },
+    {
+      "name": "sramtest",
+      "rom": "target/test-roms/sramtest.gba",
+      "frames": 60,
+      "budget_ms": 20,
+      "hash": "c0c3029ae998c569"
+    },
+    {
+      "name": "switest",
+      "rom": "target/test-roms/switest.gba",
+      "frames": 60,
+      "budget_ms": 20,
+      "hash": "d69b98ba6501db81"
+    },
+    {
+      "name": "thumbmix",
+      "rom": "target/test-roms/thumbmix.gba",
+      "frames": 60,
+      "budget_ms": 30,
+      "hash": "5fa4d8dc4c29c60b"
+    }
+  ]
+}

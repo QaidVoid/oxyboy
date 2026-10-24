@@ -141,14 +141,14 @@ pub fn build_hybrid(image: &Image, tag: &str) -> Result<Driver, String> {
 }
 
 /// One comparable slice of machine state.
-struct Slice {
-    name: &'static str,
-    bytes: Vec<u8>,
+pub(crate) struct Slice {
+    pub(crate) name: &'static str,
+    pub(crate) bytes: Vec<u8>,
 }
 
 /// Captures the full comparable state of `system`: registers first,
 /// then every memory image and the framebuffer.
-fn snapshot(system: &System) -> Vec<Slice> {
+pub(crate) fn snapshot(system: &System) -> Vec<Slice> {
     let mut regs = Vec::new();
     for i in 0..16u8 {
         regs.extend_from_slice(&system.cpu.reg_for_test(i).to_le_bytes());
@@ -386,7 +386,7 @@ fn meeting_point(image: &Image, tag: &str, frame: u32) -> Result<String, String>
 }
 
 /// Boots a system for `image` with the shared multiboot/cart dispatch.
-fn boot(image: &Image) -> System {
+pub(crate) fn boot(image: &Image) -> System {
     match image.kind() {
         ImageKind::Multiboot => System::with_multiboot(image.bytes().to_vec()),
         ImageKind::Cart => System::new(image.bytes().to_vec(), CART_BASE),
