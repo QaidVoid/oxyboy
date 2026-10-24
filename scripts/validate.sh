@@ -1,14 +1,14 @@
 #!/bin/sh
-# External conformance suite validation and regression corpus
-# checks.
+# External conformance suite validation, regression corpus checks,
+# and suite pass thresholds.
 #
 # Fetches the pinned revisions of the external test suites into a cache
 # directory, runs every category ROM headless through the interpreter,
-# and prints a per-category pass-rate report. Suite pass rates are
-# report-only until thresholds are set. The regression corpus
-# (corpus.json) gates the exit code: a determinism failure, a pinned
-# state-hash mismatch, or a frame-time budget regression fails the
-# script and names the entry.
+# and prints a per-category pass-rate report. The regression corpus
+# (corpus.json) and the suite thresholds (tests/suite-thresholds.txt) gate
+# the exit code: a determinism failure, a pinned state-hash mismatch, a
+# frame-time budget regression, or a suite category below its minimum
+# passed count fails the script and names the entry.
 #
 # Fetch policy: revisions are pinned below; suites are cloned over the
 # network once into the cache and reused offline afterwards. When a
@@ -91,8 +91,17 @@ mkdir -p "$CACHE"
 echo "== external suite validation =="
 echo "cache: $CACHE"
 
+mark_result() {
+    # mark_result <var-prefix> <passed>: record a scored outcome for
+    # the threshold gate at the end.
+    eval "${1}_ran=1"
+    eval "${1}_passed=$2"
+}
+
 GBA_DIR="$CACHE/gba-tests"
+SUITE_RAN=0
 if fetch "$GBA_DIR" "$GBA_TESTS_URL" "$GBA_TESTS_REV"; then
+    SUITE_RAN=1
     echo "source: jsmolka/gba-tests @ $GBA_TESTS_REV (MIT)"
     pass_count=0
     scored=0
@@ -109,6 +118,7 @@ if fetch "$GBA_DIR" "$GBA_TESTS_URL" "$GBA_TESTS_REV"; then
                     echo "$cat: PASS $total/$total (100%)"
                     pass_count=$((pass_count + 1))
                     scored=$((scored + 1))
+                    mark_result "$cat" "$total"
                     ;;
                 fail\ *)
                     n="${verdict#fail }"
@@ -119,17 +129,21 @@ if fetch "$GBA_DIR" "$GBA_TESTS_URL" "$GBA_TESTS_REV"; then
                         echo "$cat: FAIL at test $n"
                     fi
                     scored=$((scored + 1))
+                    mark_result "$cat" "$((n - 1))"
                     ;;
                 timeout)
                     echo "$cat: TIMEOUT (no verdict after $FRAMES frames)"
                     scored=$((scored + 1))
+                    mark_result "$cat" 0
                     ;;
                 *)
                     echo "$cat: UNEXPECTED verdict: $verdict"
+                    mark_result "$cat" 0
                     ;;
             esac
         else
             echo "$cat: RUNNER FAILED (suite-test exited nonzero)"
+            mark_result "$cat" 0
         fi
     done
     for rom in $SAVE_ROMS; do
@@ -145,22 +159,27 @@ if fetch "$GBA_DIR" "$GBA_TESTS_URL" "$GBA_TESTS_REV"; then
                     echo "save/$rom: PASS"
                     pass_count=$((pass_count + 1))
                     scored=$((scored + 1))
+                    mark_result "save_$rom" 1
                     ;;
                 fail\ *)
                     n="${verdict#fail }"
                     echo "save/$rom: FAIL at test $n (category total $total)"
                     scored=$((scored + 1))
+                    mark_result "save_$rom" "$((n - 1))"
                     ;;
                 timeout)
                     echo "save/$rom: TIMEOUT (no verdict after $FRAMES frames)"
                     scored=$((scored + 1))
+                    mark_result "save_$rom" 0
                     ;;
                 *)
                     echo "save/$rom: UNEXPECTED verdict: $verdict"
+                    mark_result "save_$rom" 0
                     ;;
             esac
         else
             echo "save/$rom: RUNNER FAILED (suite-test exited nonzero)"
+            mark_result "save_$rom" 0
         fi
     done
     echo "ppu: NOT SCORED (demo ROMs; no pass/fail protocol)"
@@ -208,3 +227,40 @@ else
 fi
 
 echo "== validation report complete =="
+
+# Threshold gate: every scored category must reach the
+# minimum passed count in tests/suite-thresholds.txt. Categories that
+# did not run (suite unavailable, ROM missing) are not gated; a
+# timeout or runner failure counts as zero passed.
+if [ "$SUITE_RAN" = 1 ]; then
+    echo
+    echo "== suite threshold gate =="
+    thresholds=tests/suite-thresholds.txt
+    if [ ! -f "$thresholds" ]; then
+        echo "suite thresholds: FAILED ($thresholds is missing)" >&2
+        exit 1
+    fi
+    gate_failures=0
+    for cat in $CATEGORIES save_none save_sram save_flash64 save_flash128; do
+        eval "ran=\${${cat}_ran:-0}"
+        [ "$ran" = 1 ] || continue
+        eval "passed=\${${cat}_passed:-0}"
+        min=$(awk -v want="$cat" '$1 == want && $2 ~ /^[0-9]+$/ { print $2 }' "$thresholds")
+        if [ -z "$min" ]; then
+            echo "$cat: FAILED (no threshold line in $thresholds)" >&2
+            gate_failures=$((gate_failures + 1))
+        elif [ "$passed" -lt "$min" ]; then
+            echo "$cat: FAILED (passed $passed, threshold $min)" >&2
+            gate_failures=$((gate_failures + 1))
+        else
+            echo "$cat: ok (passed $passed, threshold $min)"
+        fi
+    done
+    if [ "$gate_failures" -gt 0 ]; then
+        echo "suite thresholds: FAILED ($gate_failures category/categories below threshold)" >&2
+        exit 1
+    fi
+    echo "suite thresholds: PASS"
+fi
+
+exit 0

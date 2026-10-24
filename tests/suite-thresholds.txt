@@ -1,0 +1,17 @@
+# Minimum passed tests per jsmolka/gba-tests category; scripts/validate.sh
+# fails when a category that ran falls below its line here. A category that
+# times out or fails to run counts as zero passed. ppu ships demo ROMs with
+# no pass/fail protocol and stays unscored.
+#
+# unsafe stays at 1 of 2: per the suite's README, its SRAM mirror test
+# fails on real carts and its unused-ROM-reads test passes only on mGBA.
+# The interpreter models the hardware behavior instead.
+arm 223
+bios 0
+memory 6
+thumb 201
+unsafe 1
+save_none 0
+save_sram 0
+save_flash64 0
+save_flash128 0
