@@ -74,3 +74,59 @@ fn diff_rejects_a_missing_rom() {
         .expect("run oxyboy diff");
     assert_eq!(output.status.code(), Some(1));
 }
+
+/// A multiboot image whose start code calls into its own EWRAM
+/// mirror: `bl 0x02400000` (and a second call so the mirror start
+/// bounds a region) re-enters the image through the mirror and walks
+/// mirror strides without ever returning. Discovery follows the call
+/// targets and seeds functions at the mirror addresses; the runner
+/// must not translate them (the lifter reads literals at canonical
+/// addresses, so a mirror region is not the mirror program) and must
+/// let the interpreter own everything outside the image instead.
+fn mirror_call_rom(dir: &Path, name: &str) -> PathBuf {
+    let mut bytes = RomBuilder::new()
+        .title("MBMIR")
+        .entry(0xEA00_002E) // b 0x020000c0 (the header entry branch)
+        .min_size(0x140)
+        .build();
+    let program: [u32; 3] = [
+        0xEB0F_FFCE, // 0x020000c0: bl 0x02400000 (EWRAM mirror of the image)
+        0xEB1F_FFFD, // 0x020000c4: bl 0x02800000 (bounds the mirror region)
+        0xE12F_FF1E, // 0x020000c8: bx lr (lets discovery accept the mirrors)
+    ];
+    let mut code = Vec::new();
+    for word in program {
+        code.extend_from_slice(&word.to_le_bytes());
+    }
+    bytes[0xC0..0xC0 + code.len()].copy_from_slice(&code);
+    let path = dir.join(name);
+    fs::write(&path, &bytes).expect("write ROM");
+    path
+}
+
+#[test]
+fn diff_confines_regions_to_the_image_for_mirror_calls() {
+    let dir = temp_dir("mirror");
+    let rom = mirror_call_rom(&dir, "mbmirror.gba");
+    let cases = dir.join("cases");
+    let output = oxyboy()
+        .args([
+            "diff",
+            "--rom",
+            rom.to_str().expect("utf-8 path"),
+            "--frames",
+            "1",
+            "--case-dir",
+            cases.to_str().expect("utf-8 path"),
+        ])
+        .output()
+        .expect("run oxyboy diff");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout: {stdout} stderr: {:?}",
+        output.stderr
+    );
+    assert!(stdout.contains("match"), "stdout: {stdout}");
+}

@@ -96,6 +96,14 @@ pub fn build_hybrid(image: &Image, tag: &str) -> Result<Driver, String> {
         return Err("analysis found no functions to translate".to_string());
     }
     let image_end = base + image.bytes().len() as u32;
+    // Discovery follows pool words into EWRAM mirrors (a `bl` target
+    // at 0x02400000 is a real execution address, and its mirror reads
+    // alias the image), but a lifted region is only faithful over the
+    // canonical image bytes: the lifter reads literals and charges
+    // fetches at canonical addresses, so a mirror region is not the
+    // mirror program. Confine regions to the image and let the
+    // interpreter own everything outside it.
+    starts.retain(|&(start, _)| start < image_end);
     let mut regions = Vec::new();
     for (index, &(start, state)) in starts.iter().enumerate() {
         let end = starts
