@@ -8,6 +8,7 @@
 
 pub mod arm;
 pub mod cfg;
+pub mod emit_c;
 pub mod eval;
 pub mod lift;
 pub mod opt;
