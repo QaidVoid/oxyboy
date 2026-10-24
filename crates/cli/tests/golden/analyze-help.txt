@@ -1,0 +1,16 @@
+Recover code and data layout and function boundaries
+
+Usage: oxyboy analyze [OPTIONS] --rom <FILE>
+
+Options:
+  -r, --rom <FILE>              Path to the .gba ROM image
+  -v, --verbose...              Increase logging verbosity; repeat for more detail
+      --config <FILE>           Analysis config with known functions and table hints
+      --config-out <FILE>       Write every discovered function and table as a config file, ready to annotate with names for `lift --config`
+      --json                    Print the summary as JSON instead of text
+      --min-calls <N>           BL calls a `push {.., lr}` site needs before it is considered [default: 2]
+      --min-length <N>          Consecutive decodable instructions a candidate needs [default: 3]
+      --min-exit-ratio <RATIO>  Exit-behavior ratio a candidate must reach (0..1] [default: 0.6666666666666666]
+      --out <FILE>              Write the text report to this file instead of stdout
+  -h, --help                    Print help
+  -V, --version                 Print version

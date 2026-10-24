@@ -18,21 +18,15 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Print header fields, hashes, and identification for a ROM.
-    Info {
-        #[command(flatten)]
-        rom: RomArgs,
-        /// Path to a JSON ROM database used for identification.
-        #[arg(long, value_name = "FILE", env = "OXYBOY_ROM_DB")]
-        db: Option<PathBuf>,
-    },
+    Info(commands::info::InfoArgs),
     /// Emit matching, re-assemblable assembly from a ROM.
-    Disasm(RomArgs),
+    Disasm(commands::disasm::DisasmArgs),
     /// Recover code and data layout and function boundaries.
-    Analyze(RomArgs),
+    Analyze(commands::analyze::AnalyzeArgs),
     /// Lift a ROM into the intermediate representation.
     Lift(commands::lift::LiftArgs),
     /// Statically recompile a ROM to host code.
-    Recomp(RomArgs),
+    Recomp(commands::recomp::RecompArgs),
     /// Execute a ROM in the GBA runtime.
     Run(commands::run::RunArgs),
     /// Compare interpreter and recomp-hybrid execution of one ROM.
@@ -60,11 +54,11 @@ struct RomArgs {
 fn main() {
     let cli = Cli::parse();
     let code = match cli.command {
-        Command::Info { rom, db } => commands::info::run(rom, db),
-        Command::Disasm(_) => not_implemented("disasm"),
-        Command::Analyze(_) => not_implemented("analyze"),
+        Command::Info(args) => commands::info::run(args),
+        Command::Disasm(args) => commands::disasm::run(args),
+        Command::Analyze(args) => commands::analyze::run(args),
         Command::Lift(args) => commands::lift::run(args),
-        Command::Recomp(_) => not_implemented("recomp"),
+        Command::Recomp(args) => commands::recomp::run(args),
         Command::Run(args) => commands::run::run(args),
         Command::Diff(args) => commands::diff::run(args),
         Command::Corpus(args) => commands::corpus::run(args),
@@ -72,9 +66,4 @@ fn main() {
         Command::TraceDiff(args) => commands::trace_diff::run(args),
     };
     std::process::exit(code);
-}
-
-fn not_implemented(name: &str) -> i32 {
-    eprintln!("oxyboy {name}: not implemented yet");
-    1
 }

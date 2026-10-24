@@ -1,0 +1,11 @@
+Compare two execution traces and report the first divergence
+
+Usage: oxyboy trace-diff <A> <B>
+
+Arguments:
+  <A>  The reference trace
+  <B>  The trace to compare against it
+
+Options:
+  -h, --help     Print help
+  -V, --version  Print version

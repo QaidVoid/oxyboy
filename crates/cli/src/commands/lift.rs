@@ -21,18 +21,32 @@ pub fn run(args: LiftArgs) -> i32 {
         }
     };
     let mut map = FlagMap::from_image(&image);
-    let seeds = map.seed(&[]);
-    let _analysis = analyze(&image, &mut map, &seeds, &seeds, Thresholds::default(), &[]);
-    let annotations = match &args.config {
+    let mut seeds = map.seed(&[]);
+    let (config, annotations) = match &args.config {
         Some(path) => match analysis::config::Config::load(path) {
-            Ok(config) => ir::emit_c::Annotations::from_config(&config),
+            Ok(config) => {
+                let annotations = ir::emit_c::Annotations::from_config(&config);
+                for spec in &config.functions {
+                    seeds.push(spec.to_seed());
+                }
+                (Some(config), annotations)
+            }
             Err(e) => {
                 eprintln!("oxyboy lift: {}: {e}", path.display());
                 return 1;
             }
         },
-        None => ir::emit_c::Annotations::default(),
+        None => (None, ir::emit_c::Annotations::default()),
     };
+    let tables = config.as_ref().map_or(Vec::new(), |c| c.tables.clone());
+    let _analysis = analyze(
+        &image,
+        &mut map,
+        &seeds,
+        &seeds,
+        Thresholds::default(),
+        &tables,
+    );
     let mut addrs: Vec<u32> = Vec::new();
     let mut functions: Vec<ir::Function> = Vec::new();
     let mut dumped = String::new();

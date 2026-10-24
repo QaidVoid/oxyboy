@@ -1,0 +1,11 @@
+Run one external-suite ROM and decode its on-screen verdict
+
+Usage: oxyboy suite-test [OPTIONS] --rom <FILE> --glyphs <FILE>
+
+Options:
+  -r, --rom <FILE>     Path to the .gba ROM image
+  -v, --verbose...     Increase logging verbosity; repeat for more detail
+      --glyphs <FILE>  Path to the suite's glyphs.asm font-table source
+      --frames <N>     Frames to run before decoding the verdict [default: 300]
+  -h, --help           Print help
+  -V, --version        Print version

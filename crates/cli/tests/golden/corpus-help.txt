@@ -1,0 +1,9 @@
+Run the regression corpus: determinism and frame-time budgets
+
+Usage: oxyboy corpus [OPTIONS]
+
+Options:
+      --manifest <FILE>  Path to the corpus manifest [default: corpus.json]
+      --update           Re-pin each entry's expected-state hash from this run
+  -h, --help             Print help
+  -V, --version          Print version

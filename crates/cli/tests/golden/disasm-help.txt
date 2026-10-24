@@ -1,0 +1,11 @@
+Emit matching, re-assemblable assembly from a ROM
+
+Usage: oxyboy disasm [OPTIONS] --rom <FILE>
+
+Options:
+  -r, --rom <FILE>     Path to the .gba ROM image
+  -v, --verbose...     Increase logging verbosity; repeat for more detail
+      --config <FILE>  Analysis config naming functions and data for symbols
+      --out <FILE>     Write the assembly to this file instead of stdout
+  -h, --help           Print help
+  -V, --version        Print version

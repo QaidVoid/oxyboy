@@ -1,0 +1,12 @@
+Compare interpreter and recomp-hybrid execution of one ROM
+
+Usage: oxyboy diff [OPTIONS] --rom <FILE>
+
+Options:
+  -r, --rom <FILE>      Path to the .gba ROM image
+  -v, --verbose...      Increase logging verbosity; repeat for more detail
+      --frames <N>      Frames to run before comparing the final state [default: 60]
+      --case-dir <DIR>  Directory for mismatch case artifacts. The default lives under `target/` so case files never enter version control [default: target/diff-cases]
+      --tag <TAG>       Compile scratch tag; defaults to the ROM file stem
+  -h, --help            Print help
+  -V, --version         Print version

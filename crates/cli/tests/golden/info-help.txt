@@ -1,0 +1,11 @@
+Print header fields, hashes, and identification for a ROM
+
+Usage: oxyboy info [OPTIONS] --rom <FILE>
+
+Options:
+  -r, --rom <FILE>  Path to the .gba ROM image
+  -v, --verbose...  Increase logging verbosity; repeat for more detail
+      --db <FILE>   Path to a JSON ROM database used for identification [env: OXYBOY_ROM_DB=]
+      --json        Print the report as JSON instead of text
+  -h, --help        Print help
+  -V, --version     Print version

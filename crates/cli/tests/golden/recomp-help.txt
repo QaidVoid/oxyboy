@@ -1,0 +1,12 @@
+Statically recompile a ROM to host code
+
+Usage: oxyboy recomp [OPTIONS] --rom <FILE>
+
+Options:
+  -r, --rom <FILE>     Path to the .gba ROM image
+  -v, --verbose...     Increase logging verbosity; repeat for more detail
+      --config <FILE>  Analysis config with known functions and table hints
+      --out <FILE>     Write the C source to this file instead of stdout
+      --json           Print a JSON summary (entries and symbols) instead of the C source
+  -h, --help           Print help
+  -V, --version        Print version

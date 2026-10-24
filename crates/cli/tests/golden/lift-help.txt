@@ -1,0 +1,15 @@
+Lift a ROM into the intermediate representation
+
+Usage: oxyboy lift [OPTIONS] --rom <FILE>
+
+Options:
+  -r, --rom <FILE>       Path to the .gba ROM image
+  -v, --verbose...       Increase logging verbosity; repeat for more detail
+      --function <ADDR>  Lift only the function starting at this address (hex or decimal, e.g. 0x08000100)
+      --print-after-all  Print the IR after every pass, not just the final form
+      --cfg              Print the control-flow analysis (dominators, frontiers, loops) after the IR
+      --cfg-dot          Print the control-flow graph in dot form
+      --c                Emit the functions as one compilable C translation unit instead of the IR text
+      --config <PATH>    Analysis config naming functions and modules; named functions keep their configured names in the C output
+  -h, --help             Print help
+  -V, --version          Print version
