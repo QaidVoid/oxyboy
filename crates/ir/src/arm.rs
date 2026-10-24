@@ -99,6 +99,23 @@ impl ArmLift {
         id
     }
 
+    /// Repoints the pc slot at its current value ANDed with `mask`:
+    /// ARM loads into pc word-align without interworking (ARMv4), and
+    /// THUMB pop pc clears bit 0 (GBATEK THUMB.14).
+    pub(crate) fn mask_pc(&mut self, mask: u32) {
+        let raw = Value::Id(self.current[Register::Pc.bits() as usize]);
+        let masked = self.write(Register::Pc);
+        self.emit(
+            Op::And {
+                set_flags: false,
+                a: raw,
+                b: Value::Const(mask),
+                carry_in: Value::Const(0),
+            },
+            vec![masked],
+        );
+    }
+
     /// Binds one flag: a fresh id that becomes the flag's value.
     /// `slot` is 0..4 within N, Z, C, V. Under a real condition the
     /// previous representative is recorded as the write's guard-fail
@@ -128,7 +145,7 @@ impl ArmLift {
     /// rules): the shifter's carry when a real shift applies,
     /// otherwise the incoming C. Immediate carries are lift-time
     /// constants.
-    fn shifter(&mut self, operand: ShifterOperand, with_carry: bool) -> (Value, Value) {
+    pub(crate) fn shifter(&mut self, operand: ShifterOperand, with_carry: bool) -> (Value, Value) {
         match operand {
             ShifterOperand::Immediate { rotate, value } => {
                 if rotate == 0 {
@@ -619,7 +636,7 @@ impl ArmLift {
     /// Mirrors the decoded transfer fields one to one; the field
     /// count is the instruction set's, not a design choice.
     #[allow(clippy::too_many_arguments)]
-    fn single_transfer(
+    pub(crate) fn single_transfer(
         &mut self,
         load: bool,
         size: Size,
@@ -654,8 +671,15 @@ impl ArmLift {
             }
         };
         // The stored value is the pre-instruction register: a base that
-        // aliases rd must not leak the writeback into the store.
-        let stored = if load { Value::Const(0) } else { self.read(rd) };
+        // aliases rd must not leak the writeback into the store. ARM7
+        // stores R15 as the instruction address plus 12 (GBATEK).
+        let stored = if load {
+            Value::Const(0)
+        } else if rd == Register::Pc {
+            Value::Const(self.addr + 12)
+        } else {
+            self.read(rd)
+        };
         let base = self.read(rn);
         let mut pre_sum = None;
         let addr = if pre_index {
@@ -684,6 +708,12 @@ impl ArmLift {
                 },
                 vec![out],
             );
+            // Any load into pc branches: word-align, no interworking
+            // (ARMv4). The walk turns word loads into returns; the
+            // halfword and byte forms keep executing in-block.
+            if rd == Register::Pc {
+                self.mask_pc(!3);
+            }
         } else {
             self.emit(
                 Op::Store {
@@ -775,7 +805,10 @@ impl ArmLift {
                 // For STM, a base register that is not the first list
                 // entry stores the final writeback value (the old base
                 // stays current until the writeback after the loop).
-                let value = if *reg == rn && Some(*reg) != list.first().copied() {
+                // ARM7 stores R15 as the instruction address plus 12.
+                let value = if *reg == Register::Pc {
+                    Value::Const(self.addr + 12)
+                } else if *reg == rn && Some(*reg) != list.first().copied() {
                     let total = count * 4;
                     let delta = if up { total } else { total.wrapping_neg() };
                     let sum = self.fresh();
@@ -800,6 +833,13 @@ impl ArmLift {
                     vec![],
                 );
             }
+        }
+        // A block load into pc branches: word-align the loaded value,
+        // no interworking (ARMv4). The pc is the highest list bit, so
+        // its load is the loop's last write and the mask lands after
+        // every access.
+        if load && registers.contains(Register::Pc) {
+            self.mask_pc(!3);
         }
         // ARMv4: an LDM whose list contains the base leaves the loaded
         // value in place; no writeback runs.

@@ -12,12 +12,14 @@ use std::collections::{BTreeMap, HashMap};
 
 use analysis::{Canonical, FlagMap, Flags, State};
 use decode::{
-    ArmInstr, Condition, Register, ShifterOperand, ThumbAluOp, ThumbHiOp, ThumbInstr, decode_arm,
-    decode_thumb,
+    ArmInstr, Condition, Register, ShifterOperand, ThumbAluOp, ThumbHiOp, ThumbInstr,
+    TransferOffset, decode_arm, decode_thumb,
 };
 
 use crate::arm::ArmLift;
-use crate::{Block, BlockId, CycleCharge, Function, Inst, Op, SLOTS, Terminator, Value, ValueId};
+use crate::{
+    Block, BlockId, CycleCharge, Function, Inst, Op, SLOTS, Size, Terminator, Value, ValueId,
+};
 
 /// The interpreter's internal-cycle extras for one ARM instruction
 /// beyond the opcode fetch and the data-access costs the host
@@ -329,14 +331,57 @@ impl Lifter<'_> {
                                 pc_mask: !3,
                             };
                         }
-                        ArmInstr::LoadStore { load, rd, .. } if load && rd == Register::Pc => {
+                        ArmInstr::LoadStore {
+                            load: true,
+                            byte,
+                            writeback,
+                            up,
+                            pre_index,
+                            rd: Register::Pc,
+                            rn,
+                            offset,
+                        } => {
+                            // Lift the access (word-aligned pc mask
+                            // included), charge the fetch, and return
+                            // through the loaded pc slot.
+                            cycles.push(CycleCharge { addr, cycles: 0 });
+                            lift.guard = guard;
+                            lift.addr = addr;
+                            let offset = match offset {
+                                TransferOffset::Immediate(imm) => Value::Const(imm),
+                                TransferOffset::Register { rm, shift } => {
+                                    lift.shifter(ShifterOperand::Register { rm, shift }, false)
+                                        .0
+                                }
+                            };
+                            lift.single_transfer(
+                                true,
+                                if byte { Size::Byte } else { Size::Word },
+                                false,
+                                writeback,
+                                up,
+                                pre_index,
+                                Register::Pc,
+                                rn,
+                                offset,
+                            );
                             break RawTerm::Return {
                                 switches_state: false,
                             };
                         }
                         ArmInstr::BlockTransfer {
-                            load, registers, ..
-                        } if load && registers.contains(Register::Pc) => {
+                            load: true,
+                            psr_and_force_user: _,
+                            writeback,
+                            up,
+                            pre_index,
+                            rn,
+                            registers,
+                        } if registers.contains(Register::Pc) => {
+                            cycles.push(CycleCharge { addr, cycles: 0 });
+                            lift.guard = guard;
+                            lift.addr = addr;
+                            lift.block_transfer(true, writeback, up, pre_index, rn, registers);
                             break RawTerm::Return {
                                 switches_state: false,
                             };
@@ -881,6 +926,169 @@ mod tests {
     fn thumb_pop_pc_is_a_return() {
         let function = lift_thumb(&[0xBD01], 1);
         assert!(matches!(function.blocks[0].term, Terminator::Return { .. }));
+    }
+
+    /// `ldr pc, [sp], #4` lifts the load and the ARMv4
+    /// word-align mask, and returns through the loaded pc slot.
+    #[test]
+    fn ldr_pc_lifts_the_load_align_mask_and_return() {
+        let function = lift_arm(&[0xE49D_F004], 1);
+        assert_eq!(function.blocks.len(), 1);
+        let block = &function.blocks[0];
+        assert!(matches!(block.term, Terminator::Return { .. }));
+        let load_pos = block
+            .insts
+            .iter()
+            .position(|inst| {
+                matches!(
+                    inst.op,
+                    Op::Load {
+                        size: Size::Word,
+                        signed: false,
+                        mode: crate::LoadMode::Ldr,
+                        ..
+                    }
+                )
+            })
+            .expect("the word load");
+        let loaded = block.insts[load_pos].dests[0];
+        // The mask repoints pc at loaded & !3.
+        let Op::And {
+            a: Value::Id(a),
+            b: Value::Const(0xFFFF_FFFC),
+            ..
+        } = &block.insts[load_pos + 1].op
+        else {
+            panic!(
+                "expected the align mask, got {:?}",
+                block.insts[load_pos + 1].op
+            );
+        };
+        assert_eq!(*a, loaded);
+        // Post-indexed writeback: sp += 4 after the access.
+        assert!(matches!(
+            &block.insts[load_pos + 2].op,
+            Op::Add {
+                b: Value::Const(4),
+                ..
+            }
+        ));
+        // The return state leaves pc at the masked value.
+        let Terminator::Return { state, .. } = &block.term else {
+            panic!("return terminator");
+        };
+        assert_eq!(
+            state[Register::Pc.bits() as usize],
+            Value::Id(block.insts[load_pos + 1].dests[0])
+        );
+    }
+
+    /// `ldmdb r1!, {r2, r3, pc}` lifts every list load, the
+    /// pc align mask, and the base writeback.
+    #[test]
+    fn ldm_pc_lifts_all_loads_mask_and_writeback() {
+        let function = lift_arm(&[0xE931_800C], 1);
+        let block = &function.blocks[0];
+        assert!(matches!(block.term, Terminator::Return { .. }));
+        let loads: Vec<&Inst> = block
+            .insts
+            .iter()
+            .filter(|inst| {
+                matches!(
+                    inst.op,
+                    Op::Load {
+                        mode: crate::LoadMode::Block,
+                        ..
+                    }
+                )
+            })
+            .collect();
+        assert_eq!(loads.len(), 3, "one load per list entry");
+        // The pc is the highest list bit, so its load is last and
+        // feeds the align mask; the writeback follows it.
+        let Op::And {
+            a: Value::Id(a),
+            b: Value::Const(0xFFFF_FFFC),
+            ..
+        } = &block.insts[block.insts.len() - 2].op
+        else {
+            panic!(
+                "expected the align mask:\n{}",
+                crate::print::fmt_function(&function)
+            );
+        };
+        assert_eq!(*a, loads[2].dests[0]);
+        // Writeback: r1 = base - 12 (the base is not in the list).
+        assert!(matches!(
+            &block.insts[block.insts.len() - 1].op,
+            Op::Add {
+                b: Value::Const(0xFFFF_FFF4),
+                ..
+            }
+        ));
+    }
+
+    /// `pop {r0, pc}` clears bit 0 of the loaded pc
+    /// (GBATEK THUMB.14: POP pc ignores bit 0).
+    #[test]
+    fn thumb_pop_pc_masks_bit_zero() {
+        let function = lift_thumb(&[0xBD01], 1);
+        let block = &function.blocks[0];
+        let loads: Vec<&Inst> = block
+            .insts
+            .iter()
+            .filter(|inst| {
+                matches!(
+                    inst.op,
+                    Op::Load {
+                        mode: crate::LoadMode::Block,
+                        ..
+                    }
+                )
+            })
+            .collect();
+        assert_eq!(loads.len(), 2, "r0 then pc");
+        let mask_pos = block
+            .insts
+            .iter()
+            .position(|inst| {
+                matches!(
+                    inst.op,
+                    Op::And {
+                        b: Value::Const(0xFFFF_FFFE),
+                        ..
+                    }
+                )
+            })
+            .expect("the bit-0 mask");
+        let Op::And {
+            a: Value::Id(a), ..
+        } = &block.insts[mask_pos].op
+        else {
+            panic!("mask");
+        };
+        assert_eq!(*a, loads[1].dests[0]);
+    }
+
+    /// ARM7 stores R15 as the instruction address plus 12, in the
+    /// single and the block store paths alike (the generic pc read is
+    /// address plus 8 and must not leak into stores).
+    #[test]
+    fn pc_stores_use_the_arm7_plus_twelve_value() {
+        let base = 0x0800_0000u32;
+        let function = lift_arm(&[0xE580_F000, 0xE880_8000], 2);
+        let stores: Vec<&Inst> = function.blocks[0]
+            .insts
+            .iter()
+            .filter(|inst| matches!(inst.op, Op::Store { .. }))
+            .collect();
+        assert_eq!(stores.len(), 2);
+        for (index, inst) in stores.iter().enumerate() {
+            let Op::Store { value, .. } = &inst.op else {
+                panic!("store");
+            };
+            assert_eq!(*value, Value::Const(base + 4 * index as u32 + 12));
+        }
     }
 
     #[test]

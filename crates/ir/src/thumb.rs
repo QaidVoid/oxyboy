@@ -532,6 +532,11 @@ impl ArmLift {
                 vec![out],
             );
         }
+        // POP {pc} ignores bit 0 and stays in THUMB state (GBATEK
+        // THUMB.14 note).
+        if include_pc {
+            self.mask_pc(!1);
+        }
         let new_sp = self.add(sp, Value::Const(total));
         self.current[Register::Sp.bits() as usize] = new_sp;
     }

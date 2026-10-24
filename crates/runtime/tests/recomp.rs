@@ -233,6 +233,74 @@ fn conditional_boolean_idiom_stores_the_selected_value() {
     );
 }
 
+/// A function returning through `ldr pc, [sp], #4` resumes
+/// at the loaded address on both paths. The pre-fix lift returned
+/// through the entry pc, so the driver handed control back to the
+/// chunk's own entry and re-ran it: the interpreted re-pass
+/// incremented the memory counter a second time (2 vs 1).
+#[test]
+fn ldr_pc_return_resumes_at_the_loaded_address() {
+    if !recomp::Module::compiler_available() {
+        println!("skipping: no host C compiler on PATH");
+        return;
+    }
+    const PARK: u32 = 0x0800_0128;
+    let words: [u32; 11] = [
+        0xE3A0_D402, // 0x100: mov sp, #0x02000000 (2 ror 8)
+        0xE28D_D901, // 0x104: add sp, sp, #0x4000
+        0xE3A0_3402, // 0x108: mov r3, #0x02000000
+        0xE28F_0014, // 0x10c: add r0, pc, #20  ; r0 = 0x128 (the park)
+        0xE52D_0004, // 0x110: push {r0}
+        0xE593_1000, // 0x114: ldr r1, [r3]
+        0xE281_1001, // 0x118: add r1, r1, #1
+        0xE583_1000, // 0x11c: str r1, [r3]     ; counter++
+        0xE49D_F004, // 0x120: ldr pc, [sp], #4 ; return to 0x128
+        0xEAFF_FFFE, // 0x124: b . (dead; the walk ends at the return)
+        0xEAFF_FFFE, // 0x128: b . (the park)
+    ];
+    let mut bytes = RomBuilder::new().title("LDRC").build();
+    let mut code = Vec::new();
+    for word in words {
+        code.extend_from_slice(&word.to_le_bytes());
+    }
+    bytes[0x100..0x100 + code.len()].copy_from_slice(&code);
+    let image = Image::from_bytes(bytes).expect("parse");
+
+    let mut interpreted = System::new(image.bytes().to_vec(), 0x0800_0100);
+    let mut steps = 0;
+    while interpreted.cpu.pc() != PARK && steps < 10_000 {
+        interpreted.step();
+        steps += 1;
+    }
+    assert_eq!(
+        interpreted.cpu.pc(),
+        PARK,
+        "interpreted run reaches the park"
+    );
+
+    let mut driver = build_driver(&image, &[(0x100u32, 0x128u32)], "recomp-ldrpc").expect("builds");
+    let mut recompiled = System::new(image.bytes().to_vec(), 0x0800_0100);
+    let mut steps = 0;
+    while recompiled.cpu.pc() != PARK && steps < 10_000 {
+        driver.step(&mut recompiled).expect("native call");
+        steps += 1;
+    }
+    assert_eq!(recompiled.cpu.pc(), PARK, "recompiled run reaches the park");
+    let word = |system: &System| u32::from_le_bytes(system.bus().ewram()[0..4].try_into().unwrap());
+    assert_eq!(word(&interpreted), 1, "counter runs once");
+    assert_eq!(word(&recompiled), 1, "counter runs once natively");
+    assert_eq!(
+        interpreted.cpu.reg_for_test(1),
+        recompiled.cpu.reg_for_test(1),
+        "r1"
+    );
+    assert_eq!(
+        interpreted.cpu.reg_for_test(13),
+        recompiled.cpu.reg_for_test(13),
+        "sp restored by the post-indexed writeback"
+    );
+}
+
 /// Cycle parity: the recompiled run of the micro
 /// corpus charges exactly the interpreter's cycle count for the same
 /// instruction sequence - opcode fetches through the bus's real cost
