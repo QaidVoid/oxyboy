@@ -7,6 +7,7 @@
 //! control flow is an explicit terminator.
 
 pub mod arm;
+pub mod cfg;
 pub mod eval;
 pub mod lift;
 pub mod opt;

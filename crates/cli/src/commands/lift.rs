@@ -37,6 +37,15 @@ pub fn run(args: LiftArgs) -> i32 {
             opt::optimize(&mut function);
             println!("{}", fmt_function(&function));
         }
+        if args.cfg || args.cfg_dot {
+            let cfg = ir::cfg::Cfg::build(&function);
+            if args.cfg {
+                println!("{}", ir::cfg::dump_text(&cfg));
+            }
+            if args.cfg_dot {
+                println!("{}", ir::cfg::dump_dot(&cfg));
+            }
+        }
         printed += 1;
     }
     if printed == 0 {
@@ -68,6 +77,15 @@ pub struct LiftArgs {
     /// Print the IR after every pass, not just the final form.
     #[arg(long)]
     pub print_after_all: bool,
+
+    /// Print the control-flow analysis (dominators, frontiers, loops)
+    /// after the IR.
+    #[arg(long)]
+    pub cfg: bool,
+
+    /// Print the control-flow graph in dot form.
+    #[arg(long)]
+    pub cfg_dot: bool,
 }
 
 /// Parses an address literal in hex (`0x` prefix) or decimal.

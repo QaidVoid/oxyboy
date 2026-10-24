@@ -26,6 +26,48 @@ fn lift_prints_functions_for_a_test_rom() {
 }
 
 #[test]
+fn lift_cfg_flags_dump_the_analysis() {
+    let Ok(rom) = locate("thumbmix") else {
+        println!("skipping: test ROMs not built (scripts/build-test-roms.sh)");
+        return;
+    };
+    let text = oxyboy()
+        .args(["lift", "--rom"])
+        .arg(&rom)
+        .arg("--cfg")
+        .output()
+        .expect("run oxyboy");
+    assert!(
+        text.status.success(),
+        "lift --cfg failed: {:?}",
+        text.stderr
+    );
+    let stdout = String::from_utf8(text.stdout).expect("utf-8 dump");
+    assert!(stdout.contains("entry: b0"), "no entry: {stdout}");
+    assert!(stdout.contains("dominator tree:"), "no tree: {stdout}");
+    assert!(
+        stdout.contains("dominance frontiers:"),
+        "no frontiers: {stdout}"
+    );
+    assert!(stdout.contains("loops:"), "no loops: {stdout}");
+
+    let dot = oxyboy()
+        .args(["lift", "--rom"])
+        .arg(&rom)
+        .arg("--cfg-dot")
+        .output()
+        .expect("run oxyboy");
+    assert!(
+        dot.status.success(),
+        "lift --cfg-dot failed: {:?}",
+        dot.stderr
+    );
+    let stdout = String::from_utf8(dot.stdout).expect("utf-8 dot");
+    assert!(stdout.contains("digraph cfg {"), "no dot graph: {stdout}");
+    assert!(stdout.contains("entry -> b0;"), "no entry edge: {stdout}");
+}
+
+#[test]
 fn lift_print_after_all_shows_every_pass() {
     let Ok(rom) = locate("thumbmix") else {
         println!("skipping: test ROMs not built (scripts/build-test-roms.sh)");
