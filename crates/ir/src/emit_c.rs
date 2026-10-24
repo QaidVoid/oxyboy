@@ -1502,6 +1502,7 @@ mod tests {
             addr: 0,
             params: Vec::new(),
             insts,
+            cycles: Vec::new(),
             term,
         }
     }
@@ -1540,6 +1541,7 @@ mod tests {
     fn emitted(blocks: Vec<Block>) -> String {
         emit_function(&Function {
             name: "test_fn".to_string(),
+            thumb: false,
             blocks,
         })
     }
@@ -1905,6 +1907,7 @@ mod tests {
         callee.name = "count_down".to_string();
         let caller = Function {
             name: "caller_fn".to_string(),
+            thumb: false,
             blocks: vec![block(
                 Vec::new(),
                 Terminator::Call {
@@ -1939,6 +1942,7 @@ mod tests {
         callee.name = "count_down".to_string();
         let caller = Function {
             name: "caller_fn".to_string(),
+            thumb: false,
             blocks: vec![block(
                 Vec::new(),
                 Terminator::Call {

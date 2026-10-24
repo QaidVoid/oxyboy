@@ -681,7 +681,12 @@ fn all_or_nothing(dests: &[ValueId], head: usize, live: &HashSet<u32>) -> (usize
 
 /// Ops with no effect beyond their dests.
 fn is_pure(op: &Op) -> bool {
-    !matches!(op, Op::Store { .. } | Op::Intrinsic { .. })
+    // Loads are impure: a dead load still performs its bus access,
+    // which charges waitstates and advances the sequential tracker.
+    !matches!(
+        op,
+        Op::Store { .. } | Op::Intrinsic { .. } | Op::Load { .. }
+    )
 }
 
 /// Clears the set-flags bit after an all-or-nothing truncation.
@@ -1013,6 +1018,23 @@ mod tests {
                 .iter()
                 .any(|inst| matches!(inst.op, Op::Cmp { .. })),
             "the comparison feeding a branch condition must survive"
+        );
+    }
+
+    /// A load whose dest is immediately overwritten is still impure:
+    /// its bus access charges waitstates and advances the sequential
+    /// tracker, so removing it would skew every later access cost.
+    #[test]
+    fn dead_loads_survive_optimization() {
+        // ldr r0, [r1]; mov r0, #7; bx lr
+        let mut function = lift_arm(&[0xE591_0000, 0xE3A0_0007, 0xE12F_FF11]);
+        optimize(&mut function);
+        assert!(
+            function.blocks[0]
+                .insts
+                .iter()
+                .any(|inst| matches!(inst.op, Op::Load { .. })),
+            "a dead load must survive: its bus access charges cycles"
         );
     }
 }

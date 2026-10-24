@@ -123,6 +123,15 @@ mod tests {
         }
     }
 
+    unsafe extern "C" fn fetch(
+        _ctx: *mut core::ffi::c_void,
+        st: *mut GuestState,
+        _addr: u32,
+        _width: u32,
+    ) {
+        unsafe { (*st).cycles += 1 };
+    }
+
     unsafe extern "C" fn store(
         ctx: *mut core::ffi::c_void,
         _st: *mut GuestState,
@@ -177,7 +186,9 @@ mod tests {
                 .cast_mut(),
             load,
             store,
+            fetch,
             budget: 1000,
+            cycle_budget: u64::MAX,
         };
         module.call(0x0800_0100, &mut st, &ops).expect("call");
         let mem = host.mem.borrow();
@@ -194,9 +205,20 @@ mod tests {
         let reg = |i: u32| Value::Id(ValueId(i));
         Function {
             name: "sub_08000100".to_string(),
+            thumb: false,
             blocks: vec![Block {
                 addr: 0x0800_0100,
                 params: (0..20).map(ValueId).collect(),
+                cycles: vec![
+                    ir::CycleCharge {
+                        addr: 0x0800_0100,
+                        cycles: 0,
+                    },
+                    ir::CycleCharge {
+                        addr: 0x0800_0104,
+                        cycles: 0,
+                    },
+                ],
                 insts: vec![
                     Inst {
                         guard: None,

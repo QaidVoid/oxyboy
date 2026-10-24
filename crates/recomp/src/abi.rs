@@ -30,8 +30,10 @@ pub struct GuestState {
     /// The instruction state to resume in: 1 when THUMB, 0 when ARM.
     /// Exits that interwork overwrite it from the target's low bit.
     pub thumb: u32,
-    /// Cycles charged since the host started this native call (memory
-    /// ops charge real waitstate costs; each IR instruction adds one).
+    /// Cycles charged since the host started this native call: one
+    /// fetch per guest instruction through the host's cost model,
+    /// real waitstate costs on the memory callbacks, and the lifted
+    /// internal-cycle extras.
     pub cycles: u64,
     /// IR instructions executed, for the host's budget check.
     pub icount: u64,
@@ -79,9 +81,25 @@ pub struct GuestOps {
         size: u32,
         pc: u32,
     ) -> u32,
+    /// One opcode fetch: charges `st->cycles` with the bus's fetch
+    /// cost at `addr` (`width` in bytes, 4 or 2), keeping the
+    /// sequential tracker and the Game Pak prefetch buffer exactly as
+    /// the interpreter's per-instruction fetches do.
+    pub fetch: unsafe extern "C" fn(
+        ctx: *mut core::ffi::c_void,
+        st: *mut GuestState,
+        addr: u32,
+        width: u32,
+    ),
     /// Native execution stops (with `exited` set) once `icount`
     /// reaches this.
     pub budget: u64,
+    /// Native execution also stops once charged `cycles` reach this,
+    /// checked at the same backward edges and calls. The frame runner
+    /// budgets units to the remaining cycles before the video frame
+    /// boundary so a unit cannot overshoot it; unbounded callers set
+    /// `u64::MAX` and rely on `budget` alone.
+    pub cycle_budget: u64,
 }
 
 /// The C declarations every emitted module is compiled against: the
@@ -119,7 +137,13 @@ struct oxy_ops {
      * code, the host set st->pc/st->exited, and the interpreter reruns
      * the storing instruction (pc argument). */
     uint32_t (*store)(void* ctx, struct oxy_state* st, uint32_t addr, uint32_t value, uint32_t size, uint32_t pc);
+    /* One opcode fetch: charges the bus fetch cost into st->cycles
+     * (width in bytes, 4 or 2). */
+    void (*fetch)(void* ctx, struct oxy_state* st, uint32_t addr, uint32_t width);
     uint64_t budget;
+    /* Backward edges and calls also exit once st->cycles reaches
+     * this, so a unit cannot run past the scheduler's frame slice. */
+    uint64_t cycle_budget;
 };
 
 /* a + b + cin with ARM carry/overflow (ARM ARM A2.3.1). */

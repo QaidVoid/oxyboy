@@ -118,6 +118,16 @@ impl Ppu {
         self.frame_ended
     }
 
+    /// System cycles from the current dot to the next frame boundary.
+    /// The frame runner budgets native units to this so a chunk cannot
+    /// run past the boundary it is supposed to stop at.
+    #[must_use]
+    pub fn cycles_to_frame_end(&self) -> u32 {
+        let frame = LINES_PER_FRAME as u64 * CYCLES_PER_LINE as u64;
+        let elapsed = self.line as u64 * CYCLES_PER_LINE as u64 + self.dot as u64;
+        (frame - elapsed % frame) as u32
+    }
+
     /// The rendered frame.
     pub fn frame(&self) -> &Frame {
         &self.frame

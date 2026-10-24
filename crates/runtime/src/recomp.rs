@@ -33,18 +33,36 @@
 //! [`System::advance_clock`]), still inside the step's watched
 //! window.
 //!
-//! Accuracy level: native chunks charge
-//! memory ops at real waitstate costs plus one cycle per IR
-//! instruction; opcode fetch, internal cycles, and IRQ boundary checks
-//! inside a chunk are not modeled, so video timing shifts within a
-//! chunk. State equality is the contract; cycle equality is not.
+//! Accuracy level: native chunks charge the interpreter's
+//! exact per-instruction model. The lifted IR carries one cycle
+//! charge per guest instruction (fetch address plus internal-cycle
+//! extras); the emitter plays them in program order through the
+//! host's `fetch` callback, which prices the bus with the same
+//! `fetch_cost` the interpreter uses (WAITCNT waitstates, sequential
+//! tracking, and the Game Pak prefetch buffer included), and the
+//! load/store callbacks charge the data accesses as before. Failed
+//! ARM conditions add their one internal cycle. On top of the
+//! per-call instruction budget, [`Driver::run_frame`] bounds every
+//! native call by the video cycles left before the frame boundary
+//! (`GuestOps::cycle_budget`): a unit exits at a backward edge or
+//! call once its charged cycles reach the bound, so idle loops cannot
+//! overshoot the boundary and the frame runner stops where
+//! [`System::step_frame`] does. Remaining gaps, all documented: IRQ
+//! boundary checks inside a chunk (an interrupt
+//! waits for the chunk to end), hardware interleaving within a chunk
+//! (timers and the PPU advance when the chunk's cycles feed the
+//! scheduler at its end), ARM function returns via unlifted
+//! `ldr pc`/`ldm .., pc` (no charge; the unit falls back to the
+//! interpreter), and a fully eliminated conditional instruction's
+//! failed-condition cycle. State equality stays the contract; cycle
+//! equality per instruction sequence is not yet guaranteed.
 
 use core::ffi::c_void;
 
 use crate::bus::{Bus, PAGE_SHIFT};
 use crate::system::System;
 use recomp::Module;
-use recomp::abi::{GuestOps, GuestState, SIZE_BYTE, SIZE_HALF, SIZE_WORD};
+use recomp::abi::{GuestOps, GuestState, MODE_SWAP, SIZE_BYTE, SIZE_HALF, SIZE_WORD};
 
 /// The default native-instruction budget per call.
 pub const DEFAULT_BUDGET: u64 = 1_000_000;
@@ -91,6 +109,12 @@ pub struct Driver {
     /// translated function has code in the page.
     code_pages: Vec<u8>,
     budget: u64,
+    /// Cycle bound for one native call: backward edges and calls exit
+    /// once the unit's charged cycles reach it. `u64::MAX` (the
+    /// default) leaves the instruction [`DEFAULT_BUDGET`] alone as the
+    /// only bound; the frame runner sets it to the remaining video
+    /// cycles so a unit cannot overshoot the frame boundary.
+    cycle_budget: u64,
 }
 
 impl Driver {
@@ -109,6 +133,7 @@ impl Driver {
             entries,
             code_pages,
             budget: DEFAULT_BUDGET,
+            cycle_budget: u64::MAX,
         }
     }
 
@@ -200,13 +225,22 @@ impl Driver {
     /// Runs whole frames through [`Driver::step`], ending at a frame
     /// boundary (the same point plain `step_frame` stops at).
     ///
+    /// Each step unit is bounded by the video cycles left before the
+    /// next frame boundary ([`System::cycles_to_frame_end`]), so a
+    /// translated unit cannot run far past it: backward edges and
+    /// calls exit the native code once its charged cycles reach the
+    /// bound, and the leftover charge is added through
+    /// [`System::advance_clock`].
+    ///
     /// # Errors
     ///
     /// Propagates native-call failures.
     pub fn run_frame(&mut self, system: &mut System) -> Result<(), String> {
         while !system.frame_ended() {
+            self.cycle_budget = u64::from(system.cycles_to_frame_end()).max(1);
             self.step(system)?;
         }
+        self.cycle_budget = u64::MAX;
         system.step_frame();
         Ok(())
     }
@@ -317,7 +351,9 @@ impl Driver {
             ctx: std::ptr::from_mut(&mut ctx).cast::<c_void>(),
             load: host_load,
             store: host_store,
+            fetch: host_fetch,
             budget,
+            cycle_budget: self.cycle_budget,
         };
         self.module.call(entry, &mut st, &ops)?;
 
@@ -353,7 +389,7 @@ unsafe extern "C" fn host_load(
     addr: u32,
     size: u32,
     sext: u32,
-    _mode: u32,
+    mode: u32,
 ) -> u32 {
     let host = unsafe { &mut *(ctx.cast::<HostCtx>()) };
     let bus = unsafe { &mut *host.bus };
@@ -363,7 +399,9 @@ unsafe extern "C" fn host_load(
         SIZE_WORD => 4,
         _ => 0,
     };
-    if width > 0 {
+    // A SWP lifts as an uncharged load plus a charged store: the
+    // interpreter prices the exchange once, before the read.
+    if width > 0 && mode != MODE_SWAP {
         let cost = bus.access_cost(addr, width);
         unsafe { (*st).cycles += u64::from(cost) };
     }
@@ -382,6 +420,17 @@ unsafe extern "C" fn host_load(
         SIZE_HALF => (raw as u16) as i16 as i32 as u32,
         _ => raw,
     }
+}
+
+/// One opcode fetch inside a native chunk: charges the same bus cost
+/// the interpreter's per-instruction fetches charge, so the
+/// sequential tracker and the Game Pak prefetch buffer advance in
+/// the same order relative to the data callbacks.
+unsafe extern "C" fn host_fetch(ctx: *mut c_void, st: *mut GuestState, addr: u32, width: u32) {
+    let host = unsafe { &mut *(ctx.cast::<HostCtx>()) };
+    let bus = unsafe { &mut *host.bus };
+    let cost = bus.fetch_cost(addr, u8::try_from(width).unwrap_or(4));
+    unsafe { (*st).cycles += u64::from(cost) };
 }
 
 /// `true` when the store lands in a page holding translated code.

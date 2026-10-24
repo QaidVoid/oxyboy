@@ -12,11 +12,40 @@ use std::collections::{BTreeMap, HashMap};
 
 use analysis::{Canonical, FlagMap, Flags, State};
 use decode::{
-    ArmInstr, Condition, Register, ShifterOperand, ThumbHiOp, ThumbInstr, decode_arm, decode_thumb,
+    ArmInstr, Condition, Register, ShifterOperand, ThumbAluOp, ThumbHiOp, ThumbInstr, decode_arm,
+    decode_thumb,
 };
 
 use crate::arm::ArmLift;
-use crate::{Block, BlockId, Function, Inst, Op, SLOTS, Terminator, Value, ValueId};
+use crate::{Block, BlockId, CycleCharge, Function, Inst, Op, SLOTS, Terminator, Value, ValueId};
+
+/// The interpreter's internal-cycle extras for one ARM instruction
+/// beyond the opcode fetch and the data-access costs the host
+/// callbacks charge (the `execute` cycle model in the runtime).
+fn arm_internal(instr: &ArmInstr) -> u32 {
+    match instr {
+        ArmInstr::Multiply { .. } => 3,
+        ArmInstr::MultiplyLong { .. } => 5,
+        ArmInstr::Swap { .. } => 1,
+        _ => 0,
+    }
+}
+
+/// The interpreter's internal-cycle extras for one THUMB instruction
+/// at a non-terminator site; terminator forms charge at their break
+/// sites below.
+fn thumb_internal(instr: &ThumbInstr) -> u32 {
+    match instr {
+        ThumbInstr::ShiftedImmediate { .. } => 1,
+        ThumbInstr::AluOperation { op, .. } => match op {
+            ThumbAluOp::Mul => 3,
+            ThumbAluOp::Lsl | ThumbAluOp::Lsr | ThumbAluOp::Asr | ThumbAluOp::Ror => 1,
+            _ => 0,
+        },
+        ThumbInstr::PcRelativeLoad { .. } => 1,
+        _ => 0,
+    }
+}
 
 /// The number of machine state slots.
 const STATE_COUNT: usize = SLOTS.len();
@@ -86,6 +115,7 @@ struct RawBlock {
     params: Vec<ValueId>,
     end_state: Vec<ValueId>,
     insts: Vec<Inst>,
+    cycles: Vec<CycleCharge>,
     term: RawTerm,
 }
 
@@ -198,6 +228,8 @@ impl Lifter<'_> {
             addr: from,
             guard: None,
         };
+        // One cycle charge per executed guest instruction, in order.
+        let mut cycles: Vec<CycleCharge> = Vec::new();
         let mut addr = from;
         let term = loop {
             if addr >= self.region.end {
@@ -217,6 +249,7 @@ impl Lifter<'_> {
                     let guard = Condition::from_bits((word >> 28) as u8);
                     match decode_arm(word) {
                         ArmInstr::Branch { link, offset } => {
+                            cycles.push(CycleCharge { addr, cycles: 0 });
                             let target = addr.wrapping_add(8).wrapping_add_signed(offset);
                             if link {
                                 lift.addr = addr;
@@ -261,6 +294,7 @@ impl Lifter<'_> {
                             break RawTerm::Call { target, cont: None };
                         }
                         ArmInstr::BranchExchange { rn } => {
+                            cycles.push(CycleCharge { addr, cycles: 0 });
                             break if rn == Register::Lr {
                                 RawTerm::Return {
                                     switches_state: true,
@@ -282,6 +316,7 @@ impl Lifter<'_> {
                             // other ALU writes to pc keep the pc value
                             // as the exit target until the real lifter
                             // computes the sum.
+                            cycles.push(CycleCharge { addr, cycles: 0 });
                             break RawTerm::IndirectExit {
                                 reg: match operand2 {
                                     ShifterOperand::Register { rm, .. } => rm,
@@ -306,6 +341,10 @@ impl Lifter<'_> {
                         }
                         ArmInstr::Undefined { .. } => break RawTerm::Unreachable,
                         other => {
+                            cycles.push(CycleCharge {
+                                addr,
+                                cycles: arm_internal(&other),
+                            });
                             lift.guard = guard;
                             lift.addr = addr;
                             lift.lift(other);
@@ -318,6 +357,7 @@ impl Lifter<'_> {
                     let next = self.half(addr + 2);
                     match decode_thumb(first, next) {
                         ThumbInstr::ConditionalBranch { cond, offset } => {
+                            cycles.push(CycleCharge { addr, cycles: 0 });
                             let target = addr
                                 .wrapping_add(4)
                                 .wrapping_add_signed(i32::from(offset) * 2);
@@ -333,6 +373,7 @@ impl Lifter<'_> {
                             };
                         }
                         ThumbInstr::UnconditionalBranch { offset } => {
+                            cycles.push(CycleCharge { addr, cycles: 0 });
                             let target = addr
                                 .wrapping_add(4)
                                 .wrapping_add_signed(i32::from(offset) * 2);
@@ -343,6 +384,10 @@ impl Lifter<'_> {
                             break RawTerm::Call { target, cont: None };
                         }
                         ThumbInstr::LongBranchWithLink { offset } => {
+                            // One 32-bit instruction: the interpreter
+                            // charges its fetch once plus the second
+                            // halfword fetch and one internal cycle.
+                            cycles.push(CycleCharge { addr, cycles: 2 });
                             let target = addr.wrapping_add(4).wrapping_add_signed(offset * 2);
                             lift.addr = addr;
                             let lr = lift.write(Register::Lr);
@@ -368,6 +413,7 @@ impl Lifter<'_> {
                             };
                         }
                         ThumbInstr::LongBranchWithLinkFromLr { .. } => {
+                            cycles.push(CycleCharge { addr, cycles: 1 });
                             break RawTerm::IndirectExit {
                                 reg: Register::Lr,
                                 // Thumb `bl` does not interwork; the
@@ -378,6 +424,7 @@ impl Lifter<'_> {
                         }
                         ThumbInstr::HighRegisterOperation { op, rd, rs } => match (op, rd) {
                             (ThumbHiOp::Bx, _) => {
+                                cycles.push(CycleCharge { addr, cycles: 0 });
                                 break if rs == Register::Lr {
                                     RawTerm::Return {
                                         switches_state: true,
@@ -391,6 +438,7 @@ impl Lifter<'_> {
                                 };
                             }
                             (ThumbHiOp::Add | ThumbHiOp::Mov, Register::Pc) => {
+                                cycles.push(CycleCharge { addr, cycles: 0 });
                                 break RawTerm::IndirectExit {
                                     reg: rs,
                                     switches_state: false,
@@ -398,6 +446,7 @@ impl Lifter<'_> {
                                 };
                             }
                             _ => {
+                                cycles.push(CycleCharge { addr, cycles: 0 });
                                 lift.addr = addr;
                                 lift.thumb_hi(op, rd, rs);
                                 addr += 2;
@@ -410,6 +459,7 @@ impl Lifter<'_> {
                         } => {
                             // The pop's loads must lift before the
                             // return so the pc slot carries them.
+                            cycles.push(CycleCharge { addr, cycles: 0 });
                             lift.addr = addr;
                             lift.thumb_pop(u16::from(registers), true);
                             break RawTerm::Return {
@@ -418,6 +468,10 @@ impl Lifter<'_> {
                         }
                         ThumbInstr::Undefined { .. } => break RawTerm::Unreachable,
                         other => {
+                            cycles.push(CycleCharge {
+                                addr,
+                                cycles: thumb_internal(&other),
+                            });
                             lift.guard = None;
                             lift.addr = addr;
                             lift.thumb(other);
@@ -435,6 +489,7 @@ impl Lifter<'_> {
                 params,
                 end_state: lift.current.to_vec(),
                 insts: lift.insts,
+                cycles,
                 term,
             },
         );
@@ -525,6 +580,7 @@ impl Lifter<'_> {
                 addr: *addr,
                 params,
                 insts: raw.insts.clone(),
+                cycles: raw.cycles.clone(),
                 term,
             });
         }
@@ -546,6 +602,7 @@ impl Lifter<'_> {
                 addr,
                 params,
                 insts: Vec::new(),
+                cycles: Vec::new(),
                 term: Terminator::Call {
                     target: Value::Const(addr),
                     cont: None,
@@ -555,6 +612,7 @@ impl Lifter<'_> {
         }
         Function {
             name: format!("sub_{:08x}", self.region.start),
+            thumb: self.region.state == State::Thumb,
             blocks,
         }
     }
@@ -739,6 +797,46 @@ mod tests {
             }
             other => panic!("expected indirect exit, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn cycle_charges_carry_the_interpreter_extras() {
+        // mul r0, r2, r3; swp r0, r2, [r1]; bx lr: three charges, the
+        // multiply's latency and the swap's internal cycle included.
+        let function = lift_arm(&[0xE000_0392, 0xE101_0092, 0xE12F_FF1E], 3);
+        let entry = &function.blocks[0];
+        let charges: Vec<(u32, u32)> = entry
+            .cycles
+            .iter()
+            .map(|charge| (charge.addr, charge.cycles))
+            .collect();
+        assert_eq!(charges.len(), 3, "{charges:?}");
+        assert_eq!(charges[0].1, 3, "multiply latency");
+        assert_eq!(charges[1].1, 1, "swap internal cycle");
+        assert_eq!(charges[2].1, 0, "bx is fetch-only");
+        // Charges sit at the guest instructions' own addresses.
+        assert_eq!(charges[0].0, entry.insts[0].pc);
+        assert_eq!(charges[1].0, entry.insts.last().expect("swap insts").pc);
+    }
+
+    #[test]
+    fn cycle_charges_cover_eliminated_and_terminator_instructions() {
+        // bl +1 (fetch + 2 in THUMB) continuing into lsls r0, r1, #1
+        // (+1 internal); bx lr. The bl's lr-write inst folds the bl's
+        // charge; the terminator bx carries its own.
+        let function = lift_thumb(&[0xF000, 0xF800, 0x0048, 0x4770], 4);
+        let internals: Vec<u32> = function.blocks[0].cycles.iter().map(|c| c.cycles).collect();
+        assert_eq!(internals, vec![2], "bl pair");
+        let rest: Vec<u32> = function.blocks[1].cycles.iter().map(|c| c.cycles).collect();
+        assert_eq!(rest, vec![1, 0], "movs then bx");
+        // Ascending addresses, one per guest instruction in the block.
+        assert!(
+            function.blocks[1]
+                .cycles
+                .windows(2)
+                .all(|w| w[0].addr < w[1].addr)
+        );
+        assert!(function.thumb);
     }
 
     #[test]

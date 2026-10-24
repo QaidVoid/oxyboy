@@ -13,8 +13,11 @@ use runtime::recomp::{Driver, TranslatedFn};
 use runtime::system::System;
 use testutil::synthetic::RomBuilder;
 
-/// The `b .` at the end of the micro program.
-const PARK: u32 = 0x0800_012C;
+/// The jump-out park target: the micro program ends in a branch just
+/// past the translated regions, so both runs execute the park branch
+/// exactly once before the state compare (a self-spinning park would
+/// run a different number of times interpreted vs natively budgeted).
+const PARK: u32 = 0x0800_0140;
 
 /// The micro program: a counted loop over EWRAM, a `bl` into a second
 /// function, a result store, and a park. Function two computes r3+r3.
@@ -31,7 +34,7 @@ fn micro_image() -> Image {
         0xBAFF_FFFA, // blt loop
         0xEB00_0001, // bl helper
         0xE582_4000, // str r4, [r2]
-        0xEAFF_FFFE, // b .
+        0xEA00_0003, // b 0x140 (the park, outside both regions)
         0xE093_4003, // helper: adds r4, r3, r3
         0xE1A0_F00E, // mov pc, lr
     ];
@@ -156,6 +159,47 @@ fn micro_corpus_recompiled_state_matches_interpreted() {
     };
     assert_eq!(word(0x0200_0000), 10, "loop counter");
     assert_eq!(word(0x0200_0100), 20, "helper result");
+}
+
+/// Cycle parity: the recompiled run of the micro
+/// corpus charges exactly the interpreter's cycle count for the same
+/// instruction sequence - opcode fetches through the bus's real cost
+/// model, multiply latency, and data-access waitstates included.
+#[test]
+fn recompiled_cycles_match_the_interpreter() {
+    if !recomp::Module::compiler_available() {
+        println!("skipping: no host C compiler on PATH");
+        return;
+    }
+    let image = micro_image();
+    let mut interpreted = System::new(image.bytes().to_vec(), 0x0800_0100);
+    let mut steps = 0;
+    while interpreted.cpu.pc() != PARK && steps < 10_000 {
+        interpreted.step();
+        steps += 1;
+    }
+    assert_eq!(
+        interpreted.cpu.pc(),
+        PARK,
+        "interpreted run reaches the park"
+    );
+
+    let marks = [(0x100u32, 0x130u32), (0x130, 0x138)];
+    let mut driver = build_driver(&image, &marks, "recomp-cycles").expect("module builds");
+    let mut recompiled = System::new(image.bytes().to_vec(), 0x0800_0100);
+    let mut hybrid_cycles = 0u64;
+    let mut steps = 0;
+    while recompiled.cpu.pc() != PARK && steps < 10_000 {
+        let charged = driver.step(&mut recompiled).expect("native call");
+        hybrid_cycles += u64::from(charged);
+        steps += 1;
+    }
+    assert_eq!(recompiled.cpu.pc(), PARK, "recompiled run reaches the park");
+    assert_eq!(
+        interpreted.cpu.cycles(),
+        hybrid_cycles,
+        "total cycles for the same instruction sequence"
+    );
 }
 
 /// The host-call target: `r0 += r1; mov pc, lr`.

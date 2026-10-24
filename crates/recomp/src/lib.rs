@@ -121,10 +121,43 @@ fn emit_block(
         );
         return;
     }
+    // Cycle charges interleave in program order with the insts' bus
+    // callbacks: every fetch entry at or before the inst's address
+    // goes out first, so the host's fetch callback hits the same
+    // sequential-tracker and prefetch-buffer state the interpreter's
+    // per-instruction fetches produce. Charges past the last inst
+    // belong to the terminator instruction.
+    let mut pending: &[ir::CycleCharge] = &block.cycles;
     for inst in &block.insts {
+        while let [charge, rest @ ..] = pending {
+            if charge.addr > inst.pc {
+                break;
+            }
+            emit_charge(out, charge, function.thumb);
+            pending = rest;
+        }
         emit_inst(out, inst);
     }
+    for charge in pending {
+        emit_charge(out, charge, function.thumb);
+    }
     emit_term(out, index, block, function, translated);
+}
+
+/// One guest instruction's cycle charge: the opcode fetch through the
+/// host callback (real waitstate cost, sequential tracking, prefetch
+/// buffer) plus the interpreter's internal-cycle extras as a
+/// constant.
+fn emit_charge(out: &mut String, charge: &ir::CycleCharge, thumb: bool) {
+    let width = if thumb { 2 } else { 4 };
+    let _ = writeln!(
+        out,
+        "    ops->fetch(ops->ctx, st, 0x{:x}u, {width}u);",
+        charge.addr
+    );
+    if charge.cycles > 0 {
+        let _ = writeln!(out, "    st->cycles += {}u;", charge.cycles);
+    }
 }
 
 fn emit_inst(out: &mut String, inst: &Inst) {
@@ -134,7 +167,9 @@ fn emit_inst(out: &mut String, inst: &Inst) {
         Some(cond) => {
             let _ = writeln!(out, "    if ({}) {{", cond_expr(cond));
             out.push_str(&body);
-            out.push_str("    }\n");
+            // A failed condition costs the interpreter one internal
+            // cycle (ARM step model); the fetch already went out.
+            out.push_str("    } else {\n        st->cycles += 1u;\n    }\n");
         }
     }
 }
@@ -144,7 +179,7 @@ fn emit_inst(out: &mut String, inst: &Inst) {
 fn inst_body(inst: &Inst) -> String {
     let mut body = String::new();
     let d: Vec<String> = inst.dests.iter().map(|id| format!("v{}", id.0)).collect();
-    let _ = writeln!(body, "    st->icount++; st->cycles += 1;");
+    let _ = writeln!(body, "    st->icount++;");
     match &inst.op {
         Op::Add { set_flags, a, b } => {
             arith(&mut body, &d, *set_flags, expr(a), expr(b), "0u", "oxy_add");
@@ -618,6 +653,11 @@ fn emit_term(
             budget_check(out, index, *then_target, function);
             let _ = writeln!(out, "    goto b{};", then_target.0);
             out.push_str("    } else {\n");
+            // An ARM branch whose condition fails costs one internal
+            // cycle; a THUMB conditional branch costs only its fetch.
+            if !function.thumb {
+                out.push_str("        st->cycles += 1u;\n");
+            }
             edge(out, else_args, &function.blocks[else_target.0 as usize]);
             budget_check(out, index, *else_target, function);
             let _ = writeln!(out, "    goto b{};", else_target.0);
@@ -636,7 +676,7 @@ fn emit_term(
                 // termination guarantee as loops.
                 let _ = writeln!(
                     out,
-                    "    if (st->icount >= ops->budget) {{ st->pc = 0x{t:x}u; st->exited = 1u; return; }}"
+                    "    if (st->icount >= ops->budget || st->cycles >= ops->cycle_budget) {{ st->pc = 0x{t:x}u; st->exited = 1u; return; }}"
                 );
                 let _ = writeln!(out, "    {}(st, ops);", symbol(*t));
                 match cont {
@@ -712,7 +752,7 @@ fn budget_check(out: &mut String, current: usize, target: BlockId, function: &Fu
         let addr = function.blocks[target.0 as usize].addr;
         let _ = writeln!(
             out,
-            "    if (st->icount++ >= ops->budget) {{ st->pc = 0x{addr:x}u; st->exited = 1u; return; }}"
+            "    if (st->icount++ >= ops->budget || st->cycles >= ops->cycle_budget) {{ st->pc = 0x{addr:x}u; st->exited = 1u; return; }}"
         );
     }
 }
@@ -998,9 +1038,20 @@ mod tests {
     fn sample() -> Function {
         Function {
             name: "sub_08000100".to_string(),
+            thumb: false,
             blocks: vec![Block {
                 addr: 0x0800_0100,
                 params: (0..20).map(ValueId).collect(),
+                cycles: vec![
+                    ir::CycleCharge {
+                        addr: 0x0800_0100,
+                        cycles: 0,
+                    },
+                    ir::CycleCharge {
+                        addr: 0x0800_0104,
+                        cycles: 0,
+                    },
+                ],
                 insts: vec![
                     Inst {
                         guard: None,
@@ -1057,6 +1108,36 @@ mod tests {
         assert!(
             source.contains("st->r[0] = v20;"),
             "return binds r0: {source}"
+        );
+    }
+
+    #[test]
+    fn cycle_charges_go_through_the_host_fetch_callback() {
+        let mut f = sample();
+        let source = emit_module(&[(0x0800_0100, &f)]).c_source;
+        // One fetch per guest instruction, at the instruction's own
+        // address, ahead of its (guarded) body.
+        assert!(
+            source.contains("ops->fetch(ops->ctx, st, 0x8000100u, 4u);"),
+            "{source}"
+        );
+        assert!(
+            source.contains("ops->fetch(ops->ctx, st, 0x8000104u, 4u);"),
+            "{source}"
+        );
+        // The flat per-instruction charge is gone; a failed ARM
+        // condition costs the interpreter's internal cycle.
+        assert!(!source.contains("st->cycles += 1;"), "{source}");
+        assert!(
+            source.contains("} else {\n        st->cycles += 1u;\n    }"),
+            "{source}"
+        );
+        // THUMB functions fetch halfwords.
+        f.thumb = true;
+        let source = emit_module(&[(0x0800_0100, &f)]).c_source;
+        assert!(
+            source.contains("ops->fetch(ops->ctx, st, 0x8000100u, 2u);"),
+            "{source}"
         );
     }
 
@@ -1121,6 +1202,7 @@ mod tests {
             addr: 0x0800_0104,
             params: (40..60).map(ValueId).collect(),
             insts: vec![],
+            cycles: Vec::new(),
             term: Terminator::Return {
                 state: (0..20)
                     .map(|slot| Value::Id(ValueId(40 + slot as u32)))
@@ -1157,7 +1239,7 @@ mod tests {
         let source = emit_module(&[(0x0800_0100, &f)]).c_source;
         assert!(
             source.contains(
-                "if (st->icount++ >= ops->budget) { st->pc = 0x8000100u; st->exited = 1u; return; }"
+                "if (st->icount++ >= ops->budget || st->cycles >= ops->cycle_budget) { st->pc = 0x8000100u; st->exited = 1u; return; }"
             ),
             "{source}"
         );

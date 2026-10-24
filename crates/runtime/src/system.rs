@@ -110,6 +110,13 @@ impl System {
         self.ppu.take_frame_ended()
     }
 
+    /// System cycles from the current video dot to the next frame
+    /// boundary (the frame runner's native-unit budget).
+    #[must_use]
+    pub fn cycles_to_frame_end(&self) -> u32 {
+        self.ppu.cycles_to_frame_end()
+    }
+
     /// Advances the video clock, timers, and APU by `cycles` and
     /// drains any DMA the guest armed, then refreshes the CPU IRQ
     /// input line. [`System::step`] applies this to its instruction's

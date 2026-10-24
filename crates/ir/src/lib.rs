@@ -376,8 +376,29 @@ pub struct Block {
     pub params: Vec<ValueId>,
     /// Instructions in address order within the block.
     pub insts: Vec<Inst>,
+    /// One [`CycleCharge`] per guest instruction in the block,
+    /// ascending by address, in execution order. Optimization passes
+    /// never touch it, so charges survive even when every IR fragment
+    /// of an instruction is eliminated.
+    pub cycles: Vec<CycleCharge>,
     /// How control leaves the block.
     pub term: Terminator,
+}
+
+/// The cycle cost of one guest instruction as the interpreter's model
+/// charges it: an opcode fetch at `addr` plus `cycles` internal
+/// cycles. Data-access costs are not modeled here (the host's
+/// load/store callbacks charge real waitstate costs at run time);
+/// the fetch goes through the host's fetch callback so the bus
+/// sequential tracker and the Game Pak prefetch buffer see the same
+/// operation sequence the interpreter produces.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CycleCharge {
+    /// Canonical guest address the opcode fetch happens at.
+    pub addr: u32,
+    /// Internal cycles beyond the fetch (the interpreter's per-op
+    /// extras: multiply latency, the THUMB BL second fetch, ...).
+    pub cycles: u32,
 }
 
 /// A lifted function: the entry block's parameters are the incoming
@@ -388,6 +409,9 @@ pub struct Block {
 pub struct Function {
     /// Symbol name, matching the emitter's naming.
     pub name: String,
+    /// The instruction state at entry: every block in the function
+    /// lifted from the same state (chunks never interwork internally).
+    pub thumb: bool,
     /// Basic blocks; the entry block is index 0 and its parameter list
     /// is the incoming machine state.
     pub blocks: Vec<Block>,

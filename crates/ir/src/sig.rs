@@ -663,6 +663,7 @@ mod tests {
             addr: 0,
             params: Vec::new(),
             insts,
+            cycles: Vec::new(),
             term,
         }
     }
@@ -675,6 +676,7 @@ mod tests {
         }
         Function {
             name: name.to_string(),
+            thumb: false,
             blocks,
         }
     }
