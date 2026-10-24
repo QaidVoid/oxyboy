@@ -9,6 +9,7 @@ Commands:
   lift        Lift a ROM into the intermediate representation
   recomp      Statically recompile a ROM to host code
   run         Execute a ROM in the GBA runtime
+  debug       Step a ROM in the debugger (breakpoints, register dumps)
   diff        Compare interpreter and recomp-hybrid execution of one ROM
   corpus      Run the regression corpus: determinism and frame-time budgets
   suite-test  Run one external-suite ROM and decode its on-screen verdict

@@ -64,6 +64,20 @@ pub enum Region {
     OpenBus,
 }
 
+/// One IO window bus access, recorded when the log is armed.
+/// Wide accesses appear as their real bus lanes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IoAccess {
+    /// Absolute bus address inside the IO window.
+    pub addr: u32,
+    /// The value on the data lane.
+    pub value: u32,
+    /// Access width in bytes (1 or 2).
+    pub width: u8,
+    /// True for reads, false for writes.
+    pub read: bool,
+}
+
 /// The GBA memory system: region arrays plus the address decoder.
 ///
 /// The full 4 GiB address space aliases the 256 MiB window at 0x00000000
@@ -117,6 +131,9 @@ pub struct Bus {
     /// Nesting depth of the capture guard: write widths funnel into
     /// narrower writes, and only the outermost call is recorded.
     capture_depth: u32,
+    /// Armed IO access log, oldest first; `None` while disarmed so
+    /// the per-access cost is one branch.
+    io_log: Option<Vec<IoAccess>>,
 }
 
 impl Bus {
@@ -154,6 +171,7 @@ impl Bus {
             write_watch: false,
             watch_log: Vec::new(),
             capture_depth: 0,
+            io_log: None,
         };
         // SOUNDBIAS resets to 0200h: bias level 100h, the 10-bit output
         // midpoint (GBATEK SOUNDBIAS).
@@ -357,24 +375,9 @@ impl Bus {
             0x02 => self.ewram[(a & 0x0003_FFFF) as usize],
             0x03 => self.iwram[(a & 0x0000_7FFF) as usize],
             0x04 if a < 0x0400_0400 => {
-                let off = a & 0x3FF;
-                // TMxCNT_L reads return the live counter, not the
-                // stored reload value (GBATEK "TMxCNT_L").
-                if let Some(ch) = Self::timer_channel(off, 0) {
-                    let shift = 8 * (off & 1);
-                    (self.timers.counter(ch) >> shift) as u8
-                } else if off == Self::SOUNDCNT_X {
-                    // Only the master enable bit is stored; the
-                    // channel-active flags are live APU state (GBATEK
-                    // SOUNDCNT_X).
-                    (self.io[off as usize] & 0x80) | self.apu.active_mask()
-                } else if (0x090..0x0A0).contains(&off) {
-                    // The WAVE_RAM window addresses the bank not being
-                    // played (GBATEK SOUND3CNT_L).
-                    self.apu.wave_cpu_byte(self.wave_window_bank(), off - 0x090)
-                } else {
-                    self.io[(off) as usize]
-                }
+                let value = self.io_read_byte(a);
+                self.log_io(a, u32::from(value), 1, true);
+                value
             }
             // Palette and OAM sit on 16/32-bit buses with no 8-bit data
             // lane; 8-bit reads return 0 (GBATEK bus-width table).
@@ -562,6 +565,22 @@ impl Bus {
         std::mem::take(&mut self.write_log)
     }
 
+    /// Arms or disarms the IO access log, discarding anything
+    /// captured so far. While armed, every access to the
+    /// `0x04000000` window from any bus client is recorded; drain
+    /// with [`Bus::take_io_log`].
+    pub fn set_io_log(&mut self, on: bool) {
+        self.io_log = if on { Some(Vec::new()) } else { None };
+    }
+
+    /// Drains the IO access log, oldest first.
+    pub fn take_io_log(&mut self) -> Vec<IoAccess> {
+        match self.io_log.as_mut() {
+            Some(log) => std::mem::take(log),
+            None => Vec::new(),
+        }
+    }
+
     /// Arms the write watch for one execution unit and discards
     /// anything captured so far. Owned by the recomp driver: writes
     /// observed while armed are the SMC-detection channel.
@@ -616,7 +635,48 @@ impl Bus {
 
     /// Writes one byte of the IO window through the containing
     /// halfword's register semantics.
+    /// The stored-or-live byte value of one IO byte lane: live
+    /// counters and APU state override the register image (GBATEK
+    /// "TMxCNT_L", "SOUNDCNT_X", "SOUND3CNT_L").
+    fn io_read_byte(&mut self, a: u32) -> u8 {
+        let off = a & 0x3FF;
+        // TMxCNT_L reads return the live counter, not the
+        // stored reload value (GBATEK "TMxCNT_L").
+        if let Some(ch) = Self::timer_channel(off, 0) {
+            let shift = 8 * (off & 1);
+            (self.timers.counter(ch) >> shift) as u8
+        } else if off == Self::SOUNDCNT_X {
+            // Only the master enable bit is stored; the
+            // channel-active flags are live APU state (GBATEK
+            // SOUNDCNT_X).
+            (self.io[off as usize] & 0x80) | self.apu.active_mask()
+        } else if (0x090..0x0A0).contains(&off) {
+            // The WAVE_RAM window addresses the bank not being
+            // played (GBATEK SOUND3CNT_L).
+            self.apu.wave_cpu_byte(self.wave_window_bank(), off - 0x090)
+        } else {
+            self.io[(off) as usize]
+        }
+    }
+
+    /// Records one IO bus access when the log is armed: every CPU,
+    /// PPU, timer, APU, and DMA touch of the `0x04000000` window.
+    /// Wide accesses appear as their real bus lanes (a word store is
+    /// two halfword accesses); the log records the bus access, which
+    /// may still be discarded by register semantics.
+    fn log_io(&mut self, addr: u32, value: u32, width: u8, read: bool) {
+        if let Some(log) = self.io_log.as_mut() {
+            log.push(IoAccess {
+                addr,
+                value,
+                width,
+                read,
+            });
+        }
+    }
+
     fn io_write_byte(&mut self, a: u32, value: u8) {
+        self.log_io(a, u32::from(value), 1, false);
         let idx = (a & 0x03FF) as usize;
         if (0x090..0x0A0).contains(&idx) {
             // The WAVE_RAM window addresses the bank not being played
@@ -665,6 +725,7 @@ impl Bus {
     /// (GBATEK: "(R)" on V-Blank/H-Blank/V-Counter), VCOUNT is
     /// read-only, and IF acknowledges on written 1 bits.
     fn io_write_u16(&mut self, half: u32, value: u16) {
+        self.log_io(half, u32::from(value), 2, false);
         let off = (half & 0x3FF) as usize;
         let snd = off as u32;
         if (0x060..0x082).contains(&snd) {
@@ -1112,5 +1173,47 @@ fn rom_lane_cost(wcnt: u16, addr: u32, seq: bool) -> u32 {
                 1
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn io_log_records_reads_and_writes_when_armed() {
+        let mut bus = Bus::new(vec![0; 256]);
+        bus.write_u16(0x0400_0000, 0x0403);
+        assert!(
+            bus.take_io_log().is_empty(),
+            "disarmed log must record nothing"
+        );
+        bus.set_io_log(true);
+        bus.write_u16(0x0400_0000, 0x0403);
+        let _ = bus.read_u8(0x0400_0000);
+        let log = bus.take_io_log();
+        assert_eq!(log.len(), 2, "{log:?}");
+        assert_eq!(
+            log[0],
+            IoAccess {
+                addr: 0x0400_0000,
+                value: 0x0403,
+                width: 2,
+                read: false
+            }
+        );
+        assert_eq!(
+            log[1],
+            IoAccess {
+                addr: 0x0400_0000,
+                value: 0x03,
+                width: 1,
+                read: true
+            }
+        );
+        assert!(bus.take_io_log().is_empty(), "drain must empty the log");
+        bus.set_io_log(false);
+        bus.write_u16(0x0400_0000, 0);
+        assert!(bus.take_io_log().is_empty(), "disarmed again");
     }
 }

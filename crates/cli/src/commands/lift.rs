@@ -114,7 +114,7 @@ pub struct LiftArgs {
 
     /// Lift only the function starting at this address (hex or
     /// decimal, e.g. 0x08000100).
-    #[arg(long, value_name = "ADDR", value_parser = parse_addr)]
+    #[arg(long, value_name = "ADDR", value_parser = crate::commands::parse_addr)]
     pub function: Option<u32>,
 
     /// Print the IR after every pass, not just the final form.
@@ -139,15 +139,4 @@ pub struct LiftArgs {
     /// keep their configured names in the C output.
     #[arg(long, value_name = "PATH")]
     pub config: Option<std::path::PathBuf>,
-}
-
-/// Parses an address literal in hex (`0x` prefix) or decimal.
-fn parse_addr(s: &str) -> Result<u32, String> {
-    let s = s.trim();
-    match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-        Some(hex) => u32::from_str_radix(hex, 16).map_err(|e| format!("invalid address: {e}")),
-        None => s
-            .parse::<u32>()
-            .map_err(|e| format!("invalid address: {e}")),
-    }
 }

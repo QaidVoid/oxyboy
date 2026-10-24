@@ -102,6 +102,14 @@ impl System {
         self.ppu.frame_ended()
     }
 
+    /// Consumes the frame-ended flag: true once per completed frame.
+    /// Per-instruction drivers (the debugger, the IO logger) step
+    /// until this returns true instead of calling
+    /// [`System::step_frame`], which does not expose step granularity.
+    pub fn take_frame_ended(&mut self) -> bool {
+        self.ppu.take_frame_ended()
+    }
+
     /// Advances the video clock, timers, and APU by `cycles` and
     /// drains any DMA the guest armed, then refreshes the CPU IRQ
     /// input line. [`System::step`] applies this to its instruction's

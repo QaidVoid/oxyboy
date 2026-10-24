@@ -150,9 +150,6 @@ fn trace_requires_headless() {
         .expect("run oxyboy");
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8(output.stderr).expect("utf-8");
-    assert!(
-        stderr.contains("--trace requires --headless"),
-        "stderr: {stderr}"
-    );
+    assert!(stderr.contains("--headless"), "stderr: {stderr}");
     fs::remove_dir_all(&dir).ok();
 }

@@ -62,6 +62,19 @@ pub struct RunArgs {
     /// windowed runs depend on wall-clock input.
     #[arg(long, value_name = "FILE")]
     pub trace: Option<PathBuf>,
+
+    /// Log every IO window access of the headless run to this CSV
+    /// file (`pc,addr,rw,width,value`). Requires `--headless`.
+    #[arg(long, value_name = "FILE")]
+    pub io_log: Option<PathBuf>,
+
+    /// First IO address to log, inclusive (default: window start).
+    #[arg(long, value_name = "ADDR", requires = "io_log", value_parser = crate::commands::parse_addr)]
+    pub io_from: Option<u32>,
+
+    /// Last IO address to log, inclusive (default: window end).
+    #[arg(long, value_name = "ADDR", requires = "io_log", value_parser = crate::commands::parse_addr)]
+    pub io_to: Option<u32>,
 }
 
 /// Runs `oxyboy run` and returns the process exit code.
@@ -101,13 +114,19 @@ pub fn run(args: RunArgs) -> i32 {
                 eprintln!("oxyboy run: {code}");
                 return 1;
             }
+        } else if let Some(path) = &args.io_log {
+            let range = args.io_from.unwrap_or(0x0400_0000)..=args.io_to.unwrap_or(0x0400_03FF);
+            if let Err(e) = run_io_logged(&mut system, path, range, args.frames) {
+                eprintln!("oxyboy run: {e}");
+                return 1;
+            }
         } else {
             for _ in 0..args.frames {
                 system.step_frame();
             }
         }
-    } else if args.trace.is_some() {
-        eprintln!("oxyboy run: --trace requires --headless");
+    } else if args.trace.is_some() || args.io_log.is_some() {
+        eprintln!("oxyboy run: --trace and --io-log require --headless");
         return 1;
     } else if let Err(code) = run_windowed(&mut system) {
         eprintln!("oxyboy run: {code}");
@@ -139,6 +158,37 @@ pub fn run(args: RunArgs) -> i32 {
 /// # Errors
 ///
 /// Returns a printable message when the trace file cannot be written.
+/// Runs headless with the IO log armed, writing one CSV row per
+/// logged access inside `range`; the `pc` column is the instruction
+/// that performed (or contained) the access.
+fn run_io_logged(
+    system: &mut System,
+    path: &Path,
+    range: std::ops::RangeInclusive<u32>,
+    frames: u32,
+) -> Result<(), String> {
+    let mut rows = String::from("pc,addr,rw,width,value\n");
+    system.bus_mut().set_io_log(true);
+    for _ in 0..frames {
+        while !system.take_frame_ended() {
+            let pc = system.cpu.pc();
+            system.step();
+            for access in system.bus_mut().take_io_log() {
+                if range.contains(&access.addr) {
+                    rows.push_str(&format!(
+                        "0x{pc:08x},0x{:08x},{},{},0x{:x}\n",
+                        access.addr,
+                        if access.read { "r" } else { "w" },
+                        access.width,
+                        access.value,
+                    ));
+                }
+            }
+        }
+    }
+    std::fs::write(path, rows).map_err(|e| format!("{}: {e}", path.display()))
+}
+
 fn run_traced(system: &mut System, path: &Path, frames: u32) -> Result<(), String> {
     let file = File::create(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let mut writer =

@@ -11,5 +11,8 @@ Options:
       --save-dir <DIR>     Directory for save files. The default is the user data dir (never inside the repository)
       --db <FILE>          Path to a JSON ROM database; an entry's `save_type` overrides the backup medium auto-detection [env: OXYBOY_ROM_DB=]
       --trace <FILE>       Write an execution trace (`.oxytrace`) of the headless run to this file. Traces are only meaningful in `--headless` mode: windowed runs depend on wall-clock input
+      --io-log <FILE>      Log every IO window access of the headless run to this CSV file (`pc,addr,rw,width,value`). Requires `--headless`
+      --io-from <ADDR>     First IO address to log, inclusive (default: window start)
+      --io-to <ADDR>       Last IO address to log, inclusive (default: window end)
   -h, --help               Print help
   -V, --version            Print version

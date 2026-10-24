@@ -29,6 +29,8 @@ enum Command {
     Recomp(commands::recomp::RecompArgs),
     /// Execute a ROM in the GBA runtime.
     Run(commands::run::RunArgs),
+    /// Step a ROM in the debugger (breakpoints, register dumps).
+    Debug(commands::debug::DebugArgs),
     /// Compare interpreter and recomp-hybrid execution of one ROM.
     Diff(commands::diff::DiffArgs),
     /// Run the regression corpus: determinism and frame-time budgets.
@@ -60,6 +62,7 @@ fn main() {
         Command::Lift(args) => commands::lift::run(args),
         Command::Recomp(args) => commands::recomp::run(args),
         Command::Run(args) => commands::run::run(args),
+        Command::Debug(args) => commands::debug::run(args),
         Command::Diff(args) => commands::diff::run(args),
         Command::Corpus(args) => commands::corpus::run(args),
         Command::SuiteTest(args) => commands::suite::run(args),
