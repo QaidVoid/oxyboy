@@ -85,7 +85,10 @@ fn run_case(state: analysis::State, code: &[u8], rng: &mut Rng) {
     );
     let block = &function.blocks[0];
     assert!(!block.insts.is_empty(), "no ops lifted");
-    let ir::Terminator::Return { state: end_state } = &block.term else {
+    let ir::Terminator::Return {
+        state: end_state, ..
+    } = &block.term
+    else {
         panic!("expected a returning block, got {:?}", block.term);
     };
     let mut machine = Machine::new(256, bytes.clone());
@@ -118,7 +121,10 @@ fn run_case(state: analysis::State, code: &[u8], rng: &mut Rng) {
     let mut opt_fn = function.clone();
     ir::opt::optimize(&mut opt_fn);
     let oblock = &opt_fn.blocks[0];
-    let ir::Terminator::Return { state: oend_state } = &oblock.term else {
+    let ir::Terminator::Return {
+        state: oend_state, ..
+    } = &oblock.term
+    else {
         panic!("optimized function lost its return");
     };
     let mut omachine = Machine::new(256, bytes.clone());

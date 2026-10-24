@@ -27,6 +27,9 @@ pub struct GuestState {
     pub pc: u32,
     /// Nonzero when the code exited before the function returned.
     pub exited: u32,
+    /// The instruction state to resume in: 1 when THUMB, 0 when ARM.
+    /// Exits that interwork overwrite it from the target's low bit.
+    pub thumb: u32,
     /// Cycles charged since the host started this native call (memory
     /// ops charge real waitstate costs; each IR instruction adds one).
     pub cycles: u64,
@@ -97,6 +100,7 @@ struct oxy_state {
     uint32_t n, z, c, v;
     uint32_t pc;
     uint32_t exited;
+    uint32_t thumb;
     uint64_t cycles;
     uint64_t icount;
 };

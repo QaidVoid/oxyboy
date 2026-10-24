@@ -12,6 +12,7 @@ emit = { version = "0.1.0", path = "../emit" }
 ir = { version = "0.1.0", path = "../ir" }
 minifb = "0.28"
 png = "0.18"
+recomp = { version = "0.1.0", path = "../recomp" }
 rom = { version = "0.1.0", path = "../rom" }
 runtime = { version = "0.1.0", path = "../runtime" }
 trace = { version = "0.1.0", path = "../trace" }

@@ -165,6 +165,7 @@ mod tests {
             v: 0,
             pc: 0,
             exited: 0,
+            thumb: 0,
             cycles: 0,
             icount: 0,
         };
@@ -224,6 +225,7 @@ mod tests {
                     state: (0..20)
                         .map(|slot| if slot == 0 { reg(20) } else { reg(slot) })
                         .collect(),
+                    switches_state: false,
                 },
             }],
         }

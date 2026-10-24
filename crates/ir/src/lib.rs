@@ -336,13 +336,29 @@ pub enum Terminator {
         state: Vec<Value>,
     },
     /// Leave the function; the arguments are the outgoing machine
-    /// state in [`SLOTS`] order.
-    Return { state: Vec<Value> },
+    /// state in [`SLOTS`] order. `switches_state` marks a return that
+    /// interworks (`bx lr`): the outgoing pc slot then holds the lr
+    /// value and the callee's state follows its low bit. A plain
+    /// return (`ldr pc`, `ldm .., pc`, thumb `pop .., pc`, falling off
+    /// the region) keeps the calling state.
+    Return {
+        state: Vec<Value>,
+        switches_state: bool,
+    },
     /// Control leaves to an unresolved value (`bx` on an unknown
     /// register, an unresolved switch arm). `state` is the outgoing
     /// machine state in [`SLOTS`] order, observable across direct
-    /// calls between translated functions.
-    IndirectExit { target: Value, state: Vec<Value> },
+    /// calls between translated functions. `switches_state` marks a
+    /// branch that interworks (`bx rN`): the target state follows the
+    /// target address's low bit. `pc_mask` is the alignment mask the
+    /// real instruction applies to the target (`!1` for bx-style
+    /// jumps, `!3` for ARM `mov pc`).
+    IndirectExit {
+        target: Value,
+        state: Vec<Value>,
+        switches_state: bool,
+        pc_mask: u32,
+    },
     /// Control never reaches here.
     Unreachable,
 }

@@ -1,5 +1,6 @@
 //! Subcommand implementations.
 
+pub mod diff;
 pub mod info;
 pub mod lift;
 pub mod run;

@@ -295,7 +295,7 @@ fn substitute_term(term: &mut Terminator, subs: &[(ValueId, u32)]) {
             state,
             ..
         } => vec![args, state],
-        Terminator::Return { state } => vec![state],
+        Terminator::Return { state, .. } => vec![state],
         Terminator::IndirectExit { state, .. } => vec![state],
         _ => vec![],
     };
@@ -389,7 +389,7 @@ fn exit_live(
 ) -> HashSet<u32> {
     let mut live: HashSet<u32> = HashSet::new();
     match &function.blocks[index].term {
-        Terminator::Return { state }
+        Terminator::Return { state, .. }
         | Terminator::IndirectExit { state, .. }
         | Terminator::Call { state, .. } => {
             for value in state {
@@ -954,7 +954,7 @@ fn rewrite_term_copies(term: &mut Terminator, copies: &[(ValueId, Value)]) {
             state,
             ..
         } => vec![args, state],
-        Terminator::Return { state } => vec![state],
+        Terminator::Return { state, .. } => vec![state],
         Terminator::IndirectExit { state, .. } => vec![state],
         _ => vec![],
     };

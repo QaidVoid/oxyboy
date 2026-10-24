@@ -612,6 +612,7 @@ dependencies = [
  "ir",
  "minifb",
  "png",
+ "recomp",
  "rom",
  "runtime",
  "testutil",

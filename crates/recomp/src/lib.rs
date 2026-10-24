@@ -663,20 +663,39 @@ fn emit_term(
                 let _ = writeln!(out, "    st->pc = v{}; st->exited = 1u; return;", id.0);
             }
         },
-        Terminator::Return { state } => {
+        Terminator::Return {
+            state,
+            switches_state,
+        } => {
             flush_state(out, state);
             // Control went back to the caller, so this is not an
-            // exit; the resume PC is the returned r15.
+            // exit; the resume PC is the returned r15. An interworking
+            // return (`bx lr`) also switches state from the target's
+            // low bit, which slot 15 already carries.
+            if *switches_state {
+                // `bx lr` resumes at lr with the state from its low
+                // bit; the alignment mask strips that bit after.
+                out.push_str("    st->thumb = st->r[15] & 1u;\n");
+                out.push_str("    st->r[15] &= 0xfffffffeu;\n");
+            }
             out.push_str("    st->exited = 0u;\n");
             out.push_str("    return;\n");
         }
-        Terminator::IndirectExit { target, state } => {
+        Terminator::IndirectExit {
+            target,
+            state,
+            switches_state,
+            pc_mask,
+        } => {
             flush_state(out, state);
-            let _ = writeln!(
-                out,
-                "    st->pc = {}; st->exited = 1u; return;",
-                expr(target)
-            );
+            let _ = writeln!(out, "    st->pc = {};", expr(target));
+            if *switches_state {
+                // The state bit comes from the target's low bit
+                // before the alignment mask strips it.
+                out.push_str("    st->thumb = st->pc & 1u;\n");
+            }
+            let _ = writeln!(out, "    st->pc &= 0x{:x}u;", pc_mask);
+            out.push_str("    st->exited = 1u; return;\n");
         }
         Terminator::Unreachable => {
             out.push_str("    return; /* unreachable in the lifted region */\n");
@@ -827,7 +846,7 @@ fn used_ids(function: &Function) -> BTreeSet<u32> {
             }
         }
         match &block.term {
-            Terminator::Branch { args, .. } | Terminator::Return { state: args } => {
+            Terminator::Branch { args, .. } | Terminator::Return { state: args, .. } => {
                 args.iter().for_each(|v| push(&mut used, v))
             }
             Terminator::BranchCond {
@@ -849,7 +868,7 @@ fn used_ids(function: &Function) -> BTreeSet<u32> {
                 }
                 state.iter().for_each(|v| push(&mut used, v));
             }
-            Terminator::IndirectExit { target, state } => {
+            Terminator::IndirectExit { target, state, .. } => {
                 push(&mut used, target);
                 state.iter().for_each(|v| push(&mut used, v));
             }
@@ -1010,6 +1029,7 @@ mod tests {
                     state: (0..20)
                         .map(|slot| if slot == 0 { reg(20) } else { reg(slot) })
                         .collect(),
+                    switches_state: false,
                 },
             }],
         }
@@ -1105,6 +1125,7 @@ mod tests {
                 state: (0..20)
                     .map(|slot| Value::Id(ValueId(40 + slot as u32)))
                     .collect(),
+                switches_state: false,
             },
         });
         caller.blocks[0].term = Terminator::Call {

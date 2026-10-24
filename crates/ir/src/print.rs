@@ -404,10 +404,16 @@ fn fmt_term(term: &Terminator) -> String {
             ),
             None => format!("bl {}, state {}\n", fmt_value(target), fmt_state(state)),
         },
-        Terminator::Return { state } => format!("ret {}\n", fmt_state(state)),
-        Terminator::IndirectExit { target, state } => {
-            format!("bx {}, state {}\n", fmt_value(target), fmt_state(state))
-        }
+        Terminator::Return {
+            state,
+            switches_state: _,
+        } => format!("ret {}\n", fmt_state(state)),
+        Terminator::IndirectExit {
+            target,
+            state,
+            switches_state: _,
+            pc_mask: _,
+        } => format!("bx {}, state {}\n", fmt_value(target), fmt_state(state)),
         Terminator::Unreachable => "unreachable\n".to_string(),
     }
 }
@@ -577,6 +583,8 @@ pub(crate) fn sample_function() -> Function {
                         .map(reg)
                         .chain([reg(22), reg(23), reg(24), reg(25)])
                         .collect(),
+                    switches_state: true,
+                    pc_mask: !1,
                 },
             },
             Block {
@@ -588,6 +596,7 @@ pub(crate) fn sample_function() -> Function {
                         .map(|slot| if slot == 0 { reg(32) } else { reg(slot) })
                         .chain([reg(22), reg(23), reg(24), reg(25)])
                         .collect(),
+                    switches_state: false,
                 },
             },
         ],

@@ -101,10 +101,17 @@ enum RawTerm {
     },
     /// Call to a static target with an optional in-region continuation.
     Call { target: u32, cont: Option<u32> },
-    /// Return-like exit.
-    Return,
-    /// Register-indirect exit.
-    IndirectExit(Register),
+    /// Return-like exit. `switches_state` marks an interworking
+    /// return (`bx lr`); the pc slot then carries the lr value.
+    Return { switches_state: bool },
+    /// Register-indirect exit. `switches_state` marks an interworking
+    /// branch (`bx rN`); plain `mov pc` style jumps keep the state.
+    /// `pc_mask` mirrors the real instruction's target alignment.
+    IndirectExit {
+        reg: Register,
+        switches_state: bool,
+        pc_mask: u32,
+    },
     /// Undefined encoding or walked into non-code.
     Unreachable,
 }
@@ -195,8 +202,11 @@ impl Lifter<'_> {
         let term = loop {
             if addr >= self.region.end {
                 // Clean run off the region end: the function returns,
-                // carrying its final state in slot order.
-                break RawTerm::Return;
+                // carrying its final state in slot order. No interwork
+                // happens on the way out.
+                break RawTerm::Return {
+                    switches_state: false,
+                };
             }
             if !self.executed(addr) {
                 break RawTerm::Unreachable;
@@ -252,9 +262,15 @@ impl Lifter<'_> {
                         }
                         ArmInstr::BranchExchange { rn } => {
                             break if rn == Register::Lr {
-                                RawTerm::Return
+                                RawTerm::Return {
+                                    switches_state: true,
+                                }
                             } else {
-                                RawTerm::IndirectExit(rn)
+                                RawTerm::IndirectExit {
+                                    reg: rn,
+                                    switches_state: true,
+                                    pc_mask: !1,
+                                }
                             };
                         }
                         ArmInstr::DataProcessing {
@@ -266,18 +282,27 @@ impl Lifter<'_> {
                             // other ALU writes to pc keep the pc value
                             // as the exit target until the real lifter
                             // computes the sum.
-                            break RawTerm::IndirectExit(match operand2 {
-                                ShifterOperand::Register { rm, .. } => rm,
-                                _ => Register::Pc,
-                            });
+                            break RawTerm::IndirectExit {
+                                reg: match operand2 {
+                                    ShifterOperand::Register { rm, .. } => rm,
+                                    _ => Register::Pc,
+                                },
+                                switches_state: false,
+                                // ALU writes to pc word-align the target.
+                                pc_mask: !3,
+                            };
                         }
                         ArmInstr::LoadStore { load, rd, .. } if load && rd == Register::Pc => {
-                            break RawTerm::Return;
+                            break RawTerm::Return {
+                                switches_state: false,
+                            };
                         }
                         ArmInstr::BlockTransfer {
                             load, registers, ..
                         } if load && registers.contains(Register::Pc) => {
-                            break RawTerm::Return;
+                            break RawTerm::Return {
+                                switches_state: false,
+                            };
                         }
                         ArmInstr::Undefined { .. } => break RawTerm::Unreachable,
                         other => {
@@ -343,18 +368,34 @@ impl Lifter<'_> {
                             };
                         }
                         ThumbInstr::LongBranchWithLinkFromLr { .. } => {
-                            break RawTerm::IndirectExit(Register::Lr);
+                            break RawTerm::IndirectExit {
+                                reg: Register::Lr,
+                                // Thumb `bl` does not interwork; the
+                                // target state stays as it is.
+                                switches_state: false,
+                                pc_mask: !1,
+                            };
                         }
                         ThumbInstr::HighRegisterOperation { op, rd, rs } => match (op, rd) {
                             (ThumbHiOp::Bx, _) => {
                                 break if rs == Register::Lr {
-                                    RawTerm::Return
+                                    RawTerm::Return {
+                                        switches_state: true,
+                                    }
                                 } else {
-                                    RawTerm::IndirectExit(rs)
+                                    RawTerm::IndirectExit {
+                                        reg: rs,
+                                        switches_state: true,
+                                        pc_mask: !1,
+                                    }
                                 };
                             }
                             (ThumbHiOp::Add | ThumbHiOp::Mov, Register::Pc) => {
-                                break RawTerm::IndirectExit(rs);
+                                break RawTerm::IndirectExit {
+                                    reg: rs,
+                                    switches_state: false,
+                                    pc_mask: !1,
+                                };
                             }
                             _ => {
                                 lift.addr = addr;
@@ -371,7 +412,9 @@ impl Lifter<'_> {
                             // return so the pc slot carries them.
                             lift.addr = addr;
                             lift.thumb_pop(u16::from(registers), true);
-                            break RawTerm::Return;
+                            break RawTerm::Return {
+                                switches_state: false,
+                            };
                         }
                         ThumbInstr::Undefined { .. } => break RawTerm::Unreachable,
                         other => {
@@ -454,12 +497,27 @@ impl Lifter<'_> {
                     cont: cont.map(|addr| (ids[&addr], current.clone())),
                     state: current.clone(),
                 },
-                RawTerm::Return => Terminator::Return {
-                    state: current.clone(),
-                },
-                RawTerm::IndirectExit(reg) => Terminator::IndirectExit {
+                RawTerm::Return { switches_state } => {
+                    let mut state = current.clone();
+                    if *switches_state {
+                        // `bx lr` resumes at lr; slot 15 tracks slot 14
+                        // so the host resumes at the caller's address.
+                        state[Register::Pc.bits() as usize] = state[Register::Lr.bits() as usize];
+                    }
+                    Terminator::Return {
+                        state,
+                        switches_state: *switches_state,
+                    }
+                }
+                RawTerm::IndirectExit {
+                    reg,
+                    switches_state,
+                    pc_mask,
+                } => Terminator::IndirectExit {
                     target: current[reg.bits() as usize],
                     state: current.clone(),
+                    switches_state: *switches_state,
+                    pc_mask: *pc_mask,
                 },
                 RawTerm::Unreachable => Terminator::Unreachable,
             };
@@ -571,7 +629,7 @@ mod tests {
         // Only the add lands in the block; bx lr is the terminator.
         assert_eq!(entry.insts.len(), 1);
         match &entry.term {
-            Terminator::Return { state } => assert_eq!(state.len(), STATE_COUNT),
+            Terminator::Return { state, .. } => assert_eq!(state.len(), STATE_COUNT),
             other => panic!("expected return, got {other:?}"),
         }
     }

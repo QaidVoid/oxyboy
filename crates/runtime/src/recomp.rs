@@ -149,6 +149,12 @@ impl Driver {
         self.entries.iter().any(|e| e.start == pc)
     }
 
+    /// How many translated function entries the driver holds.
+    #[must_use]
+    pub fn translated_count(&self) -> usize {
+        self.entries.len()
+    }
+
     /// The instruction state of a translated function entry.
     fn thumb_at(&self, pc: u32) -> Option<bool> {
         self.entries.iter().find(|e| e.start == pc).map(|e| e.thumb)
@@ -205,6 +211,45 @@ impl Driver {
         Ok(())
     }
 
+    /// One [`Driver::step`] unit with execution recording (the
+    /// differential runner's trace capture). Interpreted units produce
+    /// a full [`trace::Record`]; a native chunk produces `None` - the
+    /// compiled code does not emit per-instruction records, so a trace
+    /// built from this method carries gaps at every translated span
+    /// and compares against the pure-interpreter oracle only up to the
+    /// first chunk.
+    ///
+    /// # Errors
+    ///
+    /// Propagates native-call failures.
+    pub fn step_recorded(
+        &mut self,
+        system: &mut System,
+    ) -> Result<(u32, Option<trace::Record>), String> {
+        system.bus_mut().arm_write_watch();
+        let result = match self.thumb_at(system.cpu.pc()) {
+            Some(thumb) => {
+                let entry = system.cpu.pc();
+                let cycles = self.run_native(system, entry, thumb)?;
+                if system.cpu.pc() == entry {
+                    // Opaque block at the entry: the interpreter made
+                    // the progress, so the unit records normally.
+                    let (cycles, record) = system.step_recorded();
+                    Ok((cycles, Some(record)))
+                } else {
+                    Ok((cycles, None))
+                }
+            }
+            None => Ok({
+                let (cycles, record) = system.step_recorded();
+                (cycles, Some(record))
+            }),
+        };
+        let watched = system.bus_mut().take_write_watch();
+        self.invalidate(&watched);
+        result
+    }
+
     /// Calls a translated guest function from the host with the ARM
     /// procedure-call convention: `args` land in r0-r3, lr is planted
     /// with [`HOST_RETURN_SENTINEL`], and the function runs natively
@@ -247,6 +292,7 @@ impl Driver {
             v: 0,
             pc: entry,
             exited: 0,
+            thumb: u32::from(thumb),
             cycles: 0,
             icount: 0,
         };
@@ -283,8 +329,10 @@ impl Driver {
         let flag_bits = (st.n << 31) | (st.z << 30) | (st.c << 29) | (st.v << 28);
         let mut cpsr = system.cpu.cpsr() & !0xF000_0000;
         cpsr |= flag_bits;
-        // Resumes leave the function in its own instruction state.
-        if thumb {
+        // Resumes leave in the state the chunk recorded on exit: an
+        // interworking exit (bx) overwrote `st.thumb`, everything else
+        // still carries the entry state.
+        if st.thumb != 0 {
             cpsr |= 0x20;
         } else {
             cpsr &= !0x20;
