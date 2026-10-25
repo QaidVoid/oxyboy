@@ -289,11 +289,8 @@ fn thumb_length(bytes: &[u8], canon: Canonical, mut addr: u32) -> u32 {
                 rd: Register::Pc,
                 ..
             } => true,
-            ThumbInstr::LoadStoreMultiple {
-                load: true,
-                registers,
-                ..
-            } => registers & (1 << Register::Pc.bits()) != 0,
+            // Format 15 load/store multiple lists cover r0-r7 only, so
+            // a pc-bearing load is exclusively PushPop above.
             _ => false,
         };
         if exit {
@@ -318,4 +315,23 @@ fn read_half(bytes: &[u8], canon: Canonical, addr: u32) -> Option<u16> {
     let offset = canon.offset(addr)?;
     let half: [u8; 2] = bytes.get(offset..offset + 2)?.try_into().ok()?;
     Some(u16::from_le_bytes(half))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn thumb_walk_survives_a_format15_multiple_transfer() {
+        // push {lr}; stmia r0!, {r0-r7}; pop {pc}: the format-15 list
+        // covers r0-r7 only, so the walk's pc-bearing-load exit check
+        // must not shift into the list width (debug builds panicked
+        // with a shift overflow on 1u8 << 15 before the check went).
+        let canon = Canonical::for_kind(rom::ImageKind::Cart);
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0xB500u16.to_le_bytes());
+        bytes.extend_from_slice(&0xC0FFu16.to_le_bytes());
+        bytes.extend_from_slice(&0xBD00u16.to_le_bytes());
+        assert_eq!(thumb_length(&bytes, canon, 0x0800_0000), 3);
+    }
 }
