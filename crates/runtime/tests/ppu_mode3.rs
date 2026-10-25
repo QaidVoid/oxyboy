@@ -249,9 +249,10 @@ fn vblank_irq_dispatches_through_the_bios_hle_path() {
     }
     assert_ne!(system.bus().int_flags() & 0x0001, 0);
     assert!(system.vcount() >= 160);
-    // HLE dispatch contract: the handler runs in ARM System state
-    // with IRQs disabled, r0 = IE & IF, lr on the HLE return sentinel.
-    assert_eq!(system.cpu.mode(), Mode::System);
+    // HLE dispatch contract: the handler runs in IRQ state (IntrMain
+    // keeps its frame on sp_irq) with IRQs disabled, r0 = IE & IF, lr
+    // on the HLE return sentinel.
+    assert_eq!(system.cpu.mode(), Mode::Irq);
     assert_eq!(system.cpu.cpsr() & 0x80, 0x80);
     assert_eq!(system.cpu.cpsr() & 0x20, 0);
     assert_eq!(system.cpu.reg_for_test(0), 0x0001);

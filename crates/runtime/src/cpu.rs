@@ -162,8 +162,8 @@ pub struct Cpu {
 }
 
 /// Registers preserved across a BIOS-HLE IRQ dispatch: r0..r3, r12,
-/// lr (the BIOS preamble pushes r0-r3, r12, lr).
-const SAVED_IRQ_REGS: usize = 6;
+/// lr, and the resume pc (the BIOS preamble pushes r0-r3, r12, lr).
+const SAVED_IRQ_REGS: usize = 7;
 
 /// How many nested BIOS-HLE dispatches can be in flight.
 const IRQ_HLE_DEPTH: usize = 8;
@@ -622,7 +622,7 @@ impl Cpu {
         if self.pc == IRQ_HLE_RETURN && self.irq_hle_depth > 0 {
             // Fetching the HLE sentinel performs the interrupt return
             // (the BIOS postamble inlined): restore the interrupted
-            // registers, CPSR, and resume at r14_irq - 4.
+            // registers, CPSR, and resume at the saved pc.
             self.cycles += 3;
             self.irq_hle_return(bus);
             return (self.cycles - before) as u32;
@@ -670,21 +670,31 @@ impl Cpu {
     /// Takes a pending IRQ through the BIOS-HLE dispatch path.
     ///
     /// With no BIOS ROM mapped, the vector at 0x18 is emulated at the
-    /// documented dispatch level instead: the interrupted caller-saved
-    /// registers (r0-r3, r12, lr) are preserved CPU-side, the CPU
-    /// enters ARM System state with IRQs disabled, `r0` carries the
-    /// `IE & IF` mask, `lr` parks on the [`IRQ_HLE_RETURN`] sentinel,
-    /// and execution resumes at `[0x03007FFC]`. The handler
-    /// acknowledges IF itself (write-1-to-clear) and returns with
-    /// `bx lr`; a handler address of 0 leaves the request pending
-    /// (nothing installed it, so there is nothing to dispatch to).
+    /// documented dispatch level, reproducing the BIOS preamble and
+    /// epilogue (GBATEK "Interrupt Dispatch"; the suite-latched
+    /// dispatcher words): the CPU enters IRQ mode with `lr_irq` parked
+    /// on the [`IRQ_HLE_RETURN`] sentinel, sp_irq is re-armed to
+    /// 0x03007FA0 and the preamble frame `{r0-r3, r12, lr}` is pushed
+    /// below it (frame `lr` = sentinel + 4, so a handler that
+    /// terminates with the conventional `pop {r0-r3,r12,lr};
+    /// subs pc, lr, #4` lands on the sentinel), `r0` carries the
+    /// `IE & IF` mask, and execution resumes at `[0x03007FFC]` in IRQ
+    /// mode - the Nintendo SDK's IntrMain starts with `mrs r0, SPSR`
+    /// and keeps its own frame on the IRQ stack, so it must be entered
+    /// exactly like this. The handler acknowledges IF itself; a
+    /// handler address of 0 leaves the request pending (nothing
+    /// installed it, so there is nothing to dispatch to).
     fn take_irq(&mut self, bus: &mut Bus) {
         let handler = bus.read_u32(IRQ_HANDLER_PTR);
         if handler == 0 {
             return;
         }
+        // The not-yet-executed instruction at `self.pc` is the resume
+        // point (see the step() dispatch comment).
+        let resume = self.pc;
         // Preserve the interrupted context before the mode switch
-        // banks r14 away (r0-r3 and r12 are unbanked).
+        // banks r14 away (r0-r3 and r12 are unbanked; the resume pc
+        // replaces the old lr_irq arithmetic as the epilogue's target).
         let saved = [
             self.regs[0],
             self.regs[1],
@@ -692,34 +702,41 @@ impl Cpu {
             self.regs[3],
             self.regs[12],
             self.regs[14],
+            resume,
         ];
         if self.irq_hle_depth < IRQ_HLE_DEPTH {
             self.irq_hle_saved[self.irq_hle_depth] = saved;
             self.irq_hle_depth += 1;
         }
-        self.exception(Mode::Irq, self.pc.wrapping_add(4), 0x18, false);
+        self.exception(Mode::Irq, resume, 0x18, false);
+        // The BIOS preamble frame on the IRQ stack: what a
+        // conventional handler pops, sitting below IntrMain's own
+        // frame.
+        bus.write_u32(0x0300_7F88, self.regs[0]);
+        bus.write_u32(0x0300_7F8C, self.regs[1]);
+        bus.write_u32(0x0300_7F90, self.regs[2]);
+        bus.write_u32(0x0300_7F94, self.regs[3]);
+        bus.write_u32(0x0300_7F98, self.regs[12]);
+        bus.write_u32(0x0300_7F9C, IRQ_HLE_RETURN.wrapping_add(4));
+        self.sp[bank_index(Bank::Irq)][0] = 0x0300_7F88;
         // The dispatch path's last BIOS prefetch, what a protected
         // BIOS read now returns (see the `BIOS_LATCH_*` constants).
         bus.set_bios_latch(BIOS_LATCH_IRQ);
-        // The BIOS preamble runs the handler in ARM System state with
-        // IRQs still disabled, r0 = IE & IF (GBATEK "Interrupt
-        // Dispatch").
-        self.switch_mode(Mode::System);
         self.regs[Register::Lr.bits() as usize] = IRQ_HLE_RETURN;
         self.regs[0] = u32::from(bus.int_enable() & bus.int_flags());
         self.pc = handler;
     }
 
-    /// Performs the interrupt return for one in-flight HLE dispatch:
-    /// restores the interrupted registers and CPSR and resumes at
-    /// `r14_irq - 4` (the not-yet-executed instruction).
+    /// Performs the interrupt return for one in-flight HLE dispatch
+    /// (the BIOS epilogue inlined): restores the interrupted registers
+    /// and CPSR, drops the preamble frame, and resumes at the
+    /// not-yet-executed instruction.
     fn irq_hle_return(&mut self, bus: &mut Bus) {
         self.irq_hle_depth -= 1;
         // The BIOS postamble's last prefetch (see take_irq).
         bus.set_bios_latch(BIOS_LATCH_IRQ_RETURN);
         let saved = self.irq_hle_saved[self.irq_hle_depth];
         let spsr = self.spsr[bank_index(Bank::Irq)];
-        let resume = self.sp[bank_index(Bank::Irq)][1].wrapping_sub(4);
         self.restore_cpsr(spsr);
         self.regs[0] = saved[0];
         self.regs[1] = saved[1];
@@ -727,7 +744,8 @@ impl Cpu {
         self.regs[3] = saved[3];
         self.regs[12] = saved[4];
         self.regs[Register::Lr.bits() as usize] = saved[5];
-        self.pc = resume;
+        self.sp[bank_index(Bank::Irq)][0] = 0x0300_7FA0;
+        self.pc = saved[6];
     }
 
     /// One ARM-state instruction.

@@ -592,10 +592,11 @@ fn irq_entry_dispatches_through_bios_hle_and_returns() {
     cpu.set_reg_for_test(14, 0x0ADC_0DE0);
     cpu.set_irq_line(true);
     run(&mut cpu, &mut bus, 1);
-    // HLE dispatch: the handler runs in ARM System state with IRQs
-    // disabled, lr parks on the HLE sentinel, r0 = IE & IF (0 here).
+    // HLE dispatch: the handler runs in IRQ state (IntrMain keeps its
+    // frame on sp_irq) with IRQs disabled, lr parks on the HLE
+    // sentinel, r0 = IE & IF (0 here).
     assert_eq!(cpu.pc(), 0x0200_0000);
-    assert_eq!(cpu.mode(), Mode::System);
+    assert_eq!(cpu.mode(), Mode::Irq);
     assert_eq!(cpu.cpsr() & 0x80, 0x80);
     assert_eq!(reg(&cpu, 0), 0);
     assert_eq!(reg(&cpu, 14), IRQ_HLE_RETURN);
