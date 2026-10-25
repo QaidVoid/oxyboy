@@ -57,6 +57,9 @@ impl EvalMemory {
                 let off = a.wrapping_sub(0x0800_0000) & self.rom_mask;
                 self.rom.get(off as usize).copied().unwrap_or(0)
             }
+            // The SRAM window over a save-less bus floats high (the
+            // no-medium save reads 0xFF).
+            0x0E | 0x0F => 0xFF,
             _ => 0,
         }
     }
@@ -71,7 +74,18 @@ impl EvalMemory {
     }
 
     /// A word load the way the interpreter's bus assembles it.
+    /// Whether the address sits on the 8-bit SRAM/flash bus.
+    fn sram_window(&self, addr: u32) -> bool {
+        matches!((addr & 0x0FFF_FFFF) >> 24, 0x0E | 0x0F)
+    }
+
     fn read_u32(&self, addr: u32) -> u32 {
+        // The 8-bit SRAM/flash bus replicates the byte (see the
+        // interpreter's `Bus::read_u32`).
+        if self.sram_window(addr) {
+            let b = u32::from(self.read_u8(addr));
+            return b | (b << 8) | (b << 16) | (b << 24);
+        }
         u32::from(self.read_u8(addr))
             | (u32::from(self.read_u8(addr.wrapping_add(1))) << 8)
             | (u32::from(self.read_u8(addr.wrapping_add(2))) << 16)
@@ -79,10 +93,21 @@ impl EvalMemory {
     }
 
     fn read_u16(&self, addr: u32) -> u16 {
+        if self.sram_window(addr) {
+            let b = u16::from(self.read_u8(addr));
+            return b | (b << 8);
+        }
         u16::from(self.read_u8(addr)) | (u16::from(self.read_u8(addr.wrapping_add(1))) << 8)
     }
 
     fn write_u32(&mut self, addr: u32, value: u32) {
+        if self.sram_window(addr) {
+            // One cycle: the byte the word lane selects (mirrors
+            // `Bus::write_u32`).
+            let b = (value >> (8 * (addr & 3))) as u8;
+            self.write_u8(addr, b);
+            return;
+        }
         for i in 0..4 {
             self.write_u8(addr.wrapping_add(i), (value >> (i * 8)) as u8);
         }
@@ -122,6 +147,11 @@ impl EvalMemory {
         match size {
             Size::Byte => self.write_u8(addr, value as u8),
             Size::Half => {
+                if self.sram_window(addr) {
+                    let b = (value >> (8 * (addr & 1))) as u8;
+                    self.write_u8(addr, b);
+                    return;
+                }
                 self.write_u8(addr, value as u8);
                 self.write_u8(addr.wrapping_add(1), (value >> 8) as u8);
             }

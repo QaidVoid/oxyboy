@@ -26,6 +26,10 @@ pub enum SaveKind {
     Eeprom512,
     /// Serial EEPROM, 8 KiB (14-bit addresses).
     Eeprom8k,
+    /// No backup medium: the SRAM window floats (reads 0xFF, the
+    /// external save suite's absent-chip convention) and writes are
+    /// discarded.
+    None,
 }
 
 impl SaveKind {
@@ -38,6 +42,7 @@ impl SaveKind {
             Self::Flash128 => 128 * 1024,
             Self::Eeprom512 => 512,
             Self::Eeprom8k => 8 * 1024,
+            Self::None => 0,
         }
     }
 
@@ -50,6 +55,7 @@ impl SaveKind {
             Self::Flash128 => "flash128",
             Self::Eeprom512 => "eeprom512",
             Self::Eeprom8k => "eeprom8k",
+            Self::None => "none",
         }
     }
 
@@ -62,6 +68,7 @@ impl SaveKind {
             "flash128" => Self::Flash128,
             "eeprom512" => Self::Eeprom512,
             "eeprom8k" => Self::Eeprom8k,
+            "none" => Self::None,
             _ => return None,
         };
         Some(kind)
@@ -74,7 +81,8 @@ impl SaveKind {
     /// `FLASH512_V`, or `FLASH1M_V` (GBATEK "GBA Cart Backup IDs"). The
     /// `EEPROM_V` string does not distinguish the two chip sizes; the
     /// size is settled later by the first DMA access width (see
-    /// [`Eeprom`]). With no ID at all the kind defaults to SRAM.
+    /// [`Eeprom`]). With no ID at all the cart has no medium
+    /// ([`SaveKind::None`]).
     #[must_use]
     pub fn detect(rom: &[u8]) -> Self {
         let ids: &[(&[u8], Self)] = &[
@@ -93,7 +101,7 @@ impl SaveKind {
                 }
             }
         }
-        Self::Sram
+        Self::None
     }
 }
 
@@ -123,18 +131,23 @@ pub enum Save {
     Flash(Flash),
     /// Serial EEPROM: bitstream-driven chip.
     Eeprom(Eeprom),
+    /// No medium behind the window.
+    None,
 }
 
 impl Save {
-    /// Builds a blank save of `kind` (erased flash reads 0xFF).
+    /// Builds a blank save of `kind` (erased flash and SRAM read
+    /// 0xFF; a fresh SRAM chip's floating bus settles high, which the
+    /// external save suite pins as the uninitialized value).
     #[must_use]
     pub fn new(kind: SaveKind) -> Self {
         match kind {
-            SaveKind::Sram => Self::Sram(vec![0; kind.size()].into_boxed_slice()),
+            SaveKind::Sram => Self::Sram(vec![0xFF; kind.size()].into_boxed_slice()),
             SaveKind::Flash64 => Self::Flash(Flash::new(false)),
             SaveKind::Flash128 => Self::Flash(Flash::new(true)),
             SaveKind::Eeprom512 => Self::Eeprom(Eeprom::new(Some(6))),
             SaveKind::Eeprom8k => Self::Eeprom(Eeprom::new(Some(14))),
+            SaveKind::None => Self::None,
         }
     }
 
@@ -145,6 +158,7 @@ impl Save {
             Self::Sram(_) => SaveKind::Sram,
             Self::Flash(f) => f.kind(),
             Self::Eeprom(e) => e.kind(),
+            Self::None => SaveKind::None,
         }
     }
 
@@ -155,6 +169,7 @@ impl Save {
             Self::Sram(data)
             | Self::Flash(Flash { data, .. })
             | Self::Eeprom(Eeprom { data, .. }) => data.to_vec(),
+            Self::None => Vec::new(),
         }
     }
 
@@ -178,6 +193,7 @@ impl Save {
                 Self::Sram(data) => data,
                 Self::Flash(f) => &mut f.data,
                 Self::Eeprom(e) => &mut e.data,
+                Self::None => return Ok(()),
             };
             data.copy_from_slice(bytes);
             save
@@ -227,6 +243,8 @@ impl Save {
             // The EEPROM answers on the ROM window instead; the SRAM
             // window has nothing behind it.
             Self::Eeprom(_) => 0,
+            // No chip drives the data lines; the bus floats high.
+            Self::None => 0xFF,
         }
     }
 
@@ -236,6 +254,7 @@ impl Save {
             Self::Sram(data) => data[(off as usize) & sram_mask(data.len())] = value,
             Self::Flash(f) => f.write_u8(off, value),
             Self::Eeprom(_) => {}
+            Self::None => {}
         }
     }
 
@@ -682,13 +701,22 @@ mod tests {
     }
 
     #[test]
-    fn detect_defaults_to_sram_without_id() {
-        assert_eq!(SaveKind::detect(&vec![0u8; 256]), SaveKind::Sram);
+    fn detect_yields_none_without_id() {
+        assert_eq!(SaveKind::detect(&vec![0u8; 256]), SaveKind::None);
         // The ID must sit at a word-aligned offset; an unaligned string
         // is not seen.
         let mut rom = vec![0u8; 256];
         rom[65..65 + 6].copy_from_slice(b"SRAM_V");
-        assert_eq!(SaveKind::detect(&rom), SaveKind::Sram);
+        assert_eq!(SaveKind::detect(&rom), SaveKind::None);
+    }
+
+    #[test]
+    fn no_medium_reads_float_high() {
+        let mut save = Save::new(SaveKind::None);
+        assert_eq!(save.read_u8(0), 0xFF);
+        save.write_u8(0, 0xAA);
+        assert_eq!(save.read_u8(0), 0xFF);
+        assert!(save.to_bytes().is_empty());
     }
 
     #[test]

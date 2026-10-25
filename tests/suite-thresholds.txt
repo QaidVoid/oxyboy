@@ -11,7 +11,7 @@ bios 0
 memory 54
 thumb 233
 unsafe 1
-save_none 0
-save_sram 0
-save_flash64 0
-save_flash128 0
+save_none 1
+save_sram 1
+save_flash64 1
+save_flash128 1

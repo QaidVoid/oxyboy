@@ -2,6 +2,7 @@
 //! open-bus behavior of the bus, per GBATEK "GBA Memory Map".
 
 use runtime::bus::{Bus, Region, region_of};
+use runtime::save::{Save, SaveKind};
 
 /// A bus whose ROM is `rom[i] = i as u8` for 1 KiB.
 fn bus_with_rom() -> Bus {
@@ -155,6 +156,7 @@ fn rom_read_beyond_power_of_two_tail_is_open_bus() {
 #[test]
 fn sram_round_trip_and_mirror() {
     let mut bus = Bus::new(Vec::new());
+    *bus.save_mut() = Save::new(SaveKind::Sram);
     bus.write_u8(0x0E00_FFFF, 0xAA);
     assert_eq!(bus.read_u8(0x0E00_FFFF), 0xAA);
     // 64 KiB repeat across the whole 16 MiB window (0x0E000000-0x0FFFFFFF).
@@ -163,20 +165,35 @@ fn sram_round_trip_and_mirror() {
 }
 
 #[test]
-fn sram_wide_accesses_split_into_byte_lanes() {
+fn sram_window_without_a_medium_floats_high() {
     let mut bus = Bus::new(Vec::new());
-    // The 8-bit SRAM bus executes a word access as four byte accesses.
-    bus.write_u32(0x0E00_0000, 0x1122_3344);
-    assert_eq!(bus.read_u8(0x0E00_0000), 0x44);
-    assert_eq!(bus.read_u8(0x0E00_0001), 0x33);
-    assert_eq!(bus.read_u8(0x0E00_0002), 0x22);
-    assert_eq!(bus.read_u8(0x0E00_0003), 0x11);
-    assert_eq!(bus.read_u32(0x0E00_0000), 0x1122_3344);
+    assert_eq!(bus.save().kind(), SaveKind::None);
+    bus.write_u8(0x0E00_0000, 0xAA);
+    assert_eq!(bus.read_u8(0x0E00_0000), 0xFF);
+}
+
+#[test]
+fn sram_wide_accesses_use_the_single_data_lane() {
+    let mut bus = Bus::new(Vec::new());
+    *bus.save_mut() = Save::new(SaveKind::Sram);
+    // The 8-bit bus answers wide reads with the byte replicated into
+    // every lane, and a halfword store writes the one byte the address
+    // selects (the external save suite pins both rules).
+    bus.write_u8(0x0E00_0000, 0x44);
+    assert_eq!(bus.read_u16(0x0E00_0000), 0x4444);
+    assert_eq!(bus.read_u32(0x0E00_0000), 0x4444_4444);
     bus.write_u16(0x0E00_0010, 0xBEEF);
     assert_eq!(bus.read_u8(0x0E00_0010), 0xEF);
+    assert_eq!(bus.read_u8(0x0E00_0011), 0xFF);
+    bus.write_u16(0x0E00_0011, 0xBEEF);
     assert_eq!(bus.read_u8(0x0E00_0011), 0xBE);
-    // Sequential lanes make unaligned wide accesses well defined.
-    assert_eq!(bus.read_u16(0x0E00_0001), 0x2233);
+    bus.write_u32(0x0E00_0020, 0x1122_3344);
+    assert_eq!(bus.read_u8(0x0E00_0020), 0x44);
+    assert_eq!(bus.read_u8(0x0E00_0021), 0xFF);
+    assert_eq!(bus.read_u8(0x0E00_0022), 0xFF);
+    assert_eq!(bus.read_u8(0x0E00_0023), 0xFF);
+    bus.write_u32(0x0E00_0023, 0x1122_3344);
+    assert_eq!(bus.read_u8(0x0E00_0023), 0x11);
 }
 
 #[test]

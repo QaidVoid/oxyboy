@@ -410,10 +410,12 @@ impl Bus {
             0x05 => halfword(&self.palette, ((a & 0x0000_03FF) & !1) as usize),
             0x06 => halfword(&self.vram, (Self::vram_index(a) & !1) as usize),
             0x07 => halfword(&self.oam, ((a & 0x0000_03FF) & !1) as usize),
-            // SRAM has an 8-bit bus: wide reads execute as sequential
-            // byte reads of consecutive addresses.
+            // The 8-bit SRAM/flash bus has one data lane: a wide read
+            // returns the single byte replicated into both halves
+            // (GBATEK; the external save suite pins this).
             0x0E | 0x0F => {
-                u16::from(self.read_u8(addr)) | (u16::from(self.read_u8(addr.wrapping_add(1))) << 8)
+                let b = self.read_u8(addr);
+                u16::from(b) | (u16::from(b) << 8)
             }
             // The EEPROM drives bit 0 of the 16-bit ROM window lane:
             // one halfword access, one bit (not two byte lanes).
@@ -439,7 +441,10 @@ impl Bus {
     /// else the access is four byte lanes.
     pub fn read_u32(&mut self, addr: u32) -> u32 {
         let a = addr & 0x0FFF_FFFF;
-        if matches!(a >> 24, 0x05..=0x0D) {
+        if matches!(a >> 24, 0x0E | 0x0F) {
+            let b = u32::from(self.read_u8(addr));
+            b | (b << 8) | (b << 16) | (b << 24)
+        } else if matches!(a >> 24, 0x05..=0x0D) {
             u32::from(self.read_u16(addr)) | (u32::from(self.read_u16(addr.wrapping_add(2))) << 16)
         } else {
             u32::from(self.read_u8(addr))
@@ -497,6 +502,14 @@ impl Bus {
                 self.write_u8(addr.wrapping_add(1), hi);
             }
             0x04 if a < 0x0400_0400 => self.io_write_u16(a & !1, value),
+            // The 8-bit SRAM/flash bus takes one byte per access: the
+            // halfword store writes the lane the address selects (the
+            // data is rotated by the address's bit 0; the external
+            // save suite pins both parities).
+            0x0E | 0x0F => {
+                let b = (value >> (8 * (a & 1))) as u8;
+                self.write_u8(addr, b);
+            }
             // The EEPROM takes one bit per halfword access: the write
             // is not split into byte lanes (GBATEK "GBA Cart Backup
             // EEPROM": only bit 0 of the data bus reaches the chip).
@@ -518,20 +531,26 @@ impl Bus {
                 self.oam[i] = lo;
                 self.oam[i + 1] = hi;
             }
-            0x0E | 0x0F => {
-                self.write_u8(addr, lo);
-                self.write_u8(addr.wrapping_add(1), hi);
-            }
             _ => {}
         }
         self.end_capture();
     }
 
-    /// Writes a little-endian word as two halfword lanes.
+    /// Writes a little-endian word.
+    ///
+    /// On the 8-bit SRAM/flash bus the store is one cycle: the byte
+    /// the word lane selects (`a & 3`), so a word store writes exactly
+    /// one address (the external save suite pins all four parities).
     pub fn write_u32(&mut self, addr: u32, value: u32) {
         self.begin_capture(addr, 4, value);
-        self.write_u16(addr, value as u16);
-        self.write_u16(addr.wrapping_add(2), (value >> 16) as u16);
+        let a = addr & 0x0FFF_FFFF;
+        if matches!(a >> 24, 0x0E | 0x0F) {
+            let b = (value >> (8 * (a & 3))) as u8;
+            self.write_u8(addr, b);
+        } else {
+            self.write_u16(addr, value as u16);
+            self.write_u16(addr.wrapping_add(2), (value >> 16) as u16);
+        }
         self.end_capture();
     }
 
