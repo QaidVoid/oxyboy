@@ -126,6 +126,7 @@ pub fn build_hybrid(image: &Image, tag: &str) -> Result<Driver, String> {
                 end: region.end,
                 state: region.state,
             },
+            &analysis.tables,
         );
         ir::opt::optimize(&mut lifted);
         entries.push(TranslatedFn {

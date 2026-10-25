@@ -65,7 +65,7 @@ fn build_driver(image: &Image, marks: &[(u32, u32)], tag: &str) -> Result<Driver
             end: base + end,
             state: analysis::State::Arm,
         };
-        let mut function = ir::lift::lift_function(image, &map, region);
+        let mut function = ir::lift::lift_function(image, &map, region, &[]);
         ir::opt::optimize(&mut function);
         entries.push(TranslatedFn {
             start: region.start,
@@ -654,7 +654,7 @@ fn mode3_rom_renders_the_same_frame_through_both_paths() {
     let mut functions = Vec::new();
     for region in ir::lift::function_regions(&image, &map) {
         let thumb = matches!(region.state, State::Thumb);
-        let mut function = ir::lift::lift_function(&image, &map, region);
+        let mut function = ir::lift::lift_function(&image, &map, region, &[]);
         ir::opt::optimize(&mut function);
         entries.push(TranslatedFn {
             start: region.start,

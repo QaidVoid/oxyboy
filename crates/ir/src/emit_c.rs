@@ -1812,6 +1812,7 @@ mod tests {
                 end: base + count as u32 * 4,
                 state: analysis::State::Arm,
             },
+            &[],
         )
     }
 
@@ -1850,6 +1851,7 @@ mod tests {
                 end: base + 4,
                 state: analysis::State::Thumb,
             },
+            &[],
         );
         let text = emit_function(&function);
         assert_wellformed(&text);

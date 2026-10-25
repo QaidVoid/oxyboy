@@ -33,7 +33,7 @@ pub fn run(args: RecompArgs) -> i32 {
     for spec in &config.functions {
         seeds.push(spec.to_seed());
     }
-    let _analysis = analyze(
+    let analysis = analyze(
         &image,
         &mut map,
         &seeds,
@@ -43,7 +43,7 @@ pub fn run(args: RecompArgs) -> i32 {
     );
     let mut functions: Vec<(u32, ir::Function)> = Vec::new();
     for region in ir::lift::function_regions(&image, &map) {
-        let mut function = ir::lift::lift_function(&image, &map, region);
+        let mut function = ir::lift::lift_function(&image, &map, region, &analysis.tables);
         opt::optimize(&mut function);
         if let Some(name) = config
             .functions

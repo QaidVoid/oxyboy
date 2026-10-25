@@ -39,7 +39,7 @@ pub fn run(args: LiftArgs) -> i32 {
         None => (None, ir::emit_c::Annotations::default()),
     };
     let tables = config.as_ref().map_or(Vec::new(), |c| c.tables.clone());
-    let _analysis = analyze(
+    let analysis = analyze(
         &image,
         &mut map,
         &seeds,
@@ -56,7 +56,7 @@ pub fn run(args: LiftArgs) -> i32 {
         {
             continue;
         }
-        let mut function = ir::lift::lift_function(&image, &map, region);
+        let mut function = ir::lift::lift_function(&image, &map, region, &analysis.tables);
         if args.print_after_all {
             optimize_with_dumps(&mut function, &mut dumped);
         } else {

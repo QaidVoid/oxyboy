@@ -8,11 +8,11 @@
 //! through the ARM and THUMB lifters; the state
 //! threading is real SSA values in slot order.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use analysis::{Canonical, FlagMap, Flags, State};
+use analysis::{Canonical, FlagMap, Flags, JumpTable, State};
 use decode::{
-    ArmInstr, Condition, Register, ShifterOperand, ThumbAluOp, ThumbHiOp, ThumbInstr,
+    ArmInstr, Condition, DataOp, Register, ShifterOperand, ThumbAluOp, ThumbHiOp, ThumbInstr,
     TransferOffset, decode_arm, decode_thumb,
 };
 
@@ -97,16 +97,26 @@ pub fn function_regions(image: &rom::Image, map: &FlagMap) -> Vec<FunctionRegion
     regions
 }
 
-/// Lifts one function region to IR.
+/// Lifts one function region to IR. `tables` are the resolved jump
+/// tables from analysis whose sites may lie in this region; a dispatch
+/// site with a resolved table lowers to a compare chain instead of a
+/// raw indirect exit.
 #[must_use]
-pub fn lift_function(image: &rom::Image, map: &FlagMap, region: FunctionRegion) -> Function {
+pub fn lift_function(
+    image: &rom::Image,
+    map: &FlagMap,
+    region: FunctionRegion,
+    tables: &[JumpTable],
+) -> Function {
     Lifter {
         image,
         map,
         canon: map.canonical(),
         region,
+        tables,
         raw: BTreeMap::new(),
         next: ValueId(STATE_COUNT as u32),
+        synthetic: 0,
     }
     .lift()
 }
@@ -154,8 +164,12 @@ struct Lifter<'a> {
     map: &'a FlagMap,
     canon: Canonical,
     region: FunctionRegion,
+    tables: &'a [JumpTable],
     raw: BTreeMap<u32, RawBlock>,
     next: ValueId,
+    /// Seq for synthetic chain/fallback blocks; keys carry the high
+    /// bit so they sort after every real address.
+    synthetic: u32,
 }
 
 impl Lifter<'_> {
@@ -174,6 +188,138 @@ impl Lifter<'_> {
     /// Whether `addr` lies inside the region.
     fn in_region(&self, addr: u32) -> bool {
         addr >= self.region.start && addr < self.region.end
+    }
+
+    /// The resolved jump table whose dispatch site is `addr`, if any.
+    /// The table must match the region's state; `find_tables` sorts by
+    /// site, so the lookup is a binary search.
+    fn table_at(&self, addr: u32, state: State) -> Option<&JumpTable> {
+        let index = self
+            .tables
+            .binary_search_by_key(&addr, |table| table.site)
+            .ok()?;
+        let table = &self.tables[index];
+        (table.state == state && table.targets.len() >= 2).then_some(table)
+    }
+
+    /// Lowers a resolved jump-table dispatch into a compare chain: the
+    /// exit value is masked into the pc slot, each chain block compares
+    /// it (its own pc parameter) against one target and branches on
+    /// equality, and the last fallback is the raw indirect exit over
+    /// the already-masked pc slot. Returns the dispatcher's raw
+    /// terminator plus the in-region case targets as leaders; the
+    /// chain and fallback blocks land in `raw` under synthetic keys.
+    fn lower_dispatch(
+        &mut self,
+        lift: &mut ArmLift,
+        cycles: &mut Vec<CycleCharge>,
+        addr: u32,
+        value: Value,
+        pc_mask: u32,
+        table: &JumpTable,
+    ) -> (RawTerm, Vec<u32>) {
+        // The walk allocates through `lift.next`; keep both counters in
+        // step while the chain blocks take their ids from `self.next`.
+        self.next = lift.next;
+        // The dispatcher masks the exit value into the pc slot so the
+        // chain blocks compare their own pc parameter against each
+        // target (block-argument SSA: no cross-block value references).
+        let pc = lift.write(Register::Pc);
+        lift.emit(
+            Op::Mov {
+                set_flags: false,
+                a: value,
+                carry_in: Value::Const(0),
+            },
+            vec![pc],
+        );
+        lift.mask_pc(pc_mask);
+        cycles.push(CycleCharge { addr, cycles: 0 });
+
+        let mut seen = BTreeSet::new();
+        let targets: Vec<u32> = table
+            .targets
+            .iter()
+            .map(|&(target, _)| target)
+            .filter(|target| seen.insert(*target))
+            .collect();
+        let fallback = self.synthetic_key();
+        let chain_keys: Vec<u32> = targets.iter().map(|_| self.synthetic_key()).collect();
+
+        for (index, &target) in targets.iter().enumerate() {
+            let otherwise = chain_keys.get(index + 1).copied().unwrap_or(fallback);
+            let (params, flag_ids) = self.fresh_params();
+            let mut end_state = params.clone();
+            end_state[FLAG_SLOT..FLAG_SLOT + 4].copy_from_slice(&flag_ids);
+            let compare = Inst {
+                guard: None,
+                dests: flag_ids,
+                fallbacks: Vec::new(),
+                op: Op::Cmp {
+                    a: Value::Id(params[Register::Pc.bits() as usize]),
+                    b: Value::Const(target),
+                },
+                pc: addr,
+                state: Vec::new(),
+            };
+            self.raw.insert(
+                chain_keys[index],
+                RawBlock {
+                    params,
+                    end_state,
+                    insts: vec![compare],
+                    cycles: Vec::new(),
+                    term: RawTerm::BranchCond {
+                        cond: Condition::Eq,
+                        then_target: target,
+                        otherwise,
+                    },
+                },
+            );
+        }
+        let fallback_params = self.fresh_params().0;
+        self.raw.insert(
+            fallback,
+            RawBlock {
+                end_state: fallback_params.clone(),
+                params: fallback_params,
+                insts: Vec::new(),
+                cycles: Vec::new(),
+                term: RawTerm::IndirectExit {
+                    reg: Register::Pc,
+                    switches_state: false,
+                    pc_mask,
+                },
+            },
+        );
+        lift.next = self.next;
+        // The dispatcher itself compares nothing: it hands the masked
+        // value to the first chain block unconditionally. In-region
+        // targets come back as leaders so their bodies lift too.
+        let leaders = targets
+            .into_iter()
+            .filter(|&target| self.in_region(target))
+            .collect();
+        (RawTerm::Branch(chain_keys[0]), leaders)
+    }
+
+    /// One synthetic key for a chain or fallback block.
+    fn synthetic_key(&mut self) -> u32 {
+        self.synthetic += 1;
+        0x8000_0000 | self.synthetic
+    }
+
+    /// Fresh block parameters plus the four flag-slot ids.
+    fn fresh_params(&mut self) -> (Vec<ValueId>, Vec<ValueId>) {
+        let params: Vec<ValueId> = (0..STATE_COUNT)
+            .map(|_| {
+                let allocated = self.next;
+                self.next = ValueId(allocated.0 + 1);
+                allocated
+            })
+            .collect();
+        let flags = params[FLAG_SLOT..FLAG_SLOT + 4].to_vec();
+        (params, flags)
     }
 
     /// Whether the byte at `addr` is marked executed.
@@ -309,6 +455,44 @@ impl Lifter<'_> {
                                     switches_state: true,
                                     pc_mask: !1,
                                 }
+                            };
+                        }
+                        ArmInstr::DataProcessing {
+                            rd: Register::Pc,
+                            opcode: DataOp::Mov,
+                            operand2: ShifterOperand::Register { rm, shift },
+                            ..
+                        } => {
+                            // `mov pc, rX` is the common indirect jump. A
+                            // resolved switch dispatch lowers to a
+                            // compare chain over the table's targets;
+                            // anything else (guarded forms included)
+                            // keeps the raw indirect exit.
+                            if guard.is_none_or(|c| c == Condition::Al)
+                                && let Some(table) = self.table_at(addr, self.region.state)
+                            {
+                                let table = table.clone();
+                                lift.guard = guard;
+                                lift.addr = addr;
+                                let (value, _) =
+                                    lift.shifter(ShifterOperand::Register { rm, shift }, false);
+                                let (term, case_leaders) = self.lower_dispatch(
+                                    &mut lift,
+                                    &mut cycles,
+                                    addr,
+                                    value,
+                                    !3,
+                                    &table,
+                                );
+                                leaders.extend(case_leaders);
+                                break term;
+                            }
+                            cycles.push(CycleCharge { addr, cycles: 0 });
+                            break RawTerm::IndirectExit {
+                                reg: rm,
+                                switches_state: false,
+                                // ALU writes to pc word-align the target.
+                                pc_mask: !3,
                             };
                         }
                         ArmInstr::DataProcessing {
@@ -485,7 +669,33 @@ impl Lifter<'_> {
                                     }
                                 };
                             }
-                            (ThumbHiOp::Add | ThumbHiOp::Mov, Register::Pc) => {
+                            (ThumbHiOp::Mov, Register::Pc) => {
+                                // A resolved switch dispatch lowers to a
+                                // compare chain; guarded THUMB does not
+                                // exist, so only the table gates it.
+                                if let Some(table) = self.table_at(addr, self.region.state) {
+                                    let table = table.clone();
+                                    lift.addr = addr;
+                                    let value = Value::Id(lift.current[rs.bits() as usize]);
+                                    let (term, case_leaders) = self.lower_dispatch(
+                                        &mut lift,
+                                        &mut cycles,
+                                        addr,
+                                        value,
+                                        !1,
+                                        &table,
+                                    );
+                                    leaders.extend(case_leaders);
+                                    break term;
+                                }
+                                cycles.push(CycleCharge { addr, cycles: 0 });
+                                break RawTerm::IndirectExit {
+                                    reg: rs,
+                                    switches_state: false,
+                                    pc_mask: !1,
+                                };
+                            }
+                            (ThumbHiOp::Add, Register::Pc) => {
                                 cycles.push(CycleCharge { addr, cycles: 0 });
                                 break RawTerm::IndirectExit {
                                     reg: rs,
@@ -666,6 +876,9 @@ impl Lifter<'_> {
     }
 }
 
+/// Flag slots start after the sixteen register slots.
+const FLAG_SLOT: usize = 16;
+
 /// The block id for `addr`, or an exit helper.
 fn block_or_helper(
     ids: &HashMap<u32, BlockId>,
@@ -684,6 +897,11 @@ mod tests {
     /// Builds a small image, marks `count` ARM words executed, and
     /// lifts them as one region from the canonical base.
     fn lift_arm(words: &[u32], count: usize) -> Function {
+        lift_arm_with(words, count, &[])
+    }
+
+    /// `lift_arm` with resolved jump tables handed to the lifter.
+    fn lift_arm_with(words: &[u32], count: usize, tables: &[JumpTable]) -> Function {
         let mut bytes = vec![0u8; 256];
         for (index, word) in words.iter().enumerate() {
             bytes[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
@@ -701,6 +919,7 @@ mod tests {
                 end: base + count as u32 * 4,
                 state: State::Arm,
             },
+            tables,
         )
     }
 
@@ -723,6 +942,7 @@ mod tests {
                 end: base + count as u32 * 2,
                 state: State::Thumb,
             },
+            &[],
         )
     }
 
@@ -926,6 +1146,170 @@ mod tests {
     fn thumb_pop_pc_is_a_return() {
         let function = lift_thumb(&[0xBD01], 1);
         assert!(matches!(function.blocks[0].term, Terminator::Return { .. }));
+    }
+
+    /// A resolved switch dispatch lowers to a compare chain
+    /// over the table's targets; the raw indirect exit survives only
+    /// as the out-of-range fallback.
+    #[test]
+    fn resolved_switch_lowers_to_a_compare_chain() {
+        let base = 0x0800_0000u32;
+        let words = [
+            0xE1A0_F000, // base: mov pc, r0 (the dispatch)
+            0xE1A0_0000,
+            0xE1A0_0000,
+            0xE1A0_0000, // padding
+            0xE1A0_0000, // base+0x10: case 0
+            0xE1A0_0000,
+            0xE1A0_0000,
+            0xE1A0_0000, // padding
+            0xE1A0_0000, // base+0x20: case 1
+        ];
+        let table = JumpTable {
+            site: base,
+            state: State::Arm,
+            base: base + 0x40,
+            entries: 2,
+            targets: vec![(base + 0x10, State::Arm), (base + 0x20, State::Arm)],
+        };
+        let function = lift_arm_with(&words, 9, &[table]);
+        let entry = &function.blocks[0];
+        // The dispatcher masked the exit value into the pc slot.
+        assert!(matches!(entry.insts[0].op, Op::Mov { .. }));
+        assert!(matches!(
+            &entry.insts[1].op,
+            Op::And {
+                b: Value::Const(0xFFFF_FFFC),
+                ..
+            }
+        ));
+        // The dispatcher hands the masked value to the chain
+        // unconditionally.
+        let Terminator::Branch {
+            target: first_chain,
+            args: _,
+        } = &entry.term
+        else {
+            panic!("expected the chain entry, got {:?}", entry.term);
+        };
+        let chain0 = &function.blocks[first_chain.0 as usize];
+        let Terminator::BranchCond {
+            cond: Condition::Eq,
+            then_target,
+            else_target,
+            ..
+        } = &chain0.term
+        else {
+            panic!("expected the first compare");
+        };
+        assert_eq!(function.blocks[then_target.0 as usize].addr, base + 0x10);
+        let Op::Cmp {
+            a: Value::Id(a),
+            b: Value::Const(target),
+        } = &chain0.insts[0].op
+        else {
+            panic!("chain block compares");
+        };
+        assert_eq!(*target, base + 0x10);
+        assert_eq!(*a, chain0.params[Register::Pc.bits() as usize]);
+        // The chain continues to case 1, then falls back.
+        let chain1 = &function.blocks[else_target.0 as usize];
+        let Terminator::BranchCond {
+            cond: Condition::Eq,
+            then_target: second,
+            else_target: after,
+            ..
+        } = &chain1.term
+        else {
+            panic!("expected the second compare");
+        };
+        assert_eq!(function.blocks[second.0 as usize].addr, base + 0x20);
+        let Op::Cmp {
+            b: Value::Const(second_target),
+            ..
+        } = &chain1.insts[0].op
+        else {
+            panic!("chain block compares");
+        };
+        assert_eq!(*second_target, base + 0x20);
+        // The chain ends in the raw indirect exit as the fallback.
+        let fallback = &function.blocks[after.0 as usize];
+        assert!(matches!(
+            &fallback.term,
+            Terminator::IndirectExit {
+                target: Value::Id(_),
+                switches_state: false,
+                pc_mask: 0xFFFF_FFFC,
+                ..
+            }
+        ));
+        // Both cases are real blocks, lifted as leaders.
+        assert!(function.blocks.iter().any(|b| b.addr == base + 0x10));
+        assert!(function.blocks.iter().any(|b| b.addr == base + 0x20));
+    }
+
+    /// The THUMB dispatch lowers the same way, with the pop-style
+    /// bit-0 mask instead of word alignment.
+    #[test]
+    fn thumb_switch_chain_masks_bit_zero() {
+        // mov pc, r0 at the entry, nops after, two case bodies.
+        let halves: [u16; 9] = [
+            0x4687, // base: mov pc, r0
+            0x1C00, 0x1C00, 0x1C00, // padding
+            0x1C00, // base+8: case 0
+            0x1C00, 0x1C00, 0x1C00, // padding
+            0x1C00, // base+0x10: case 1
+        ];
+        let mut bytes = vec![0u8; 256];
+        for (index, half) in halves.iter().enumerate() {
+            bytes[index * 2..index * 2 + 2].copy_from_slice(&half.to_le_bytes());
+        }
+        let image = rom::Image::from_bytes(bytes).expect("parses");
+        let mut map = FlagMap::from_image(&image);
+        let canon_base = map.canonical().base();
+        map.mark_range(canon_base, canon_base + 0x12, Flags::EXEC);
+        map.set(canon_base, Flags::EXEC | Flags::FUNC_START | Flags::THUMB);
+        let table = JumpTable {
+            site: canon_base,
+            state: State::Thumb,
+            base: canon_base + 0x20,
+            entries: 2,
+            targets: vec![
+                (canon_base + 8, State::Thumb),
+                (canon_base + 0x10, State::Thumb),
+            ],
+        };
+        let function = lift_function(
+            &image,
+            &map,
+            FunctionRegion {
+                start: canon_base,
+                end: canon_base + 0x12,
+                state: State::Thumb,
+            },
+            &[table],
+        );
+        let fallback = function
+            .blocks
+            .iter()
+            .find(|b| {
+                matches!(
+                    b.term,
+                    Terminator::IndirectExit {
+                        pc_mask: 0xFFFF_FFFE,
+                        ..
+                    }
+                )
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "the bit-0 fallback:\n{}",
+                    crate::print::fmt_function(&function)
+                )
+            });
+        assert!(matches!(fallback.term, Terminator::IndirectExit { .. }));
+        assert!(function.blocks.iter().any(|b| b.addr == canon_base + 8));
+        assert!(function.blocks.iter().any(|b| b.addr == canon_base + 0x10));
     }
 
     /// `ldr pc, [sp], #4` lifts the load and the ARMv4

@@ -1016,6 +1016,7 @@ mod tests {
                 end: base + words.len() as u32 * 4,
                 state: State::Arm,
             },
+            &[],
         )
     }
 

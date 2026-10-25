@@ -97,7 +97,7 @@ fn build_driver(image: &Image, tag: &str) -> Option<Driver> {
             end: base + end,
             state: analysis::State::Arm,
         };
-        let mut function = ir::lift::lift_function(image, &map, region);
+        let mut function = ir::lift::lift_function(image, &map, region, &[]);
         ir::opt::optimize(&mut function);
         entries.push(TranslatedFn {
             start: region.start,

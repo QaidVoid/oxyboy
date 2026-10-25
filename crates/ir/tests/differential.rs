@@ -82,6 +82,7 @@ fn run_case(state: analysis::State, code: &[u8], rng: &mut Rng) {
             end: start + len,
             state,
         },
+        &[],
     );
     let block = &function.blocks[0];
     assert!(!block.insts.is_empty(), "no ops lifted");
