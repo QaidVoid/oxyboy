@@ -38,6 +38,13 @@ const DECOMP_CYCLES_PER_BYTE: u32 = 10;
 /// when the call redirected execution (SoftReset) so the caller skips
 /// the sequential pc advance.
 pub(crate) fn execute(cpu: &mut Cpu, bus: &mut Bus, number: u32) -> bool {
+    // Entering the BIOS updates the read-protection latch; SoftReset
+    // re-runs the boot path, which ends on the boot snapshot.
+    bus.set_bios_latch(if number & 0xFF == 0x00 {
+        crate::bus::BIOS_LATCH_BOOT
+    } else {
+        crate::bus::BIOS_LATCH_SWI
+    });
     match number & 0xFF {
         0x00 => {
             soft_reset(cpu, bus);

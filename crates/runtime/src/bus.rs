@@ -39,6 +39,16 @@ pub const PAGE_SHIFT: u32 = 10;
 /// documents and returns zero.
 const OPEN_BUS_BYTE: u8 = 0;
 
+/// The BIOS read-protection snapshots (GBATEK "BIOS read protection":
+/// reads from outside the BIOS return the last word prefetched from
+/// the BIOS bus). The external bios suite pins the four values the
+/// real BIOS's reset, SWI, and IRQ paths leave latched; with no BIOS
+/// image mapped, the HLE dispatch replays them.
+pub const BIOS_LATCH_BOOT: u32 = 0xE129_F000;
+pub const BIOS_LATCH_SWI: u32 = 0xE3A0_2004;
+pub const BIOS_LATCH_IRQ: u32 = 0xE25E_F004;
+pub const BIOS_LATCH_IRQ_RETURN: u32 = 0xE55E_C002;
+
 /// A GBA bus region selected by the top address bits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Region {
@@ -85,6 +95,13 @@ pub struct IoAccess {
 /// Area"); every access is therefore masked with 0x0FFF_FFFF first.
 pub struct Bus {
     bios: Box<[u8]>,
+    /// Whether a real BIOS image is mapped ([`Bus::with_bios`]); with
+    /// the default zero image the window serves the read-protection
+    /// latch instead.
+    bios_mapped: bool,
+    /// The word a protected BIOS read returns (see the
+    /// `BIOS_LATCH_*` constants).
+    bios_latch: u32,
     ewram: Box<[u8]>,
     iwram: Box<[u8]>,
     palette: Box<[u8]>,
@@ -150,6 +167,8 @@ impl Bus {
         let save = Save::new(SaveKind::detect(&rom));
         let mut bus = Bus {
             bios: vec![0; 0x4000].into_boxed_slice(),
+            bios_mapped: false,
+            bios_latch: BIOS_LATCH_BOOT,
             ewram: vec![0; EWRAM_SIZE].into_boxed_slice(),
             iwram: vec![0; IWRAM_SIZE].into_boxed_slice(),
             palette: vec![0; PALETTE_SIZE].into_boxed_slice(),
@@ -187,7 +206,14 @@ impl Bus {
         let mut bus = Self::new(rom);
         let n = bios.len().min(0x4000);
         bus.bios[..n].copy_from_slice(&bios[..n]);
+        bus.bios_mapped = true;
         bus
+    }
+
+    /// Replaces the BIOS read-protection latch (the BIOS-HLE dispatch
+    /// paths replay the real BIOS's prefetch snapshots).
+    pub fn set_bios_latch(&mut self, value: u32) {
+        self.bios_latch = value;
     }
 
     /// Classifies a logical address into its bus region.
@@ -371,7 +397,12 @@ impl Bus {
     pub fn read_u8(&mut self, addr: u32) -> u8 {
         let a = addr & 0x0FFF_FFFF;
         match a >> 24 {
-            0x00 if a < 0x4000 => self.bios[(a & 0x3FFF) as usize],
+            // A mapped BIOS image reads directly; the zero-image
+            // default serves the read-protection latch: reads from
+            // outside the BIOS return the last BIOS-bus prefetch
+            // (GBATEK), lane-selected for narrow accesses.
+            0x00 if a < 0x4000 && self.bios_mapped => self.bios[(a & 0x3FFF) as usize],
+            0x00 if a < 0x4000 => (self.bios_latch >> ((a & 3) * 8)) as u8,
             0x02 => self.ewram[(a & 0x0003_FFFF) as usize],
             0x03 => self.iwram[(a & 0x0000_7FFF) as usize],
             0x04 if a < 0x0400_0400 => {
@@ -444,6 +475,10 @@ impl Bus {
         if matches!(a >> 24, 0x0E | 0x0F) {
             let b = u32::from(self.read_u8(addr));
             b | (b << 8) | (b << 16) | (b << 24)
+        } else if a >> 24 == 0x00 && a < 0x4000 && !self.bios_mapped {
+            // The protected read returns the whole latched word; the
+            // CPU applies its own LDR rotation on top.
+            self.bios_latch
         } else if matches!(a >> 24, 0x05..=0x0D) {
             u32::from(self.read_u16(addr)) | (u32::from(self.read_u16(addr.wrapping_add(2))) << 16)
         } else {

@@ -7,7 +7,7 @@
 # fails on real carts and its unused-ROM-reads test passes only on mGBA.
 # The interpreter models the hardware behavior instead.
 arm 532
-bios 0
+bios 4
 memory 54
 thumb 233
 unsafe 1

@@ -424,7 +424,8 @@ fn arm_thumb_interworking_round_trip() {
     run(&mut cpu, &mut bus, 3);
     assert_eq!(cpu.cpsr() & 0x20, 0x20); // BX switched to THUMB
     assert_eq!(cpu.pc(), 0x0800_001C);
-    assert_eq!(cpu.mode(), Mode::Supervisor);
+    // BX changes T state only; the mode stays the boot handover's.
+    assert_eq!(cpu.mode(), Mode::System);
 
     run(&mut cpu, &mut bus, 1);
     assert_eq!(reg(&cpu, 0), 0x40); // MOVS

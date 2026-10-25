@@ -47,21 +47,21 @@
       "rom": "target/test-roms/mb-thumbptr.gba",
       "frames": 60,
       "budget_ms": 60,
-      "hash": "a72e98ee2ec58031"
+      "hash": "8e158e0a19789fc5"
     },
     {
       "name": "mode3",
       "rom": "target/test-roms/mode3.gba",
       "frames": 60,
       "budget_ms": 20,
-      "hash": "44d5801437d3d1f3"
+      "hash": "b830a3db4f1a81b7"
     },
     {
       "name": "sramtest",
       "rom": "target/test-roms/sramtest.gba",
       "frames": 60,
       "budget_ms": 20,
-      "hash": "f6778eb6779b732d"
+      "hash": "871c34ec92095829"
     },
     {
       "name": "switest",
@@ -75,7 +75,7 @@
       "rom": "target/test-roms/thumbmix.gba",
       "frames": 60,
       "budget_ms": 30,
-      "hash": "1188bf49b12b69ef"
+      "hash": "447c4179a2c767fb"
     }
   ]
 }

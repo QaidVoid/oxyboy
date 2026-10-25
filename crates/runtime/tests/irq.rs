@@ -145,6 +145,36 @@ fn hle_dispatch_passes_ie_and_if_in_r0() {
 }
 
 #[test]
+fn hle_dispatch_updates_the_bios_protection_latch() {
+    // Entering the dispatch latches the IRQ path's prefetch; the
+    // return latches the postamble's (the external bios suite reads
+    // BIOS[0] during and after the handler).
+    let mut system = dispatch_system();
+    system.cpu.set_irq_line(true);
+    let mut steps = 0;
+    while system.cpu.pc() != 0x0200_0000 {
+        system.step();
+        steps += 1;
+        assert!(steps < 100, "dispatch never happened");
+    }
+    assert_eq!(
+        system.bus_mut().read_u32(0x0000_0000),
+        runtime::bus::BIOS_LATCH_IRQ,
+        "latched while the handler runs"
+    );
+    while system.cpu.pc() != 0x0800_0000 {
+        system.step();
+        steps += 1;
+        assert!(steps < 100, "return never happened");
+    }
+    assert_eq!(
+        system.bus_mut().read_u32(0x0000_0000),
+        runtime::bus::BIOS_LATCH_IRQ_RETURN,
+        "latched after the return"
+    );
+}
+
+#[test]
 fn ime_zero_masks_the_irq_line_entirely() {
     let mut rom = vec![0u8; 0x20];
     rom[..4].copy_from_slice(&PARK.to_le_bytes());

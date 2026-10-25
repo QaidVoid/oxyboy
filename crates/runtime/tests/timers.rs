@@ -22,9 +22,10 @@ fn cnt_h(prescaler: u16, cascade: bool, irq: bool, enable: bool) -> u16 {
         | if enable { 0x0080 } else { 0 }
 }
 
-/// `b .` (EA FF FF FE): parks the CPU while timers run.
+/// `b .` (0xEAFFFFFE, little-endian bytes): parks the CPU while
+/// timers run.
 fn parked() -> Vec<u8> {
-    vec![0xEA, 0xFF, 0xFF, 0xFE]
+    vec![0xFE, 0xFF, 0xFF, 0xEA]
 }
 
 #[test]

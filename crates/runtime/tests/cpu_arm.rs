@@ -5,7 +5,7 @@
 //! the project rule that encodings are checked, never hand-derived.
 
 use decode::Condition;
-use runtime::bus::Bus;
+use runtime::bus::{BIOS_LATCH_BOOT, BIOS_LATCH_SWI, Bus};
 use runtime::cpu::{Cpu, IRQ_HLE_RETURN, Mode};
 
 /// Builds a bus whose ROM contains `words` at `0x08000000`, padded with
@@ -576,7 +576,9 @@ fn undefined_instruction_exception() {
     run(&mut cpu, &mut bus, 1);
     assert_eq!(cpu.pc(), 4);
     assert_eq!(cpu.mode(), Mode::Undefined);
-    assert_eq!(cpu.spsr_for_test(), Some(0xD3));
+    // The interrupted context is the post-boot handover CPSR (System,
+    // flags clear); the UND entry banks it into SPSR.
+    assert_eq!(cpu.spsr_for_test(), Some(0x1F));
     assert_eq!(reg(&cpu, 14), 0x0800_0004);
 }
 
@@ -996,4 +998,35 @@ fn misaligned_block_transfer_round_trips_with_raw_writeback() {
     assert_eq!(reg(&cpu, 10), 0x4444_4444);
     // Writeback keeps the raw base: 0x03000043 - 16 + 16.
     assert_eq!(reg(&cpu, 8), 0x0300_0043);
+}
+
+#[test]
+fn boot_state_is_the_post_bios_handover() {
+    // The no-BIOS boot skips the BIOS preamble, so Cpu::new must
+    // start at the state the real BIOS leaves behind: System mode
+    // with I and F clear (IME alone gates IRQs, the pattern every
+    // cart's CRT0 relies on) and sp_usr/sys visible as r13.
+    let cpu = Cpu::new(0x0800_0000);
+    assert_eq!(cpu.cpsr(), 0x0000_001F);
+    assert_eq!(cpu.mode(), Mode::System);
+    assert_eq!(reg(&cpu, 13), 0x0300_7F00);
+    assert_eq!(reg(&cpu, 14), 0);
+}
+
+#[test]
+fn hle_swi_updates_the_bios_protection_latch() {
+    // A dispatched BIOS call leaves the SWI path's prefetch latched:
+    // protected BIOS reads then return the suite-pinned word (the
+    // external bios suite reads BIOS[0] after `swi 0x80000`).
+    let words = [
+        0xEF08_0000, // swi 0x80000 (sqrt)
+        0xEAFF_FFFE, // b .
+    ];
+    let mut bus = rom(&words);
+    let mut cpu = Cpu::new(0x0800_0000);
+    assert_eq!(bus.read_u32(0x0000_0000), BIOS_LATCH_BOOT);
+    cpu.set_reg_for_test(0, 4);
+    run(&mut cpu, &mut bus, 1);
+    assert_eq!(reg(&cpu, 0), 2, "sqrt dispatched");
+    assert_eq!(bus.read_u32(0x0000_0000), BIOS_LATCH_SWI);
 }

@@ -6,7 +6,7 @@
 //! approximations (one N-cycle per bus access, region cost from
 //! [`crate::bus`]); real WAITSTATE timing is not modeled yet.
 
-use crate::bus::Bus;
+use crate::bus::{BIOS_LATCH_IRQ, BIOS_LATCH_IRQ_RETURN, Bus};
 use decode::{
     ArmInstr, Condition, DataOp, HalfwordKind, Register, RegisterList, RegisterShift, ShiftAmount,
     ShiftKind, ShifterOperand, ThumbAluOp, ThumbHiOp, ThumbImmOp, ThumbInstr, ThumbMemOp,
@@ -189,7 +189,13 @@ impl Cpu {
             r8_12_fiq: [0; 5],
             sp: [[0; 2]; BANK_COUNT],
             spsr: [0; BANK_COUNT],
-            cpsr: (u32::from(Mode::Supervisor.bits())) | 0x0000_00C0,
+            // Post-boot handover state (the no-BIOS boot skips the
+            // BIOS preamble that would end here on hardware): System
+            // mode with I and F clear, so IME alone gates IRQs as
+            // every cart's CRT0 expects. The boot stacks are the
+            // documented BIOS values; System's bank makes sp_usr/sys
+            // (0x03007F00) the visible r13.
+            cpsr: u32::from(Mode::System.bits()),
             pc,
             cycles: 0,
             halt: Halt::None,
@@ -351,6 +357,11 @@ impl Cpu {
         self.spsr = [0; BANK_COUNT];
         self.init_stacks();
         self.switch_mode(Mode::System);
+        // switch_mode only loads the banked r13/r14 on a bank change;
+        // from the System-mode boot the live regs must be loaded
+        // explicitly (same rule as Cpu::new's boot bank load).
+        let bank = bank_index(Bank::Usr);
+        self.regs[13..15].copy_from_slice(&self.sp[bank]);
         self.cpsr |= 0x80;
         self.pc = if flag == 0 { 0x0800_0000 } else { 0x0200_0000 };
     }
@@ -613,7 +624,7 @@ impl Cpu {
             // (the BIOS postamble inlined): restore the interrupted
             // registers, CPSR, and resume at r14_irq - 4.
             self.cycles += 3;
-            self.irq_hle_return();
+            self.irq_hle_return(bus);
             return (self.cycles - before) as u32;
         }
         if self.halt != Halt::None {
@@ -687,6 +698,9 @@ impl Cpu {
             self.irq_hle_depth += 1;
         }
         self.exception(Mode::Irq, self.pc.wrapping_add(4), 0x18, false);
+        // The dispatch path's last BIOS prefetch, what a protected
+        // BIOS read now returns (see the `BIOS_LATCH_*` constants).
+        bus.set_bios_latch(BIOS_LATCH_IRQ);
         // The BIOS preamble runs the handler in ARM System state with
         // IRQs still disabled, r0 = IE & IF (GBATEK "Interrupt
         // Dispatch").
@@ -699,8 +713,10 @@ impl Cpu {
     /// Performs the interrupt return for one in-flight HLE dispatch:
     /// restores the interrupted registers and CPSR and resumes at
     /// `r14_irq - 4` (the not-yet-executed instruction).
-    fn irq_hle_return(&mut self) {
+    fn irq_hle_return(&mut self, bus: &mut Bus) {
         self.irq_hle_depth -= 1;
+        // The BIOS postamble's last prefetch (see take_irq).
+        bus.set_bios_latch(BIOS_LATCH_IRQ_RETURN);
         let saved = self.irq_hle_saved[self.irq_hle_depth];
         let spsr = self.spsr[bank_index(Bank::Irq)];
         let resume = self.sp[bank_index(Bank::Irq)][1].wrapping_sub(4);

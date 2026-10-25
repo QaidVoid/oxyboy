@@ -215,7 +215,7 @@ fn mix_routing_master_volume_and_enable() {
 
 #[test]
 fn system_frame_mixdown_is_684_silent_samples() {
-    let mut system = System::new(vec![0xEA, 0xFF, 0xFF, 0xFE], 0x0800_0000);
+    let mut system = System::new(vec![0xFE, 0xFF, 0xFF, 0xEA], 0x0800_0000);
     system.step_frame();
     let audio = system.take_audio();
     assert_eq!(audio.len(), SAMPLES_PER_FRAME * 2);

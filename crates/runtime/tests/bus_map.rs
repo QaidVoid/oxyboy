@@ -1,7 +1,7 @@
 //! Address routing, mirroring, width rules, and
 //! open-bus behavior of the bus, per GBATEK "GBA Memory Map".
 
-use runtime::bus::{Bus, Region, region_of};
+use runtime::bus::{BIOS_LATCH_BOOT, Bus, Region, region_of};
 use runtime::save::{Save, SaveKind};
 
 /// A bus whose ROM is `rom[i] = i as u8` for 1 KiB.
@@ -222,12 +222,25 @@ fn palette_and_oam_eight_bit_accesses() {
 }
 
 #[test]
-fn bios_region_is_zero_and_write_protected() {
+fn bios_region_is_write_protected_and_reads_return_the_protection_latch() {
     let mut bus = Bus::new(Vec::new());
-    assert_eq!(bus.read_u32(0x0000_0000), 0);
+    // With no BIOS image, protected reads return the latched BIOS
+    // prefetch (GBATEK), lane-selected for narrow accesses.
+    assert_eq!(bus.read_u32(0x0000_0000), BIOS_LATCH_BOOT);
+    assert_eq!(bus.read_u16(0x0000_0002), (BIOS_LATCH_BOOT >> 16) as u16);
+    assert_eq!(bus.read_u8(0x0000_0001), (BIOS_LATCH_BOOT >> 8) as u8);
     bus.write_u32(0x0000_0100, 0xFFFF_FFFF);
     bus.write_u8(0x0000_3FFF, 0xFF);
-    assert_eq!(bus.read_u32(0x0000_0000), 0);
+    assert_eq!(bus.read_u32(0x0000_0000), BIOS_LATCH_BOOT, "no write path");
+    assert_eq!(bus.read_u8(0x0000_3FFF), (BIOS_LATCH_BOOT >> 24) as u8);
+}
+
+#[test]
+fn mapped_bios_reads_the_image() {
+    let mut bios = vec![0u8; 0x4000];
+    bios[8..12].copy_from_slice(&0x0EA0_C0DEu32.to_le_bytes());
+    let mut bus = Bus::with_bios(Vec::new(), bios);
+    assert_eq!(bus.read_u32(0x0000_0008), 0x0EA0_C0DE);
     assert_eq!(bus.read_u8(0x0000_3FFF), 0);
 }
 

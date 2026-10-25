@@ -24,9 +24,10 @@ const CNT_H: u32 = 0xA;
 const SRC: u32 = 0x0200_0000;
 const DST: u32 = 0x0200_0100;
 
-/// `b .` (EA FF FF FE): parks the CPU while DMA runs.
+/// `b .` (0xEAFFFFFE, little-endian bytes): parks the CPU while DMA
+/// runs.
 fn parked() -> Vec<u8> {
-    vec![0xEA, 0xFF, 0xFF, 0xFE]
+    vec![0xFE, 0xFF, 0xFF, 0xEA]
 }
 
 /// CNT_H builders: `(dst_adj, src_adj, timing, extra_bits)`.

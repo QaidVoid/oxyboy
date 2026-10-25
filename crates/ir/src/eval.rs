@@ -26,14 +26,24 @@ const Z_SLOT: usize = 17;
 const C_SLOT: usize = 18;
 const V_SLOT: usize = 19;
 
+/// The boot snapshot of the BIOS read-protection latch. The ir crate
+/// sits below runtime, so the value mirrors
+/// `runtime::bus::BIOS_LATCH_BOOT`; the differential tests pin the
+/// two constants equal.
+pub const BIOS_LATCH_BOOT: u32 = 0xE129_F000;
+
 /// The memory the evaluator reads and writes: cart ROM as data, EWRAM,
 /// and IWRAM, mirroring the interpreter's bus behavior for those
-/// regions (everything else reads as zero and discards writes).
+/// regions (everything else reads as zero and discards writes, except
+/// the BIOS window which serves the read-protection latch).
 pub struct EvalMemory {
     rom: Vec<u8>,
     ewram: Vec<u8>,
     iwram: Vec<u8>,
     rom_mask: u32,
+    /// The BIOS read-protection latch, mirroring the interpreter's
+    /// bus (the boot snapshot; IR chunks contain no SWI/IRQ dispatch).
+    bios_latch: u32,
 }
 
 impl EvalMemory {
@@ -45,6 +55,7 @@ impl EvalMemory {
             ewram: vec![0; 0x4_0000],
             iwram: vec![0; 0x8000],
             rom_mask: len.wrapping_sub(1),
+            bios_latch: BIOS_LATCH_BOOT,
         }
     }
 
@@ -53,6 +64,9 @@ impl EvalMemory {
         match a >> 24 {
             0x02 => self.ewram[(a & 0x0003_FFFF) as usize],
             0x03 => self.iwram[(a & 0x0000_7FFF) as usize],
+            // Protected BIOS reads return the latched prefetch word,
+            // lane-selected for narrow accesses (mirrors the bus).
+            0x00 if a < 0x4000 => (self.bios_latch >> ((a & 3) * 8)) as u8,
             0x08..=0x0D => {
                 let off = a.wrapping_sub(0x0800_0000) & self.rom_mask;
                 self.rom.get(off as usize).copied().unwrap_or(0)
@@ -85,6 +99,10 @@ impl EvalMemory {
         if self.sram_window(addr) {
             let b = u32::from(self.read_u8(addr));
             return b | (b << 8) | (b << 16) | (b << 24);
+        }
+        // A protected BIOS read returns the whole latch unrotated.
+        if (addr & 0x0FFF_FFFF) >> 24 == 0x00 && addr & 0x0FFF_FFFF < 0x4000 {
+            return self.bios_latch;
         }
         u32::from(self.read_u8(addr))
             | (u32::from(self.read_u8(addr.wrapping_add(1))) << 8)

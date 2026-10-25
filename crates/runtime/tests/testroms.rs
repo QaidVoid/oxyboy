@@ -50,8 +50,8 @@ fn switest_rom_runs_cpufastset_and_lz77_without_bios() {
     let mut system = System::new(image.bytes().to_vec(), CART_BASE);
     assert_eq!(
         system.bus_mut().read_u32(0x0000_0000),
-        0,
-        "no BIOS file: the boot ROM window must read as zero"
+        runtime::bus::BIOS_LATCH_BOOT,
+        "no BIOS file: the window serves the read-protection latch"
     );
 
     // Run until the ROM sets its IWRAM done flag, bounded by a generous

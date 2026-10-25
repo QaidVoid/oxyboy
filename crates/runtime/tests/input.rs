@@ -141,7 +141,7 @@ fn keycnt_rewrite_over_held_keys_fires() {
 
 #[test]
 fn system_press_reaches_the_polled_register() {
-    let mut system = System::new(vec![0xEA, 0xFF, 0xFF, 0xFE], 0x0800_0000);
+    let mut system = System::new(vec![0xFE, 0xFF, 0xFF, 0xEA], 0x0800_0000);
     system.press(Key::Start);
     system.step_frame();
     assert_eq!(system.bus_mut().read_u16(KEYINPUT), 0x03F7);

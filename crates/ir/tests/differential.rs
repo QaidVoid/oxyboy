@@ -482,3 +482,7 @@ fn thumb_differential_10k() {
         let _ = case;
     }
 }
+
+// The mirrored boot latch must track the interpreter's constant; the
+// ir crate sits below runtime and cannot import it.
+const _: () = assert!(ir::eval::BIOS_LATCH_BOOT == runtime::bus::BIOS_LATCH_BOOT);
