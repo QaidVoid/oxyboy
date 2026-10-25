@@ -301,6 +301,88 @@ fn ldr_pc_return_resumes_at_the_loaded_address() {
     );
 }
 
+/// A guarded call (`blne helper`) must skip both the lr write and the
+/// call when the condition fails, and take both when it holds. The
+/// pre-fix lift called unconditionally (and wrote lr unguarded), so
+/// the failing round ran the helper and stored its result first
+/// (2 vs 1).
+#[test]
+fn guarded_bl_skips_the_call_when_the_condition_fails() {
+    if !recomp::Module::compiler_available() {
+        println!("skipping: no host C compiler on PATH");
+        return;
+    }
+    const PARK: u32 = 0x0800_0140;
+    let words: [u32; 17] = [
+        0xE3A0_0402, // 0x100: mov r0, #0x02000000
+        0xE3A0_1000, // 0x104: mov r1, #0        ; round 1: NE fails
+        0xE351_0000, // 0x108: cmp r1, #0
+        0x1B00_0008, // 0x10c: blne 0x134
+        0xE3A0_2001, // 0x110: mov r2, #1
+        0xE480_2004, // 0x114: str r2, [r0], #4  ; slot 0
+        0xE3A0_1007, // 0x118: mov r1, #7        ; round 2: NE holds
+        0xE351_0000, // 0x11c: cmp r1, #0
+        0x1B00_0003, // 0x120: blne 0x134
+        0xE3A0_2001, // 0x124: mov r2, #1
+        0xE480_2004, // 0x128: str r2, [r0], #4  ; slot 2
+        0xEA00_0003, // 0x12c: b 0x140 (the park)
+        0xE1A0_0000, // 0x130: (dead padding)
+        0xE3A0_2002, // 0x134: helper: mov r2, #2
+        0xE480_2004, // 0x138: str r2, [r0], #4  ; slot 1
+        0xE1A0_F00E, // 0x13c: mov pc, lr
+        0xEAFF_FFFE, // 0x140: park: b .
+    ];
+    let mut bytes = RomBuilder::new().title("BLCC").build();
+    let mut code = Vec::new();
+    for word in words {
+        code.extend_from_slice(&word.to_le_bytes());
+    }
+    bytes[0x100..0x100 + code.len()].copy_from_slice(&code);
+    let image = Image::from_bytes(bytes).expect("parse");
+
+    let mut interpreted = System::new(image.bytes().to_vec(), 0x0800_0100);
+    let mut steps = 0;
+    while interpreted.cpu.pc() != PARK && steps < 10_000 {
+        interpreted.step();
+        steps += 1;
+    }
+    assert_eq!(
+        interpreted.cpu.pc(),
+        PARK,
+        "interpreted run reaches the park"
+    );
+
+    let mut driver = build_driver(
+        &image,
+        &[(0x100u32, 0x130u32), (0x134, 0x140)],
+        "recomp-blcc",
+    )
+    .expect("builds");
+    let mut recompiled = System::new(image.bytes().to_vec(), 0x0800_0100);
+    let mut steps = 0;
+    while recompiled.cpu.pc() != PARK && steps < 10_000 {
+        driver.step(&mut recompiled).expect("native call");
+        steps += 1;
+    }
+    assert_eq!(recompiled.cpu.pc(), PARK, "recompiled run reaches the park");
+
+    let slots = |system: &System| {
+        let ewram = system.bus().ewram();
+        (0..3)
+            .map(|slot| u32::from_le_bytes(ewram[slot * 4..slot * 4 + 4].try_into().unwrap()))
+            .collect::<Vec<u32>>()
+    };
+    assert_eq!(slots(&interpreted), vec![1, 2, 1], "interpreted rounds");
+    assert_eq!(slots(&recompiled), vec![1, 2, 1], "recompiled rounds");
+    for i in 0..15u8 {
+        assert_eq!(
+            interpreted.cpu.reg_for_test(i),
+            recompiled.cpu.reg_for_test(i),
+            "r{i}"
+        );
+    }
+}
+
 /// Cycle parity: the recompiled run of the micro
 /// corpus charges exactly the interpreter's cycle count for the same
 /// instruction sequence - opcode fetches through the bus's real cost

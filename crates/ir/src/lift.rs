@@ -309,6 +309,41 @@ impl Lifter<'_> {
         0x8000_0000 | self.synthetic
     }
 
+    /// Ends a guarded transfer: the transfer's raw terminator moves
+    /// into a synthetic block reached only when `guard` holds, and a
+    /// failed guard falls through to the next instruction (which the
+    /// caller surfaces as a leader). Returns the dispatcher's raw
+    /// terminator.
+    fn lower_guarded(
+        &mut self,
+        lift: &mut ArmLift,
+        addr: u32,
+        guard: Condition,
+        term: RawTerm,
+    ) -> RawTerm {
+        self.next = lift.next;
+        let key = self.synthetic_key();
+        let (params, flag_ids) = self.fresh_params();
+        let mut end_state = params.clone();
+        end_state[FLAG_SLOT..FLAG_SLOT + 4].copy_from_slice(&flag_ids);
+        self.raw.insert(
+            key,
+            RawBlock {
+                params,
+                end_state,
+                insts: Vec::new(),
+                cycles: Vec::new(),
+                term,
+            },
+        );
+        lift.next = self.next;
+        RawTerm::BranchCond {
+            cond: guard,
+            then_target: key,
+            otherwise: addr.wrapping_add(4),
+        }
+    }
+
     /// Fresh block parameters plus the four flag-slot ids.
     fn fresh_params(&mut self) -> (Vec<ValueId>, Vec<ValueId>) {
         let params: Vec<ValueId> = (0..STATE_COUNT)
@@ -402,27 +437,28 @@ impl Lifter<'_> {
                             let target = addr.wrapping_add(8).wrapping_add_signed(offset);
                             if link {
                                 lift.addr = addr;
+                                lift.guard = guard.filter(|cond| *cond != Condition::Al);
                                 let lr = lift.write(Register::Lr);
-                                lift.insts.push(crate::Inst {
-                                    guard: None,
-                                    dests: vec![lr],
-                                    fallbacks: Vec::new(),
-                                    op: Op::Mov {
+                                lift.emit(
+                                    Op::Mov {
                                         set_flags: false,
                                         a: Value::Const(addr + 4),
                                         carry_in: Value::Const(0),
                                     },
-                                    pc: addr,
-                                    state: Vec::new(),
-                                });
+                                    vec![lr],
+                                );
                                 let cont = addr + 4;
                                 let linked = self.in_region(cont);
                                 if linked {
                                     leaders.push(cont);
                                 }
-                                break RawTerm::Call {
+                                let call = RawTerm::Call {
                                     target,
                                     cont: linked.then_some(cont),
+                                };
+                                break match guard.filter(|cond| *cond != Condition::Al) {
+                                    Some(cond) => self.lower_guarded(&mut lift, addr, cond, call),
+                                    None => call,
                                 };
                             }
                             if let Some(cond) = guard.filter(|cond| *cond != Condition::Al) {
@@ -445,7 +481,7 @@ impl Lifter<'_> {
                         }
                         ArmInstr::BranchExchange { rn } => {
                             cycles.push(CycleCharge { addr, cycles: 0 });
-                            break if rn == Register::Lr {
+                            let term = if rn == Register::Lr {
                                 RawTerm::Return {
                                     switches_state: true,
                                 }
@@ -455,6 +491,13 @@ impl Lifter<'_> {
                                     switches_state: true,
                                     pc_mask: !1,
                                 }
+                            };
+                            break match guard.filter(|cond| *cond != Condition::Al) {
+                                Some(cond) => {
+                                    leaders.push(addr + 4);
+                                    self.lower_guarded(&mut lift, addr, cond, term)
+                                }
+                                None => term,
                             };
                         }
                         ArmInstr::DataProcessing {
@@ -488,11 +531,18 @@ impl Lifter<'_> {
                                 break term;
                             }
                             cycles.push(CycleCharge { addr, cycles: 0 });
-                            break RawTerm::IndirectExit {
+                            let term = RawTerm::IndirectExit {
                                 reg: rm,
                                 switches_state: false,
                                 // ALU writes to pc word-align the target.
                                 pc_mask: !3,
+                            };
+                            break match guard.filter(|cond| *cond != Condition::Al) {
+                                Some(cond) => {
+                                    leaders.push(addr + 4);
+                                    self.lower_guarded(&mut lift, addr, cond, term)
+                                }
+                                None => term,
                             };
                         }
                         ArmInstr::DataProcessing {
@@ -505,7 +555,7 @@ impl Lifter<'_> {
                             // as the exit target until the real lifter
                             // computes the sum.
                             cycles.push(CycleCharge { addr, cycles: 0 });
-                            break RawTerm::IndirectExit {
+                            let term = RawTerm::IndirectExit {
                                 reg: match operand2 {
                                     ShifterOperand::Register { rm, .. } => rm,
                                     _ => Register::Pc,
@@ -513,6 +563,13 @@ impl Lifter<'_> {
                                 switches_state: false,
                                 // ALU writes to pc word-align the target.
                                 pc_mask: !3,
+                            };
+                            break match guard.filter(|cond| *cond != Condition::Al) {
+                                Some(cond) => {
+                                    leaders.push(addr + 4);
+                                    self.lower_guarded(&mut lift, addr, cond, term)
+                                }
+                                None => term,
                             };
                         }
                         ArmInstr::LoadStore {
@@ -549,8 +606,15 @@ impl Lifter<'_> {
                                 rn,
                                 offset,
                             );
-                            break RawTerm::Return {
+                            let term = RawTerm::Return {
                                 switches_state: false,
+                            };
+                            break match guard.filter(|cond| *cond != Condition::Al) {
+                                Some(cond) => {
+                                    leaders.push(addr + 4);
+                                    self.lower_guarded(&mut lift, addr, cond, term)
+                                }
+                                None => term,
                             };
                         }
                         ArmInstr::BlockTransfer {
@@ -566,8 +630,15 @@ impl Lifter<'_> {
                             lift.guard = guard;
                             lift.addr = addr;
                             lift.block_transfer(true, writeback, up, pre_index, rn, registers);
-                            break RawTerm::Return {
+                            let term = RawTerm::Return {
                                 switches_state: false,
+                            };
+                            break match guard.filter(|cond| *cond != Condition::Al) {
+                                Some(cond) => {
+                                    leaders.push(addr + 4);
+                                    self.lower_guarded(&mut lift, addr, cond, term)
+                                }
+                                None => term,
                             };
                         }
                         ArmInstr::Undefined { .. } => break RawTerm::Unreachable,
@@ -1310,6 +1381,138 @@ mod tests {
         assert!(matches!(fallback.term, Terminator::IndirectExit { .. }));
         assert!(function.blocks.iter().any(|b| b.addr == canon_base + 8));
         assert!(function.blocks.iter().any(|b| b.addr == canon_base + 0x10));
+    }
+
+    /// A guarded call lowers to a trampoline: the lr write carries its
+    /// guard-fail fallback, the call lives in a block reached only on
+    /// the taken edge, and a failed guard falls through to the next
+    /// instruction.
+    #[test]
+    fn guarded_call_falls_through_to_the_next_instruction() {
+        let base = 0x0800_0000u32;
+        let words = [
+            0x1B00_0002, // base: blne base+0x10
+            0xE3A0_0001, // base+4: mov r0, #1 (the fallthrough)
+            0xE12F_FF10, // base+8: bx lr
+            0xE1A0_0000, // padding
+            0xE3A0_0002, // base+0x10: helper: mov r0, #2
+            0xE12F_FF10, // bx lr
+        ];
+        let function = lift_arm_with(&words, 6, &[]);
+        let entry = &function.blocks[0];
+        // The lr write is guarded and falls back to the incoming lr.
+        let write = &entry.insts[0];
+        assert_eq!(write.guard, Some(Condition::Ne));
+        assert_eq!(
+            write.fallbacks,
+            vec![Some(Value::Id(entry.params[Register::Lr.bits() as usize]))],
+            "lr falls back to its incoming value"
+        );
+        // The block hands off: taken to the trampoline, else to the
+        // next instruction.
+        let Terminator::BranchCond {
+            cond: Condition::Ne,
+            then_target,
+            else_target,
+            ..
+        } = &entry.term
+        else {
+            panic!("expected the guarded hand-off, got {:?}", entry.term);
+        };
+        assert_eq!(function.blocks[else_target.0 as usize].addr, base + 4);
+        let trampoline = &function.blocks[then_target.0 as usize];
+        let Terminator::Call {
+            target: Value::Const(target),
+            cont,
+            state,
+        } = &trampoline.term
+        else {
+            panic!("expected the trampoline call, got {:?}", trampoline.term);
+        };
+        assert_eq!(*target, base + 0x10);
+        let (cont_id, _args) = cont.as_ref().expect("the continuation is in-region");
+        assert_eq!(function.blocks[cont_id.0 as usize].addr, base + 4);
+        // The callee's incoming lr is the trampoline's own parameter,
+        // bound from the taken edge's state argument.
+        assert_eq!(
+            state[Register::Lr.bits() as usize],
+            Value::Id(trampoline.params[Register::Lr.bits() as usize])
+        );
+    }
+
+    /// A guarded `bx` ignores its exit when the condition fails and
+    /// falls through; the taken edge exits through the trampoline.
+    #[test]
+    fn guarded_bx_falls_through_when_the_condition_fails() {
+        let base = 0x0800_0000u32;
+        let words = [
+            0x112F_FF10, // base: bxne r0
+            0xE3A0_0001, // base+4: mov r0, #1
+            0xE12F_FF10, // base+8: bx lr
+        ];
+        let function = lift_arm_with(&words, 3, &[]);
+        let entry = &function.blocks[0];
+        assert!(entry.insts.is_empty(), "bx lifts no instructions");
+        let Terminator::BranchCond {
+            cond: Condition::Ne,
+            then_target,
+            else_target,
+            ..
+        } = &entry.term
+        else {
+            panic!("expected the guarded hand-off, got {:?}", entry.term);
+        };
+        assert_eq!(function.blocks[else_target.0 as usize].addr, base + 4);
+        assert!(matches!(
+            &function.blocks[then_target.0 as usize].term,
+            Terminator::IndirectExit {
+                switches_state: true,
+                pc_mask: 0xFFFF_FFFE,
+                ..
+            }
+        ));
+    }
+
+    /// A guarded pc-bearing return keeps the value threading: the
+    /// taken edge passes the masked load result, which the
+    /// trampoline's return sends out through its own pc parameter.
+    #[test]
+    fn guarded_pc_return_keeps_the_value_threading() {
+        let base = 0x0800_0000u32;
+        let words = [
+            0x1590_F000, // base: ldrne pc, [r0]
+            0xE3A0_0001, // base+4: mov r0, #1
+            0xE12F_FF10, // base+8: bx lr
+        ];
+        let function = lift_arm_with(&words, 3, &[]);
+        let entry = &function.blocks[0];
+        let masked = entry
+            .insts
+            .iter()
+            .find(|inst| matches!(inst.op, Op::And { .. }))
+            .map(|inst| inst.dests[0])
+            .expect("the pc mask");
+        let Terminator::BranchCond {
+            cond: Condition::Ne,
+            then_target,
+            else_target,
+            then_args,
+            ..
+        } = &entry.term
+        else {
+            panic!("expected the guarded hand-off, got {:?}", entry.term);
+        };
+        assert_eq!(then_args[Register::Pc.bits() as usize], Value::Id(masked));
+        assert_eq!(function.blocks[else_target.0 as usize].addr, base + 4);
+        let trampoline = &function.blocks[then_target.0 as usize];
+        let Terminator::Return {
+            state,
+            switches_state: false,
+        } = &trampoline.term
+        else {
+            panic!("expected the trampoline return, got {:?}", trampoline.term);
+        };
+        assert_eq!(state[15], Value::Id(trampoline.params[15]));
     }
 
     /// `ldr pc, [sp], #4` lifts the load and the ARMv4
