@@ -396,17 +396,29 @@ impl Machine {
                 let (v, c, o) = sub_with_borrow(self.value(a), self.value(b), false);
                 let d = &inst.dests;
                 self.set_slot_value(N_SLOT, d[0], u32::from(v & 0x8000_0000 != 0));
-                self.set_slot_value(Z_SLOT, d[1], u32::from(v == 0));
-                self.set_slot_value(C_SLOT, d[2], u32::from(c));
-                self.set_slot_value(V_SLOT, d[3], u32::from(o));
+                if let Some(&z) = d.get(1) {
+                    self.set_slot_value(Z_SLOT, z, u32::from(v == 0));
+                }
+                if let Some(&cy) = d.get(2) {
+                    self.set_slot_value(C_SLOT, cy, u32::from(c));
+                }
+                if let Some(&ov) = d.get(3) {
+                    self.set_slot_value(V_SLOT, ov, u32::from(o));
+                }
             }
             Op::Cmn { a, b } => {
                 let (v, c, o) = add_with_carry(self.value(a), self.value(b), false);
                 let d = &inst.dests;
                 self.set_slot_value(N_SLOT, d[0], u32::from(v & 0x8000_0000 != 0));
-                self.set_slot_value(Z_SLOT, d[1], u32::from(v == 0));
-                self.set_slot_value(C_SLOT, d[2], u32::from(c));
-                self.set_slot_value(V_SLOT, d[3], u32::from(o));
+                if let Some(&z) = d.get(1) {
+                    self.set_slot_value(Z_SLOT, z, u32::from(v == 0));
+                }
+                if let Some(&cy) = d.get(2) {
+                    self.set_slot_value(C_SLOT, cy, u32::from(c));
+                }
+                if let Some(&ov) = d.get(3) {
+                    self.set_slot_value(V_SLOT, ov, u32::from(o));
+                }
             }
             Op::Tst { a, b, carry_in } | Op::Teq { a, b, carry_in } => {
                 let v = match &inst.op {
@@ -416,8 +428,12 @@ impl Machine {
                 let c = self.flag_value(carry_in);
                 let d = &inst.dests;
                 self.set_slot_value(N_SLOT, d[0], u32::from(v & 0x8000_0000 != 0));
-                self.set_slot_value(Z_SLOT, d[1], u32::from(v == 0));
-                self.set_slot_value(C_SLOT, d[2], u32::from(c));
+                if let Some(&z) = d.get(1) {
+                    self.set_slot_value(Z_SLOT, z, u32::from(v == 0));
+                }
+                if let Some(&cy) = d.get(2) {
+                    self.set_slot_value(C_SLOT, cy, u32::from(c));
+                }
             }
             Op::Lsl {
                 set_flags: _,
@@ -545,13 +561,17 @@ impl Machine {
         self.set_id(inst.dests[0], v);
         if set_flags {
             let d = &inst.dests;
-            self.set_slot_value(N_SLOT, d[1], u32::from(v & 0x8000_0000 != 0));
-            self.set_slot_value(Z_SLOT, d[2], u32::from(v == 0));
-            if d.len() >= 4 {
-                self.set_slot_value(C_SLOT, d[3], u32::from(c));
+            if let Some(&n) = d.get(1) {
+                self.set_slot_value(N_SLOT, n, u32::from(v & 0x8000_0000 != 0));
             }
-            if d.len() >= 5 {
-                self.set_slot_value(V_SLOT, d[4], u32::from(o));
+            if let Some(&z) = d.get(2) {
+                self.set_slot_value(Z_SLOT, z, u32::from(v == 0));
+            }
+            if let Some(&cy) = d.get(3) {
+                self.set_slot_value(C_SLOT, cy, u32::from(c));
+            }
+            if let Some(&ov) = d.get(4) {
+                self.set_slot_value(V_SLOT, ov, u32::from(o));
             }
         }
     }
@@ -563,9 +583,15 @@ impl Machine {
         if set_flags {
             let c = self.flag_value(carry_in);
             let d = &inst.dests;
-            self.set_slot_value(N_SLOT, d[1], u32::from(v & 0x8000_0000 != 0));
-            self.set_slot_value(Z_SLOT, d[2], u32::from(v == 0));
-            self.set_slot_value(C_SLOT, d[3], u32::from(c));
+            if let Some(&n) = d.get(1) {
+                self.set_slot_value(N_SLOT, n, u32::from(v & 0x8000_0000 != 0));
+            }
+            if let Some(&z) = d.get(2) {
+                self.set_slot_value(Z_SLOT, z, u32::from(v == 0));
+            }
+            if let Some(&cy) = d.get(3) {
+                self.set_slot_value(C_SLOT, cy, u32::from(c));
+            }
         }
     }
 
@@ -678,4 +704,54 @@ pub(crate) fn sub_with_borrow(a: u32, b: u32, borrow: bool) -> (u32, bool, bool)
     let c = r >> 63 == 0;
     let v = ((a ^ b) & (a ^ res)) & 0x8000_0000 != 0;
     (res, c, v)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Dead-flag elimination truncates set-flags dests to any live
+    /// prefix; every bind must read the dest count, not assume the
+    /// full tail.
+    #[test]
+    fn truncated_add_binds_only_its_value_dest() {
+        let mut machine = Machine::new(32, Vec::new());
+        let out = ValueId(6);
+        let add = Inst {
+            guard: None,
+            dests: vec![out],
+            fallbacks: Vec::new(),
+            op: Op::Add {
+                set_flags: true,
+                a: Value::Const(2),
+                b: Value::Const(3),
+            },
+            pc: 0,
+            state: Vec::new(),
+        };
+        let mut end = vec![Value::Const(0); STATE_SLOTS];
+        end[0] = Value::Id(out);
+        machine.eval(&[add], &end);
+        assert_eq!(machine.slot(0), 5);
+    }
+
+    #[test]
+    fn truncated_cmp_binds_only_the_live_prefix() {
+        let mut machine = Machine::new(32, Vec::new());
+        machine.set_slot(N_SLOT, 1);
+        let n = ValueId(6);
+        let cmp = Inst {
+            guard: None,
+            dests: vec![n],
+            fallbacks: Vec::new(),
+            op: Op::Cmp {
+                a: Value::Const(0),
+                b: Value::Const(0),
+            },
+            pc: 0,
+            state: Vec::new(),
+        };
+        machine.eval(&[cmp], &[]);
+        assert_eq!(machine.slot(N_SLOT), 0);
+    }
 }

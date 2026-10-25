@@ -547,60 +547,76 @@ fn arith(
 }
 
 /// Binds an arithmetic op's dests `[v, n, z, c, v]`; dead-flag
-/// elimination may truncate the flag tail (matching the evaluator's
-/// length dispatch).
+/// elimination may truncate the flag tail to any live prefix, so
+/// every flag binds from the dest count alone.
 fn bind_arith(body: &mut String, d: &[String], set_flags: bool, r: &str, co: &str, vo: &str) {
     let _ = writeln!(body, "    {} = {r};", d[0]);
     if set_flags {
-        let _ = writeln!(
-            body,
-            "    {} = ({r} >> 31) & 1u; {} = (uint32_t)({r} == 0u); st->n = {}; st->z = {};",
-            d[1], d[2], d[1], d[2]
-        );
-        if d.len() >= 4 {
-            let _ = writeln!(body, "    {} = {co}; st->c = {};", d[3], d[3]);
+        if let Some(n) = d.get(1) {
+            let _ = writeln!(body, "    {n} = ({r} >> 31) & 1u; st->n = {n};");
         }
-        if d.len() >= 5 {
-            let _ = writeln!(body, "    {} = {vo}; st->v = {};", d[4], d[4]);
+        if let Some(z) = d.get(2) {
+            let _ = writeln!(body, "    {z} = (uint32_t)({r} == 0u); st->z = {z};");
+        }
+        if let Some(c) = d.get(3) {
+            let _ = writeln!(body, "    {c} = {co}; st->c = {c};");
+        }
+        if let Some(v) = d.get(4) {
+            let _ = writeln!(body, "    {v} = {vo}; st->v = {v};");
         }
     }
     body.push_str("    }\n");
 }
 
+/// Binds a comparison's dests `[n, z, c, v]`; dead-flag elimination
+/// may truncate to any live prefix.
 fn cmp_flags(body: &mut String, d: &[String], r: &str, co: &str, vo: &str) {
-    let _ = writeln!(
-        body,
-        "    {} = ({r} >> 31) & 1u; {} = (uint32_t)({r} == 0u); {} = {co}; {} = {vo};",
-        d[0], d[1], d[2], d[3]
-    );
-    let _ = writeln!(
-        body,
-        "    st->n = {}; st->z = {}; st->c = {}; st->v = {};",
-        d[0], d[1], d[2], d[3]
-    );
+    let n = &d[0];
+    let _ = writeln!(body, "    {n} = ({r} >> 31) & 1u; st->n = {n};");
+    if let Some(z) = d.get(1) {
+        let _ = writeln!(body, "    {z} = (uint32_t)({r} == 0u); st->z = {z};");
+    }
+    if let Some(c) = d.get(2) {
+        let _ = writeln!(body, "    {c} = {co}; st->c = {c};");
+    }
+    if let Some(v) = d.get(3) {
+        let _ = writeln!(body, "    {v} = {vo}; st->v = {v};");
+    }
     body.push_str("    }\n");
 }
 
+/// Binds a Tst/Teq's dests `[n, z, c]`, truncated to any live
+/// prefix. There is no value dest: the comparison only produces
+/// flags.
 fn tst_body(body: &mut String, d: &[String], value: String, carry_in: String) {
-    let _ = writeln!(body, "    {{ {} = {value};", d[0]);
-    let _ = writeln!(
-        body,
-        "    {} = ({} >> 31) & 1u; {} = (uint32_t)({} == 0u); {} = ({}); st->n = {}; st->z = {}; st->c = {};",
-        d[1], d[0], d[2], d[0], d[3], carry_in, d[1], d[2], d[3]
-    );
+    let n = &d[0];
+    let _ = writeln!(body, "    {{ {n} = ({value} >> 31) & 1u; st->n = {n};");
+    if let Some(z) = d.get(1) {
+        let _ = writeln!(body, "    {z} = (uint32_t)({value} == 0u); st->z = {z};");
+    }
+    if let Some(c) = d.get(2) {
+        let _ = writeln!(body, "    {c} = ({carry_in}); st->c = {c};");
+    }
     body.push_str("    }\n");
 }
 
 /// Logic and move ops: `[v, n, z, c]` with the shifter carry passed
 /// through, exactly as the evaluator's `bind_logic`.
+/// Logic and move ops: `[v, n, z, c]` with the shifter carry passed
+/// through, exactly as the evaluator's `bind_logic`; the flag tail
+/// may be truncated to any live prefix.
 fn logic(body: &mut String, d: &[String], set_flags: bool, value: String, carry_in: String) {
     let _ = writeln!(body, "    {{ {} = {value};", d[0]);
     if set_flags {
-        let _ = writeln!(
-            body,
-            "    {} = ({} >> 31) & 1u; {} = (uint32_t)({} == 0u); {} = ({}); st->n = {}; st->z = {}; st->c = {};",
-            d[1], d[0], d[2], d[0], d[3], carry_in, d[1], d[2], d[3]
-        );
+        if let Some(n) = d.get(1) {
+            let _ = writeln!(body, "    {n} = ({value} >> 31) & 1u; st->n = {n};");
+        }
+        if let Some(z) = d.get(2) {
+            let _ = writeln!(body, "    {z} = (uint32_t)({value} == 0u); st->z = {z};");
+        }
+        if let Some(c) = d.get(3) {
+            let _ = writeln!(body, "    {c} = ({carry_in}); st->c = {c};");
+        }
     }
     body.push_str("    }\n");
 }
@@ -1296,5 +1312,83 @@ mod tests {
             "{source}"
         );
         assert!(source.contains("goto b0;"), "{source}");
+    }
+
+    /// Dead-flag elimination truncates set-flags tails to any live
+    /// prefix; emission must bind from the dest count, and Tst/Teq
+    /// must bind their `[n, z, c]` dests directly (no value dest).
+    #[test]
+    fn truncated_flag_dests_bind_prefix_wise() {
+        let mut f = sample();
+        f.blocks[0].insts.insert(
+            0,
+            Inst {
+                guard: None,
+                dests: vec![ValueId(40)],
+                fallbacks: Vec::new(),
+                op: Op::Add {
+                    set_flags: true,
+                    a: reg(0),
+                    b: Value::Const(1),
+                },
+                pc: 0x0800_0100,
+                state: Vec::new(),
+            },
+        );
+        f.blocks[0].insts.insert(
+            1,
+            Inst {
+                guard: None,
+                dests: vec![ValueId(41), ValueId(42)],
+                fallbacks: Vec::new(),
+                op: Op::Cmp {
+                    a: reg(0),
+                    b: Value::Const(0),
+                },
+                pc: 0x0800_0100,
+                state: Vec::new(),
+            },
+        );
+        f.blocks[0].insts.insert(
+            2,
+            Inst {
+                guard: None,
+                dests: vec![ValueId(43), ValueId(44)],
+                fallbacks: Vec::new(),
+                op: Op::Tst {
+                    a: reg(0),
+                    b: Value::Const(15),
+                    carry_in: Value::Const(0),
+                },
+                pc: 0x0800_0100,
+                state: Vec::new(),
+            },
+        );
+        let source = emit_module(&[(0x0800_0100, &f)]).c_source;
+        // The add keeps only its value dest: no flag binds at all.
+        assert!(source.contains("v40 = r;"), "{source}");
+        assert!(!source.contains("st->n = v40;"), "{source}");
+        // The cmp keeps only its n, z prefix.
+        assert!(
+            source.contains("v41 = (r >> 31) & 1u; st->n = v41;"),
+            "{source}"
+        );
+        assert!(
+            source.contains("v42 = (uint32_t)(r == 0u); st->z = v42;"),
+            "{source}"
+        );
+        assert!(!source.contains("st->c = v42;"), "{source}");
+        assert!(!source.contains("st->v = v42;"), "{source}");
+        // The tst binds n and z straight from the operands, and no
+        // carry dest exists to bind.
+        assert!(
+            source.contains("v43 = ((v0 & 15u) >> 31) & 1u; st->n = v43;"),
+            "{source}"
+        );
+        assert!(
+            source.contains("v44 = (uint32_t)((v0 & 15u) == 0u); st->z = v44;"),
+            "{source}"
+        );
+        assert!(!source.contains("st->c = v44;"), "{source}");
     }
 }
