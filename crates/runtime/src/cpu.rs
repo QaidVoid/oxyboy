@@ -8,9 +8,9 @@
 
 use crate::bus::Bus;
 use decode::{
-    ArmInstr, Condition, DataOp, HalfwordKind, Register, RegisterList, ShiftAmount, ShiftKind,
-    ShifterOperand, ThumbAluOp, ThumbHiOp, ThumbImmOp, ThumbInstr, ThumbMemOp, ThumbShift,
-    ThumbSignedMemOp, decode_arm, decode_thumb,
+    ArmInstr, Condition, DataOp, HalfwordKind, Register, RegisterList, RegisterShift, ShiftAmount,
+    ShiftKind, ShifterOperand, ThumbAluOp, ThumbHiOp, ThumbImmOp, ThumbInstr, ThumbMemOp,
+    ThumbShift, ThumbSignedMemOp, decode_arm, decode_thumb,
 };
 
 /// A CPU operating mode (ARM ARM A2.2, GBATEK "CPU Modes").
@@ -963,8 +963,26 @@ impl Cpu {
         rn: Register,
         operand2: ShifterOperand,
     ) -> Flow {
-        let a = self.reg(rn);
-        let (b, shift_carry) = self.eval_operand2(operand2);
+        // A register-specified shift spends an extra register-file read
+        // cycle: R15 reads as instruction + 12 for both operand
+        // registers (ARM ARM A5.2/E5.2 note; the external arm suite
+        // pins `mov r0, pc, lsl r0` and `add r0, pc, r0, lsl r0`).
+        let late_pc = matches!(
+            &operand2,
+            ShifterOperand::Register {
+                shift: RegisterShift {
+                    amount: ShiftAmount::Register(_),
+                    ..
+                },
+                ..
+            }
+        );
+        let a = if late_pc && rn == Register::Pc {
+            self.pc.wrapping_add(12)
+        } else {
+            self.reg(rn)
+        };
+        let (b, shift_carry) = self.eval_operand2_late_pc(operand2, late_pc);
         let comparison = matches!(
             opcode,
             DataOp::Tst | DataOp::Teq | DataOp::Cmp | DataOp::Cmn
@@ -1019,6 +1037,9 @@ impl Cpu {
                 let spsr = self.spsr_of_current();
                 self.restore_cpsr(spsr);
             }
+            if comparison && set_flags && rd == Register::Pc {
+                self.write_cpsr_control_from_result(res);
+            }
         }
         if !comparison && rd == Register::Pc {
             // Data-processing writes to PC do not interwork on ARMv4T:
@@ -1030,8 +1051,10 @@ impl Cpu {
         }
     }
 
-    /// Second-operand evaluation: value plus shifter carry-out.
-    fn eval_operand2(&self, operand: ShifterOperand) -> (u32, bool) {
+    /// Second-operand evaluation with the register-specified-shift
+    /// pipeline rule: `late_pc` makes an R15 operand read instruction
+    /// + 12 instead of the normal + 8.
+    fn eval_operand2_late_pc(&self, operand: ShifterOperand, late_pc: bool) -> (u32, bool) {
         match operand {
             ShifterOperand::Immediate { rotate, value } => {
                 let v = u32::from(value).rotate_right(u32::from(rotate) * 2);
@@ -1043,7 +1066,11 @@ impl Cpu {
                 (v, carry)
             }
             ShifterOperand::Register { rm, shift } => {
-                let raw = self.reg(rm);
+                let raw = if late_pc && rm == Register::Pc {
+                    self.pc.wrapping_add(12)
+                } else {
+                    self.reg(rm)
+                };
                 match shift.amount {
                     ShiftAmount::Immediate(n) => {
                         let amount = match shift.kind {
@@ -1095,6 +1122,28 @@ impl Cpu {
             self.set_flag_bits(0xE0, value);
         }
         // s (0b0100) and x (0b0010): no SPSR S/E bits on ARM7TDMI.
+    }
+
+    /// ARMv2-era CMPP/TSTP/TEQP/CMNP heritage: a comparison with S=1
+    /// and Rd=15 has an architecturally moot destination, and the
+    /// ARM7TDMI spends the corner writing the result's PSR bits into
+    /// the CPSR control tail: I = result bit 27, F = result bit 26,
+    /// mode = 0x10 | result[1:0] (GBATEK "Data Processing", "{P}
+    /// opcodes"; the external arm suite pins `cmp pc, pc, r0` as a
+    /// mode change). NZCV come from the normal flag update. User mode
+    /// keeps NZCV only. The pipeline is not flushed.
+    fn write_cpsr_control_from_result(&mut self, result: u32) {
+        if self.mode() == Mode::User {
+            return;
+        }
+        let i = u32::from(result & 0x0800_0000 != 0) << 7;
+        let f = u32::from(result & 0x0400_0000 != 0) << 6;
+        self.cpsr = (self.cpsr & !0xC0) | i | f;
+        // The old 26-bit mode pair M1,M0 maps onto the low two GBA
+        // mode bits; 0x10 | 0..=3 is always a valid mode.
+        if let Some(m) = Mode::from_bits(0x10 | (result & 3) as u8) {
+            self.switch_mode(m);
+        }
     }
 
     /// Masks `value` through `fields` onto `old` (for SPSR writes,

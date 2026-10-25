@@ -161,19 +161,30 @@ impl ArmLift {
                     (Value::Const(word), Value::Const(word >> 31))
                 }
             }
-            ShifterOperand::Register { rm, shift } => self.register_shift(rm, shift),
+            ShifterOperand::Register { rm, shift } => {
+                let late = matches!(&shift.amount, ShiftAmount::Register(_));
+                self.register_shift(rm, shift, late)
+            }
         }
     }
 
     /// Expands one register shift to `(value, carry)`, emitting the
     /// explicit shift op when it has an effect. Shift ops always
     /// produce their carry-out; dead-flag elimination can drop it when
-    /// no consumer needs it.
-    fn register_shift(&mut self, rm: Register, shift: RegisterShift) -> (Value, Value) {
+    /// no consumer needs it. `late` is the register-specified-shift
+    /// pipeline rule: the extra register-file cycle reads R15 as
+    /// instruction + 12 (ARM ARM A5.2; the external arm suite pins
+    /// `mov r0, pc, lsl r0` and `add r0, pc, r0, lsl r0`).
+    fn register_shift(&mut self, rm: Register, shift: RegisterShift, late: bool) -> (Value, Value) {
+        let raw = if late && rm == Register::Pc {
+            Value::Const(self.addr + 12)
+        } else {
+            self.read(rm)
+        };
         let (kind, amount) = match shift.amount {
             ShiftAmount::Immediate(0) => match shift.kind {
                 // A plain register: no shift op; carry passes through.
-                ShiftKind::Lsl => return (self.read(rm), self.carry_in()),
+                ShiftKind::Lsl => return (raw, self.carry_in()),
                 // ROR #0 encodes RRX (ARM ARM A4.1.3).
                 ShiftKind::Ror => {
                     let out = self.fresh();
@@ -184,7 +195,7 @@ impl ArmLift {
                     self.emit(
                         Op::Rrx {
                             set_flags: false,
-                            a: self.read(rm),
+                            a: raw,
                             carry_in: c_in,
                         },
                         vec![out, c],
@@ -202,7 +213,7 @@ impl ArmLift {
         // Plain value: the parent op decides whether the shifter carry
         // becomes the C flag.
         let c = self.fresh();
-        let a = self.read(rm);
+        let a = raw;
         let op = match kind {
             ShiftKind::Lsl => Op::Lsl {
                 set_flags: false,
@@ -466,6 +477,16 @@ impl ArmLift {
         }
     }
 
+    /// Operand-1 read for data processing: under a register-specified
+    /// shift, R15 reads instruction + 12 (see `register_shift`).
+    fn dp_operand1(&self, late: bool, rn: Register) -> Value {
+        if late && rn == Register::Pc {
+            Value::Const(self.addr + 12)
+        } else {
+            self.read(rn)
+        }
+    }
+
     /// Data processing: ALU ops, comparisons, moves.
     fn data_processing(
         &mut self,
@@ -475,6 +496,16 @@ impl ArmLift {
         rn: Register,
         operand2: ShifterOperand,
     ) {
+        let late = matches!(
+            &operand2,
+            ShifterOperand::Register {
+                shift: RegisterShift {
+                    amount: ShiftAmount::Register(_),
+                    ..
+                },
+                ..
+            }
+        );
         match opcode {
             DataOp::Mov | DataOp::Mvn => {
                 let (value, carry) = self.shifter(operand2, set_flags);
@@ -501,7 +532,7 @@ impl ArmLift {
             }
             DataOp::Cmp | DataOp::Cmn => {
                 let (b, _) = self.shifter(operand2, false);
-                let a = self.read(rn);
+                let a = self.dp_operand1(late, rn);
                 let n = self.flag_dest(0);
                 let z = self.flag_dest(1);
                 let c = self.flag_dest(C_SLOT);
@@ -515,7 +546,7 @@ impl ArmLift {
             }
             DataOp::Tst | DataOp::Teq => {
                 let (b, carry) = self.shifter(operand2, true);
-                let a = self.read(rn);
+                let a = self.dp_operand1(late, rn);
                 let n = self.flag_dest(0);
                 let z = self.flag_dest(1);
                 let c = self.flag_dest(C_SLOT);
@@ -535,7 +566,7 @@ impl ArmLift {
             }
             DataOp::And | DataOp::Eor | DataOp::Orr | DataOp::Bic => {
                 let (b, carry) = self.shifter(operand2, set_flags);
-                let a = self.read(rn);
+                let a = self.dp_operand1(late, rn);
                 let out = self.write(rd);
                 let mut dests = vec![out];
                 if set_flags {
@@ -577,7 +608,7 @@ impl ArmLift {
                 // instruction's incoming carry.
                 let carry = self.carry_in();
                 let (b, _) = self.shifter(operand2, false);
-                let a = self.read(rn);
+                let a = self.dp_operand1(late, rn);
                 let out = self.write(rd);
                 let mut dests = vec![out];
                 if set_flags {
@@ -600,7 +631,7 @@ impl ArmLift {
             DataOp::Sub | DataOp::Sbc | DataOp::Rsb | DataOp::Rsc => {
                 let carry = self.carry_in();
                 let (b, _) = self.shifter(operand2, false);
-                let a = self.read(rn);
+                let a = self.dp_operand1(late, rn);
                 let out = self.write(rd);
                 let mut dests = vec![out];
                 if set_flags {

@@ -307,6 +307,25 @@ fn psr_read_write() {
 }
 
 #[test]
+fn bad_comparison_rd15_stays_data_processing() {
+    // TST/TEQ/CMP/CMN with S=1 and Rd=15 decode as ordinary data
+    // processing; their ARMv2-era CMPP/TSTP heritage is an execution
+    // rule in the CPU (see write_cpsr_control_from_result), not a
+    // decode alias. The external ARM suite pins the exact word
+    // `cmp pc, pc, r0` (0xE15FF000) as a mode change.
+    assert!(matches!(
+        decode_arm(0xE15F_F000),
+        ArmInstr::DataProcessing {
+            opcode: DataOp::Cmp,
+            set_flags: true,
+            rd: Register::Pc,
+            rn: Register::Pc,
+            ..
+        }
+    ));
+}
+
+#[test]
 fn load_store_immediate_offset() {
     // ldr r0, [r1, #4]
     assert_eq!(

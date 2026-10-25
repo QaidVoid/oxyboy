@@ -832,3 +832,74 @@ fn block_transfer_and_halfword_quirks() {
     run(&mut cpu, &mut bus, 1);
     assert_eq!(reg(&cpu, 2), 0xFFFF_FFAB);
 }
+
+#[test]
+fn register_specified_shift_reads_pc_late() {
+    // A register-specified shift spends an extra register-file cycle,
+    // so R15 reads instruction + 12 as both operand registers (the
+    // external arm suite pins both forms; an immediate shift keeps
+    // the + 8 read).
+    let words = [
+        0xE1A0_001F, // mov r0, pc, lsl r0 (register-specified shift)
+        0xE150_000F, // cmp r0, pc
+        0x03A0_1001, // moveq r1, #1
+        0xE3A0_0000, // mov r0, #0
+        0xE08F_0010, // add r0, pc, r0, lsl r0
+        0xE150_000F, // cmp r0, pc
+        0x03A0_2001, // moveq r2, #1
+    ];
+    let mut bus = rom(&words);
+    let mut cpu = Cpu::new(0x0800_0000);
+    run(&mut cpu, &mut bus, 1);
+    assert_eq!(reg(&cpu, 0), 0x0800_0000 + 12);
+    run(&mut cpu, &mut bus, 2);
+    assert_eq!(reg(&cpu, 1), 1);
+    run(&mut cpu, &mut bus, 2);
+    assert_eq!(reg(&cpu, 0), 0x0800_0000 + 4 * 4 + 12);
+    run(&mut cpu, &mut bus, 2);
+    assert_eq!(reg(&cpu, 2), 1);
+}
+
+#[test]
+fn bad_comparison_rd15_writes_cpsr_control_from_result() {
+    // TST/TEQ/CMP/CMN with S=1 and Rd=15 write the result's PSR bits
+    // into the CPSR control tail (ARMv2 CMPP heritage, GBATEK "{P}
+    // opcodes"): I = result bit 27, F = result bit 26, mode =
+    // 0x10 | result[1:0], no pipeline flush, NZCV from the normal
+    // flag update. The external arm suite pins `cmp pc, pc, r0`
+    // (0xE15FF000) leaving FIQ mode so the non-FIQ R8 reads again.
+    let words = [
+        0xE3A0_0470, // mov r0, #0x70000000
+        0xE380_0001, // orr r0, r0, #1
+        0xE3A0_8020, // mov r8, #32
+        0xE3A1_1011, // mov r1, #0x11
+        0xE121_F001, // msr cpsr_c, r1 (-> FIQ)
+        0xE3A0_8040, // mov r8, #64 (FIQ-banked)
+        0xE15F_F000, // cmp pc, pc, r0 (the corner)
+    ];
+    let mut bus = rom(&words);
+    let mut cpu = Cpu::new(0x0800_0000);
+    run(&mut cpu, &mut bus, 7);
+    // result = (corner + 12) - r0 = 0x98000023: N=1, Z=0, C=0, V=1,
+    // bit 27 -> I set, bit 26 -> F clear, low two bits -> Supervisor.
+    assert_eq!(cpu.cpsr() & 0x1F, 0x13);
+    assert_ne!(cpu.cpsr() & 0x80, 0);
+    assert_eq!(cpu.cpsr() & 0x40, 0);
+    assert_ne!(cpu.cpsr() & 0x8000_0000, 0);
+    assert_eq!(cpu.cpsr() & 0x4000_0000, 0);
+    assert_eq!(cpu.cpsr() & 0x2000_0000, 0);
+    assert_eq!(cpu.cpsr() & 0x1000_0000, 0);
+    // The mode change leaves FIQ, so the shared R8 file reads again.
+    assert_eq!(reg(&cpu, 8), 32);
+
+    // In User mode only NZCV change: the control tail stays put even
+    // though the result would have set I.
+    let mut bus = rom(&[words[0], words[1], words[6]]);
+    let mut cpu = Cpu::new(0x0800_0000);
+    run(&mut cpu, &mut bus, 2);
+    cpu.set_cpsr_raw(0x0000_0010);
+    run(&mut cpu, &mut bus, 1);
+    assert_eq!(cpu.cpsr() & 0x1F, 0x10);
+    assert_eq!(cpu.cpsr() & 0xC0, 0);
+    assert_ne!(cpu.cpsr() & 0x8000_0000, 0);
+}
