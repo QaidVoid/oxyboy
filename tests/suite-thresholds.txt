@@ -6,7 +6,7 @@
 # unsafe stays at 1 of 2: per the suite's README, its SRAM mirror test
 # fails on real carts and its unused-ROM-reads test passes only on mGBA.
 # The interpreter models the hardware behavior instead.
-arm 223
+arm 532
 bios 0
 memory 54
 thumb 233

@@ -903,3 +903,97 @@ fn bad_comparison_rd15_writes_cpsr_control_from_result() {
     assert_eq!(cpu.cpsr() & 0xC0, 0);
     assert_ne!(cpu.cpsr() & 0x8000_0000, 0);
 }
+
+#[test]
+fn misaligned_word_store_lands_aligned_unrotated() {
+    // A word store on a 32-bit bus ignores A[1:0]: the value lands in
+    // the aligned unit unrotated (external arm suite single_transfer
+    // test 354). The bytes must not spill into the next word either.
+    let words = [
+        0xE581_0003, // str r0, [r1, #3]
+        0xE591_2000, // ldr r2, [r1]
+        0xE591_3004, // ldr r3, [r1, #4]
+    ];
+    let mut bus = rom(&words);
+    let mut cpu = Cpu::new(0x0800_0000);
+    cpu.set_reg_for_test(0, 0x1234_5678);
+    cpu.set_reg_for_test(1, 0x0300_0000);
+    run(&mut cpu, &mut bus, 3);
+    assert_eq!(reg(&cpu, 2), 0x1234_5678);
+    assert_eq!(bus.read_u32(0x0300_0000), 0x1234_5678);
+    assert_eq!(reg(&cpu, 3), 0);
+    assert_eq!(bus.read_u32(0x0300_0004), 0);
+}
+
+#[test]
+fn odd_halfword_store_lands_aligned() {
+    // A halfword store ignores A[0]: the low half lands in the aligned
+    // halfword (external arm suite halfword_transfer test 407), and
+    // the register's upper half is discarded.
+    let words = [
+        0xE1C1_00B1, // strh r0, [r1, #1]
+        0xE1D1_20B0, // ldrh r2, [r1]
+        0xE591_3000, // ldr r3, [r1]
+    ];
+    let mut bus = rom(&words);
+    let mut cpu = Cpu::new(0x0800_0000);
+    cpu.set_reg_for_test(0, 0xCAFE_BEEF);
+    cpu.set_reg_for_test(1, 0x0300_0000);
+    run(&mut cpu, &mut bus, 3);
+    assert_eq!(reg(&cpu, 2), 0xBEEF);
+    assert_eq!(bus.read_u32(0x0300_0000), 0x0000_BEEF);
+}
+
+#[test]
+fn misaligned_swap_reads_aligned_then_rotates() {
+    // SWP's load is an LDR: it reads the aligned word first and then
+    // applies the A[1:0] rotation; the store side is the aligned
+    // unrotated word store (external arm suite data_swap test 452,
+    // addr & 3 == 1).
+    let words = [
+        0xE281_1001, // add r1, r1, #1
+        0xE101_2093, // swp r2, r3, [r1]
+    ];
+    let mut bus = rom(&words);
+    bus.write_u32(0x0300_0000, 0xAABB_CCDD);
+    let mut cpu = Cpu::new(0x0800_0000);
+    cpu.set_reg_for_test(1, 0x0300_0000);
+    cpu.set_reg_for_test(3, 0xDEAD_BEEF);
+    run(&mut cpu, &mut bus, 2);
+    assert_eq!(reg(&cpu, 2), 0xDDAA_BBCC);
+    assert_eq!(bus.read_u32(0x0300_0000), 0xDEAD_BEEF);
+}
+
+#[test]
+fn misaligned_block_transfer_round_trips_with_raw_writeback() {
+    // Block transfers neither rotate nor use byte lanes: each value
+    // crosses the bus as the aligned unrotated word, and the base
+    // writeback keeps the raw misaligned arithmetic (external arm
+    // suite block_transfer test 508: stmfd at base+3, ldmfd at
+    // base-5, the final base compared unmasked).
+    let words = [
+        0xE281_8003, // add r8, r1, #3
+        0xE928_00F0, // stmfd r8!, {r4-r7}
+        0xE1A0_B001, // mov r11, r1 (ldmfd clobbers r1)
+        0xE8B8_000F, // ldmfd r8!, {r0-r3}
+        0xE51B_9010, // ldr r9, [r11, #-16]
+        0xE51B_A004, // ldr r10, [r11, #-4]
+    ];
+    let mut bus = rom(&words);
+    let mut cpu = Cpu::new(0x0800_0000);
+    cpu.set_reg_for_test(1, 0x0300_0040);
+    cpu.set_reg_for_test(4, 0x1111_1111);
+    cpu.set_reg_for_test(5, 0x2222_2222);
+    cpu.set_reg_for_test(6, 0x3333_3333);
+    cpu.set_reg_for_test(7, 0x4444_4444);
+    run(&mut cpu, &mut bus, 6);
+    assert_eq!(reg(&cpu, 0), 0x1111_1111);
+    assert_eq!(reg(&cpu, 1), 0x2222_2222);
+    assert_eq!(reg(&cpu, 2), 0x3333_3333);
+    assert_eq!(reg(&cpu, 3), 0x4444_4444);
+    // The stores landed at the aligned words base-16 and base-4.
+    assert_eq!(reg(&cpu, 9), 0x1111_1111);
+    assert_eq!(reg(&cpu, 10), 0x4444_4444);
+    // Writeback keeps the raw base: 0x03000043 - 16 + 16.
+    assert_eq!(reg(&cpu, 8), 0x0300_0043);
+}

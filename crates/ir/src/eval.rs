@@ -108,8 +108,10 @@ impl EvalMemory {
             self.write_u8(addr, b);
             return;
         }
-        for i in 0..4 {
-            self.write_u8(addr.wrapping_add(i), (value >> (i * 8)) as u8);
+        // Word accesses ignore A[1:0] (mirrors `Bus::write_u32`).
+        let w = addr & !3;
+        for i in 0..4u32 {
+            self.write_u8(w.wrapping_add(i), (value >> (i * 8)) as u8);
         }
     }
 
@@ -136,8 +138,8 @@ impl EvalMemory {
             }
             (Size::Word, _) => match mode {
                 LoadMode::Ldr => self.read_u32(addr & !3).rotate_right((addr & 3) * 8),
-                LoadMode::Swap => self.read_u32(addr).rotate_right((addr & 3) * 8),
-                LoadMode::Block => self.read_u32(addr),
+                LoadMode::Swap => self.read_u32(addr & !3).rotate_right((addr & 3) * 8),
+                LoadMode::Block => self.read_u32(addr & !3),
             },
         }
     }
@@ -152,8 +154,11 @@ impl EvalMemory {
                     self.write_u8(addr, b);
                     return;
                 }
-                self.write_u8(addr, value as u8);
-                self.write_u8(addr.wrapping_add(1), (value >> 8) as u8);
+                // Halfword accesses ignore A[0] (mirrors
+                // `Bus::write_u16`).
+                let w = addr & !1;
+                self.write_u8(w, value as u8);
+                self.write_u8(w.wrapping_add(1), (value >> 8) as u8);
             }
             Size::Word => self.write_u32(addr, value),
         }

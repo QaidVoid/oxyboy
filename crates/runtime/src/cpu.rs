@@ -844,7 +844,11 @@ impl Cpu {
                     bus.write_u8(addr, self.reg(rm) as u8);
                     self.set_reg(rd, u32::from(tmp));
                 } else {
-                    let raw = bus.read_u32(addr);
+                    // The swap's load follows the LDR rotation rule:
+                    // the aligned word, rotated so the addressed byte
+                    // sits in the LSB (the store side aligns inside
+                    // `Bus::write_u32`).
+                    let raw = bus.read_u32(addr & !3);
                     let tmp = raw.rotate_right((addr & 3) * 8);
                     bus.write_u32(addr, self.reg(rm));
                     self.set_reg(rd, tmp);
@@ -1420,7 +1424,10 @@ impl Cpu {
             }
             self.cycles += u64::from(bus.access_cost(addr, 4));
             if load {
-                let value = bus.read_u32(addr);
+                // Block transfers neither rotate nor use byte lanes:
+                // each access reads the aligned word (the external arm
+                // suite pins a misaligned STM read back by LDM).
+                let value = bus.read_u32(addr & !3);
                 if r == Register::Pc {
                     loaded_pc = Some(value & !3);
                 } else if psr_and_force_user && !pc_in_list {

@@ -497,9 +497,14 @@ impl Bus {
         let lo = value as u8;
         let hi = (value >> 8) as u8;
         match a >> 24 {
+            // Word and halfword accesses ignore A[0]/A[1:0] on the
+            // wide buses: the value lands in the aligned unit
+            // unrotated (the external arm suite pins misaligned
+            // stores read back by aligned loads).
             0x02 | 0x03 => {
-                self.write_u8(addr, lo);
-                self.write_u8(addr.wrapping_add(1), hi);
+                let w = a & !1;
+                self.write_u8(w, lo);
+                self.write_u8(w.wrapping_add(1), hi);
             }
             0x04 if a < 0x0400_0400 => self.io_write_u16(a & !1, value),
             // The 8-bit SRAM/flash bus takes one byte per access: the
@@ -547,9 +552,19 @@ impl Bus {
         if matches!(a >> 24, 0x0E | 0x0F) {
             let b = (value >> (8 * (a & 3))) as u8;
             self.write_u8(addr, b);
+        } else if matches!(a >> 24, 0x04 | 0x0D) {
+            // The 16-bit IO and EEPROM lanes sequence A[1:0] through:
+            // the word splits at the address as given (the IRQ model
+            // pins a word acknowledge at IF+0/IF+2).
+            self.write_u16(a, value as u16);
+            self.write_u16(a.wrapping_add(2), (value >> 16) as u16);
         } else {
-            self.write_u16(addr, value as u16);
-            self.write_u16(addr.wrapping_add(2), (value >> 16) as u16);
+            // Word accesses ignore A[1:0]: the value lands in the
+            // aligned word unrotated (the external arm suite pins a
+            // store at +3 read back by an aligned load).
+            let w = a & !3;
+            self.write_u16(w, value as u16);
+            self.write_u16(w.wrapping_add(2), (value >> 16) as u16);
         }
         self.end_capture();
     }
