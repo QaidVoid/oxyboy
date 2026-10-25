@@ -27,6 +27,10 @@ enum Close {
     /// `do { ... } while (cond);`: the latch closes with its own
     /// trailing condition.
     DoWhile { cond: Condition, invert: bool },
+    /// `while (header_cond) { ... if (latch_cond) { break; } }`: the
+    /// header tests entry and the latch closes conditionally, one arm
+    /// back to the header, the other out through the loop exit.
+    WhileLatch { cond: Condition, invert: bool },
 }
 
 /// A recognized simple loop.
@@ -294,8 +298,9 @@ fn recognize_loops(cfg: &Cfg, function: &Function) -> Vec<Shape> {
             } else {
                 continue;
             };
+            let latch_term = &function.blocks[latch.0 as usize].term;
             let latch_closes = matches!(
-                &function.blocks[latch.0 as usize].term,
+                latch_term,
                 Terminator::Branch { target, .. } if *target == header
             );
             if latch_closes {
@@ -305,6 +310,34 @@ fn recognize_loops(cfg: &Cfg, function: &Function) -> Vec<Shape> {
                     exit,
                     latch,
                     close: Close::While,
+                });
+                continue;
+            }
+            // Conditional latch: one arm closes back to the header,
+            // the other leaves through the header's exit arm.
+            if let Terminator::BranchCond {
+                cond,
+                then_target,
+                else_target,
+                ..
+            } = latch_term
+            {
+                let (close_cond, invert) = if *then_target == exit && *else_target == header {
+                    (*cond, false)
+                } else if *else_target == exit && *then_target == header {
+                    (*cond, true)
+                } else {
+                    continue;
+                };
+                shapes.push(Shape {
+                    header,
+                    body_enter,
+                    exit,
+                    latch,
+                    close: Close::WhileLatch {
+                        cond: close_cond,
+                        invert,
+                    },
                 });
                 continue;
             }
@@ -575,14 +608,22 @@ impl Emitter<'_> {
 
     /// Whether the latch's trailing `cmp` is its close condition.
     fn latch_skip(&self, latch: BlockId) -> bool {
-        let do_while = matches!(self.loop_stack.last(), Some((_, _, Close::DoWhile { .. })));
-        do_while && self.last_inst_is_cmp(latch)
+        let consumed_by_close = matches!(
+            self.loop_stack.last(),
+            Some((_, _, Close::DoWhile { .. } | Close::WhileLatch { .. }))
+        );
+        consumed_by_close && self.last_inst_is_cmp(latch)
     }
 
     /// Emits the closing line of the innermost open loop.
     fn emit_close(&mut self, latch: BlockId) {
         match self.loop_stack.last().map(|(_, _, close)| close.clone()) {
             Some(Close::While) => self.line("}"),
+            Some(Close::WhileLatch { cond, invert }) => {
+                let text = self.condition_text(cond, latch, invert);
+                self.line(&format!("if ({text}) {{ break; }}"));
+                self.line("}");
+            }
             Some(Close::DoWhile { cond, invert }) => {
                 let text = self.condition_text(cond, latch, invert);
                 self.line(&format!("}} while ({text});"));
@@ -594,10 +635,11 @@ impl Emitter<'_> {
     /// Emits one recognized loop and continues at its exit. `stop`
     /// is the enclosing walk's latch, used for the exit continuation.
     fn open_loop(&mut self, shape: Shape, stop: Option<(BlockId, BlockId)>) {
-        let skip = matches!(shape.close, Close::While) && self.last_inst_is_cmp(shape.header);
+        let skip = matches!(shape.close, Close::While | Close::WhileLatch { .. })
+            && self.last_inst_is_cmp(shape.header);
         self.consumed.insert(shape.header);
         self.emit_insts(shape.header, skip);
-        let (opening, entry) = if matches!(shape.close, Close::While) {
+        let (opening, entry) = if matches!(shape.close, Close::While | Close::WhileLatch { .. }) {
             let (cond, entry) = self.loop_condition(&shape);
             (format!("while ({cond}) {{"), entry)
         } else {
@@ -624,6 +666,11 @@ impl Emitter<'_> {
     fn frame_close(&mut self, shape: &Shape) {
         match &shape.close {
             Close::While => self.line("}"),
+            Close::WhileLatch { cond, invert } => {
+                let text = self.condition_text(*cond, shape.latch, *invert);
+                self.line(&format!("if ({text}) {{ break; }}"));
+                self.line("}");
+            }
             Close::DoWhile { cond, invert } => {
                 let text = self.condition_text(*cond, shape.latch, *invert);
                 self.line(&format!("}} while ({text});"));
@@ -1707,6 +1754,30 @@ mod tests {
         assert_wellformed(&text);
         assert!(text.contains("do {"), "{text}");
         assert!(text.contains("} while ((0x1u == 0x1u));"), "{text}");
+        assert!(!text.contains("goto"), "{text}");
+    }
+
+    #[test]
+    fn while_loop_with_conditional_latch() {
+        // The Emerald memcpy shape: the header tests entry, the latch
+        // has one arm back to the header and one out through the same
+        // exit. b0 entry; b1 header; b2 body; b3 latch; b4 exit.
+        let text = emitted(vec![
+            block(vec![], branch(BlockId(1))),
+            block(
+                vec![cmp(0x5, 0x0)],
+                branch_cond(Condition::Ne, BlockId(2), BlockId(4)),
+            ),
+            block(vec![], branch(BlockId(3))),
+            block(
+                vec![cmp(0x7, 0x1)],
+                branch_cond(Condition::Hi, BlockId(4), BlockId(1)),
+            ),
+            block(vec![], ret()),
+        ]);
+        assert_wellformed(&text);
+        assert!(text.contains("while ((0x5u != 0x0u)) {"), "{text}");
+        assert!(text.contains("break;"), "{text}");
         assert!(!text.contains("goto"), "{text}");
     }
 

@@ -70,29 +70,37 @@ pub fn function_regions(image: &rom::Image, map: &FlagMap) -> Vec<FunctionRegion
     let len = image.bytes().len();
     let canon = map.canonical();
     let base = canon.base();
-    let mut regions = Vec::new();
+    // Function starts: leading bytes of maximal FUNC_START runs (a run
+    // longer than one byte is one mark spanning an instruction, not
+    // several functions).
+    let mut starts: Vec<u32> = Vec::new();
     let mut index = 0usize;
     while index < len {
-        let run = map.get(base + index as u32);
-        if run.contains(Flags::FUNC_START) {
-            let state = if run.contains(Flags::THUMB) {
-                State::Thumb
-            } else {
-                State::Arm
-            };
-            let mut end = index + 1;
-            while end < len && map.get(base + end as u32).contains(Flags::FUNC_START) {
-                end += 1;
+        if map.get(base + index as u32).contains(Flags::FUNC_START) {
+            starts.push(base + index as u32);
+            while index < len && map.get(base + index as u32).contains(Flags::FUNC_START) {
+                index += 1;
             }
-            regions.push(FunctionRegion {
-                start: base + index as u32,
-                end: base + end as u32,
-                state,
-            });
-            index = end;
         } else {
             index += 1;
         }
+    }
+    // Each region runs from its start to the next function's start (or
+    // the image end): the bytes between belong to the function, so the
+    // lifter sees its whole body and every branch inside it stays
+    // in-region. The hybrid's region builder uses the same rule.
+    let mut regions = Vec::new();
+    for (position, &start) in starts.iter().enumerate() {
+        let end = starts
+            .get(position + 1)
+            .copied()
+            .unwrap_or(base + len as u32);
+        let state = if map.get(start).contains(Flags::THUMB) {
+            State::Thumb
+        } else {
+            State::Arm
+        };
+        regions.push(FunctionRegion { start, end, state });
     }
     regions
 }
@@ -2013,17 +2021,20 @@ mod tests {
             Flags::EXEC | Flags::FUNC_START | Flags::THUMB,
         );
         let regions = function_regions(&image, &map);
+        // Each region runs from its function's start to the next
+        // function's start (or the image end): the bytes between
+        // belong to the function, so the lifter sees its whole body.
         assert_eq!(
             regions,
             vec![
                 FunctionRegion {
                     start: base,
-                    end: base + 4,
+                    end: base + 8,
                     state: State::Arm
                 },
                 FunctionRegion {
                     start: base + 8,
-                    end: base + 12,
+                    end: base + 256,
                     state: State::Thumb
                 },
             ]
