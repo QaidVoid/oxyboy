@@ -11,11 +11,17 @@
 //! stdout: `pass`, `fail <test-number>`, or `timeout`. Diagnostics go
 //! to stderr; the validating script aggregates the tokens into the
 //! per-category pass-rate report.
+//!
+//! Suite ROMs always execute from the cart base. The suite's own tests
+//! assert cart-mirror semantics (code at `0x08xxxxxx` is readable at
+//! `0x0Axxxxxx`), which only hold when executing from `0x08000000`,
+//! so the [`ImageKind`] multiboot heuristic (ambiguous for small
+//! cart images, see `rom::image`) is deliberately ignored here.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use rom::{Image, ImageKind};
+use rom::Image;
 use runtime::ppu::{VISIBLE_LINES, WIDTH};
 use runtime::system::System;
 
@@ -54,10 +60,9 @@ pub fn run(args: SuiteTestArgs) -> i32 {
             return 1;
         }
     };
-    let mut system = match image.kind() {
-        ImageKind::Multiboot => System::with_multiboot(image.bytes().to_vec()),
-        ImageKind::Cart => System::new(image.bytes().to_vec(), CART_BASE),
-    };
+    // Cart base regardless of the classification: the suite asserts
+    // cart-mirror semantics, so it must run from 0x08000000.
+    let mut system = System::new(image.bytes().to_vec(), CART_BASE);
     for _ in 0..args.frames {
         system.step_frame();
     }

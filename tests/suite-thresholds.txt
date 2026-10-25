@@ -8,8 +8,8 @@
 # The interpreter models the hardware behavior instead.
 arm 223
 bios 0
-memory 6
-thumb 201
+memory 54
+thumb 233
 unsafe 1
 save_none 0
 save_sram 0

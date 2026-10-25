@@ -286,11 +286,13 @@ fn load_store_multiple_thumb() {
     assert_eq!(reg(&cpu, 0), 0x1234);
     assert_eq!(reg(&cpu, 1), 0x5678);
 
-    // Empty list: R15 stored (reads as $+4), base + 0x40.
+    // Empty list: R15 stored late (address+6, the block-transfer
+    // pipeline offset; the ARM-state equivalent stores address+12),
+    // base + 0x40.
     cpu.set_reg_for_test(1, area);
     let instr_addr = cpu.pc();
     run(&mut cpu, &mut bus, 1);
-    assert_eq!(bus.read_u32(area), instr_addr + 4);
+    assert_eq!(bus.read_u32(area), instr_addr + 6);
     assert_eq!(reg(&cpu, 1), area + 0x40);
 }
 

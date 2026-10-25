@@ -183,7 +183,7 @@ impl Cpu {
     /// caller picks the entry point (normally `0x08000000`).
     #[must_use]
     pub fn new(pc: u32) -> Self {
-        Cpu {
+        let mut cpu = Cpu {
             regs: [0; 16],
             r8_12_normal: [0; 5],
             r8_12_fiq: [0; 5],
@@ -197,7 +197,25 @@ impl Cpu {
             irq_line: false,
             irq_hle_saved: [[0; SAVED_IRQ_REGS]; IRQ_HLE_DEPTH],
             irq_hle_depth: 0,
-        }
+        };
+        cpu.init_stacks();
+        // The boot CPSR names a mode whose live r13/r14 sit in
+        // regs[13..15]; switch_mode only swaps them on a bank change,
+        // so the boot bank must be loaded here once.
+        let bank = bank_index(cpu.mode().bank());
+        cpu.regs[13..15].copy_from_slice(&cpu.sp[bank]);
+        cpu
+    }
+
+    /// Installs the stack pointers the BIOS sets up during boot
+    /// (GBATEK "GBA BIOS RAM Usage"): sp_usr/sys = 3007F00h,
+    /// sp_irq = 3007FA0h, sp_svc = 3007FE0h. The no-BIOS entry paths
+    /// (cart and multiboot boots) must reproduce the post-boot state;
+    /// ROMs without their own CRT0 read these directly.
+    fn init_stacks(&mut self) {
+        self.sp[bank_index(Bank::Irq)][0] = 0x0300_7FA0;
+        self.sp[bank_index(Bank::Svc)][0] = 0x0300_7FE0;
+        self.sp[bank_index(Bank::Usr)][0] = 0x0300_7F00;
     }
 
     /// The program counter: address of the instruction being executed.
@@ -331,9 +349,7 @@ impl Cpu {
         self.r8_12_fiq = [0; 5];
         self.sp = [[0; 2]; BANK_COUNT];
         self.spsr = [0; BANK_COUNT];
-        self.sp[bank_index(Bank::Irq)][0] = 0x0300_7FA0;
-        self.sp[bank_index(Bank::Svc)][0] = 0x0300_7FE0;
-        self.sp[bank_index(Bank::Usr)][0] = 0x0300_7F00;
+        self.init_stacks();
         self.switch_mode(Mode::System);
         self.cpsr |= 0x80;
         self.pc = if flag == 0 { 0x0800_0000 } else { 0x0200_0000 };
@@ -1950,20 +1966,31 @@ impl Cpu {
             }
             addr = addr.wrapping_add(4);
         }
+        let mut jumped = false;
         if empty {
             // ARMv4: R15 is transferred at the start address, reading
             // as $+4 like any THUMB operand; the base moves by 0x40.
             self.cycles += u64::from(bus.access_cost(addr, 4));
             if load {
                 self.pc = bus.read_u32(addr) & !1;
+                jumped = true;
             } else {
-                bus.write_u32(addr, self.pc.wrapping_add(4));
+                // The block transfer samples R15 late: the +4 operand
+                // read gains the 2-byte THUMB pipeline offset (the
+                // ARM-state equivalent stores address+12).
+                bus.write_u32(addr, self.pc.wrapping_add(6));
             }
         }
         let base_in_list = !empty && registers & (1 << u16::from(rb.bits())) != 0;
         if empty || !(load && base_in_list) {
             self.regs[rb.bits() as usize] = base.wrapping_add(total);
         }
-        Flow::Sequential
+        if jumped {
+            // The empty-list load acts as `ldr pc, [rb]`; the caller
+            // must not advance pc past the transferred target.
+            Flow::Handled
+        } else {
+            Flow::Sequential
+        }
     }
 }

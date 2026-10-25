@@ -451,10 +451,14 @@ impl Bus {
 
     /// Writes one byte.
     ///
-    /// 8-bit writes are accepted only on 8/32-bit-bus regions: palette,
-    /// VRAM, and OAM discard them (GBATEK bus-width table), BIOS and Game
-    /// Pak ROM have no write path, and IO byte writes go through the
-    /// containing halfword's register semantics.
+    /// 8-bit writes are accepted on 8/32-bit-bus regions. Palette and
+    /// VRAM have no 8-bit data lane, so the byte lands in both halves
+    /// of the containing halfword (GBATEK "VRAM": 8-bit writes "write
+    /// 8bit data to both upper and lower bytes"; the palette behaves
+    /// identically on its 16-bit bus, which the external memory suite
+    /// asserts). OAM discards byte stores (GBATEK bus-width table);
+    /// BIOS and Game Pak ROM have no write path, and IO byte writes go
+    /// through the containing halfword's register semantics.
     pub fn write_u8(&mut self, addr: u32, value: u8) {
         self.begin_capture(addr, 1, u32::from(value));
         let a = addr & 0x0FFF_FFFF;
@@ -469,6 +473,11 @@ impl Bus {
                 let i = (Self::vram_index(a) & !1) as usize;
                 self.vram[i] = value;
                 self.vram[i + 1] = value;
+            }
+            0x05 => {
+                let i = ((a & 0x0000_03FF) & !1) as usize;
+                self.palette[i] = value;
+                self.palette[i + 1] = value;
             }
             0x0E | 0x0F => self.save.write_u8((a & 0x0000_FFFF) as u16, value),
             _ => {}
@@ -1215,5 +1224,20 @@ mod tests {
         bus.set_io_log(false);
         bus.write_u16(0x0400_0000, 0);
         assert!(bus.take_io_log().is_empty(), "disarmed again");
+    }
+
+    #[test]
+    fn palette_byte_store_fills_the_halfword() {
+        let mut bus = Bus::new(vec![0; 256]);
+        bus.write_u8(0x0500_0021, 0x01);
+        assert_eq!(bus.read_u16(0x0500_0020), 0x0101);
+    }
+
+    #[test]
+    fn oam_byte_store_is_discarded() {
+        let mut bus = Bus::new(vec![0; 256]);
+        bus.write_u16(0x0700_0010, 0x1234);
+        bus.write_u8(0x0700_0010, 0xFF);
+        assert_eq!(bus.read_u16(0x0700_0010), 0x1234);
     }
 }

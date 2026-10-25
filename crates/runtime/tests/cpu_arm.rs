@@ -500,17 +500,19 @@ fn psr_transfers_between_modes() {
     run(&mut cpu, &mut bus, 5);
     assert_eq!(reg(&cpu, 1), 0x1100);
 
-    // FIQ has its own SP; the S-bit STM stores the USER sp instead.
+    // FIQ has its own SP; the S-bit STM stores the USER sp instead
+    // (the user bank's boot value, not FIQ's zeroed stack).
     run(&mut cpu, &mut bus, 5);
-    assert_eq!(reg(&cpu, 2), 0);
+    assert_eq!(reg(&cpu, 2), 0x0300_7F00);
 
     // IRQ banks SP too; returning to SVC restores 0x1100.
     run(&mut cpu, &mut bus, 4);
     assert_eq!(reg(&cpu, 3), 0x1100);
 
-    // Entering user mode: SP reads as the user bank (0).
+    // Entering user mode: SP reads as the user bank (the boot value,
+    // not the 0x1100 SVC stack stored above).
     run(&mut cpu, &mut bus, 2);
-    assert_eq!(reg(&cpu, 4), 0);
+    assert_eq!(reg(&cpu, 4), 0x0300_7F00);
 
     // Flag writes work in user mode; control writes do not.
     run(&mut cpu, &mut bus, 2);
@@ -533,7 +535,7 @@ fn psr_transfers_between_modes() {
     assert_eq!(cpu.cpsr(), 0x8000_0010);
     assert_eq!(cpu.pc(), 0x0800_0000 + (21 * 4) as u32);
     run(&mut cpu, &mut bus, 1);
-    assert_eq!(reg(&cpu, 7), 0);
+    assert_eq!(reg(&cpu, 7), 0x0300_7F00);
 }
 
 #[test]
