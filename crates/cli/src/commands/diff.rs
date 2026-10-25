@@ -9,7 +9,12 @@
 //! ends where the next function starts or at the image end). After
 //! every frame the runner compares registers, CPSR, EWRAM, IWRAM,
 //! palette, VRAM, the IO image, save media, and the rendered
-//! framebuffer; the first diverging frame ends the run.
+//! framebuffer. A translated unit overshooting the frame line parks
+//! the hybrid past the interpreter's stop point, so a frame-end
+//! mismatch is first resolved by a clock-parked catch-up walk to the
+//! hybrid's unit exit (see `catch_up_and_compare`); what stays
+//! different there is a real divergence, and the first such frame
+//! ends the run.
 //!
 //! On a mismatch the runner re-executes both paths up to the diverging
 //! frame with execution recording and runs the trace diff over
@@ -220,6 +225,52 @@ fn first_difference(a: &[Slice], b: &[Slice]) -> Option<String> {
     None
 }
 
+/// Bound on the catch-up walk that resolves a frame-line overshoot.
+const CATCHUP_LIMIT: u32 = 1 << 20;
+
+/// Resolves one frame-end mismatch by catch-up: a translated unit
+/// that overshoots the frame line parks the hybrid at the unit's exit
+/// point (a backward edge or call), a few instructions past the
+/// interpreter's stop. Walks the interpreter to that parked
+/// checkpoint with the video clock parked ([`System::step_deferred`]),
+/// replays the deferred cycles, and compares the full state there.
+///
+/// Both engines charge the same cycles per instruction, so the walk
+/// is bounded by one unit iteration; a pc that matches with different
+/// registers is the paths splitting, not an overshoot. Errors carry
+/// the reason the states could not be reconciled.
+fn catch_up_and_compare(interpreted: &mut System, hybrid: &System) -> Result<(), String> {
+    let parked = cpu_checkpoint(hybrid);
+    let mut deferred: u32 = 0;
+    let outcome = loop {
+        let here = cpu_checkpoint(interpreted);
+        if here == parked {
+            break Ok(());
+        }
+        if here[CKPT_PC] == parked[CKPT_PC] {
+            break Err(format!("; paths split at pc {:#010x}", parked[CKPT_PC]));
+        }
+        if interpreted.cpu.is_halted() {
+            break Err("; cpu halted during catch-up".to_string());
+        }
+        if deferred >= CATCHUP_LIMIT {
+            break Err(format!("; no resync within {CATCHUP_LIMIT} cycles"));
+        }
+        deferred = deferred.saturating_add(interpreted.step_deferred());
+    };
+    interpreted.advance_clock(deferred);
+    outcome?;
+    let a = snapshot(interpreted);
+    let b = snapshot(hybrid);
+    match first_difference(&a, &b) {
+        None => Ok(()),
+        Some(d) => Err(format!(
+            "; resynced at pc {:#010x} but {d}",
+            interpreted.cpu.pc()
+        )),
+    }
+}
+
 /// Runs `oxyboy diff` and returns the process exit code: 0 on match,
 /// 1 on mismatch or infrastructure failure.
 pub fn run(args: DiffArgs) -> i32 {
@@ -258,8 +309,16 @@ pub fn run(args: DiffArgs) -> i32 {
         let a = snapshot(&interpreted);
         let b = snapshot(&hybrid);
         if let Some(d) = first_difference(&a, &b) {
-            diverged = Some((frame, d));
-            break;
+            // A translated unit can overshoot the frame line (the
+            // driver's cycle budget exits it at the next backward edge
+            // or call), parking the hybrid a few instructions past the
+            // interpreter's stop point. Catch the interpreter up with
+            // the video clock parked and compare at that point; only a
+            // failed catch-up is a real divergence.
+            if let Err(extra) = catch_up_and_compare(&mut interpreted, &hybrid) {
+                diverged = Some((frame, format!("{d}{extra}")));
+                break;
+            }
         }
     }
     match diverged {

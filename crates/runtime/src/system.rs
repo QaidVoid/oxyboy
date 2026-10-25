@@ -130,6 +130,22 @@ impl System {
         self.cpu.set_irq_line(pending);
     }
 
+    /// Runs one CPU instruction while parking the video clock,
+    /// timers, and APU, returning the deferred cycle count. The caller
+    /// replays it through [`System::advance_clock`] once the parked
+    /// window ends. DMA requests armed during the deferred step stay
+    /// armed until that replay, and the CPU IRQ input line is not
+    /// refreshed inside the window.
+    ///
+    /// The diff harness's catch-up mode: a translated chunk that
+    /// overshoots the frame line parks the hybrid at the chunk's exit
+    /// point a few instructions past where the interpreter stopped;
+    /// the interpreter walks there with the clock parked so both
+    /// engines compare at one architectural point.
+    pub fn step_deferred(&mut self) -> u32 {
+        self.cpu.step(&mut self.bus)
+    }
+
     /// Runs one step and records what it did as a
     /// [`trace::Record`]: the PC after the instruction, the Thumb and
     /// halted state bits, the register writes (indices 0-14; R15 is
