@@ -5,7 +5,7 @@
 //! optimization pipeline; by default only the final IR prints,
 //! `--print-after-all` adds a dump after every pass.
 
-use analysis::{FlagMap, Thresholds, analyze};
+use analysis::{FlagMap, Seed, Thresholds, analyze};
 use ir::opt;
 use ir::print::fmt_function;
 
@@ -21,14 +21,10 @@ pub fn run(args: LiftArgs) -> i32 {
         }
     };
     let mut map = FlagMap::from_image(&image);
-    let mut seeds = map.seed(&[]);
     let (config, annotations) = match &args.config {
         Some(path) => match analysis::config::Config::load(path) {
             Ok(config) => {
                 let annotations = ir::emit_c::Annotations::from_config(&config);
-                for spec in &config.functions {
-                    seeds.push(spec.to_seed());
-                }
                 (Some(config), annotations)
             }
             Err(e) => {
@@ -38,6 +34,13 @@ pub fn run(args: LiftArgs) -> i32 {
         },
         None => (None, ir::emit_c::Annotations::default()),
     };
+    // Config-declared functions are user assertions: seed and mark
+    // them so `function_regions` lifts them even when discovery never
+    // walks a call to them.
+    let config_seeds: Vec<Seed> = config.as_ref().map_or(Vec::new(), |c| {
+        c.functions.iter().map(|f| f.to_seed()).collect()
+    });
+    let seeds = map.seed(&config_seeds);
     let tables = config.as_ref().map_or(Vec::new(), |c| c.tables.clone());
     let analysis = analyze(
         &image,
@@ -89,9 +92,6 @@ pub fn run(args: LiftArgs) -> i32 {
             ir::emit_c::emit_unit(&addrs, &functions, &annotations)
         );
     } else {
-        for function in &functions {
-            dumped.push_str(&fmt_function(function));
-        }
         print!("{dumped}");
     }
     0

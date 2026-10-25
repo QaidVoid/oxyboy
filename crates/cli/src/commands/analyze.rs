@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use analysis::{FlagMap, Thresholds, analyze};
+use analysis::{FlagMap, Seed, Thresholds, analyze};
 use rom::Image;
 use serde::Serialize;
 
@@ -28,10 +28,10 @@ pub fn run(args: AnalyzeArgs) -> i32 {
         None => analysis::config::Config::default(),
     };
     let mut map = FlagMap::from_image(&image);
-    let mut seeds = map.seed(&[]);
-    for spec in &config.functions {
-        seeds.push(spec.to_seed());
-    }
+    // Config-declared functions are user assertions: seed and mark
+    // them (see lift.rs).
+    let config_seeds: Vec<Seed> = config.functions.iter().map(|spec| spec.to_seed()).collect();
+    let seeds = map.seed(&config_seeds);
     let analysis = analyze(
         &image,
         &mut map,
