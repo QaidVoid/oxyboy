@@ -290,14 +290,19 @@ fn substitute_term(term: &mut Terminator, subs: &[(ValueId, u32)]) {
             else_args,
             ..
         } => vec![then_args, else_args],
-        Terminator::Call {
-            cont: Some((_, args)),
-            state,
-            ..
-        } => vec![args, state],
+        Terminator::Call { cont, state, .. } => {
+            // A cont-free call is an exit: its state list is the
+            // outgoing machine state and must see folded constants
+            // just like the cont-bearing form.
+            let mut lists = vec![state];
+            if let Some((_, args)) = cont {
+                lists.push(args);
+            }
+            lists
+        }
         Terminator::Return { state, .. } => vec![state],
         Terminator::IndirectExit { state, .. } => vec![state],
-        _ => vec![],
+        Terminator::Unreachable => Vec::new(),
     };
     for list in lists {
         for value in list.iter_mut() {
@@ -997,6 +1002,53 @@ mod tests {
     use super::*;
     use crate::lift::{FunctionRegion, lift_function};
     use analysis::{FlagMap, Flags, State};
+
+    /// A folded `mov r0, #7` must reach a cont-free call's exit state
+    /// as the constant; leaving the dest id there binds a local no
+    /// instruction defines (zero) at the park flush.
+    #[test]
+    fn folded_constants_reach_the_call_exit_state() {
+        let mut function = Function {
+            name: "f".to_string(),
+            thumb: false,
+            blocks: vec![Block {
+                addr: 0x0800_0100,
+                params: (0..20).map(ValueId).collect(),
+                insts: vec![Inst {
+                    guard: None,
+                    dests: vec![ValueId(20)],
+                    fallbacks: Vec::new(),
+                    op: Op::Mov {
+                        set_flags: false,
+                        a: Value::Const(7),
+                        carry_in: Value::Const(0),
+                    },
+                    pc: 0x0800_0100,
+                    state: Vec::new(),
+                }],
+                cycles: Vec::new(),
+                term: Terminator::Call {
+                    target: Value::Const(0x0800_0200),
+                    cont: None,
+                    state: (0..20)
+                        .map(|slot| {
+                            if slot == 0 {
+                                Value::Id(ValueId(20))
+                            } else {
+                                Value::Id(ValueId(slot))
+                            }
+                        })
+                        .collect(),
+                },
+            }],
+        };
+        constant_propagation(&mut function);
+        assert!(function.blocks[0].insts.is_empty(), "the mov folds away");
+        let Terminator::Call { state, .. } = &function.blocks[0].term else {
+            panic!("the call stays");
+        };
+        assert_eq!(state[0], Value::Const(7), "r0 exits as the constant");
+    }
 
     /// Lifts `words` as one ARM region from the canonical base.
     fn lift_arm(words: &[u32]) -> Function {
