@@ -39,6 +39,10 @@ pub struct RunArgs {
     #[arg(long)]
     pub headless: bool,
 
+    /// Window upscale factor (nearest-neighbor, 1 to 8).
+    #[arg(long, value_name = "N", default_value_t = 3, value_parser = clap::value_parser!(u32).range(1..=8))]
+    pub scale: u32,
+
     /// Number of frames to run in headless mode.
     #[arg(long, value_name = "N", default_value_t = 1)]
     pub frames: u32,
@@ -128,7 +132,7 @@ pub fn run(args: RunArgs) -> i32 {
     } else if args.trace.is_some() || args.io_log.is_some() {
         eprintln!("oxyboy run: --trace and --io-log require --headless");
         return 1;
-    } else if let Err(code) = run_windowed(&mut system) {
+    } else if let Err(code) = run_windowed(&mut system, args.scale) {
         eprintln!("oxyboy run: {code}");
         return 1;
     }
@@ -212,29 +216,78 @@ fn run_traced(system: &mut System, path: &Path, frames: u32) -> Result<(), Strin
 
 /// Presents frames in a window until it closes or Escape is pressed.
 ///
+/// The frame is scaled by whole-pixel replication and the host keyboard
+/// drives the keypad.
+///
 /// # Errors
 ///
 /// Returns a printable message when the window cannot open or a
 /// buffer presentation fails.
-fn run_windowed(system: &mut System) -> Result<(), String> {
+fn run_windowed(system: &mut System, scale: u32) -> Result<(), String> {
     use minifb::{Key, Window, WindowOptions};
 
-    let mut window = Window::new("oxyboy", WIDTH, VISIBLE_LINES, WindowOptions::default())
+    let scale = scale as usize;
+    let width = WIDTH * scale;
+    let height = VISIBLE_LINES * scale;
+    println!("controls: arrows d-pad, X A, Z B, Enter start, Backspace select, A L, S R, Esc quit");
+    let mut window = Window::new("oxyboy", width, height, WindowOptions::default())
         .map_err(|e| format!("cannot open window: {e}"))?;
-    let mut buffer = vec![0u32; WIDTH * VISIBLE_LINES];
     while window.is_open() && !window.is_key_down(Key::Escape) {
+        apply_keypad(system, &window);
         system.step_frame();
-        for (dst, px) in buffer
-            .iter_mut()
-            .zip(system.framebuffer().as_chunks::<4>().0)
-        {
-            *dst = u32::from_be_bytes([0xFF, px[0], px[1], px[2]]);
-        }
+        let buffer = scale_frame(system.framebuffer(), scale);
         window
-            .update_with_buffer(&buffer, WIDTH, VISIBLE_LINES)
+            .update_with_buffer(&buffer, width, height)
             .map_err(|e| format!("present failed: {e}"))?;
     }
     Ok(())
+}
+
+/// Expands a framebuffer into a `scale`-times larger 0xRGB pixel buffer
+/// by nearest-neighbor replication.
+fn scale_frame(frame: &[u8], scale: usize) -> Vec<u32> {
+    let row = WIDTH * scale;
+    let mut buffer = vec![0u32; row * VISIBLE_LINES * scale];
+    let pixels = frame.as_chunks::<4>().0;
+    for y in 0..VISIBLE_LINES {
+        let base = y * scale * row;
+        let src_row = &pixels[y * WIDTH..(y + 1) * WIDTH];
+        for (x, px) in src_row.iter().enumerate() {
+            let word = u32::from_be_bytes([0xFF, px[0], px[1], px[2]]);
+            let start = base + x * scale;
+            buffer[start..start + scale].fill(word);
+        }
+        for dup in 1..scale {
+            buffer.copy_within(base..base + row, base + dup * row);
+        }
+    }
+    buffer
+}
+
+/// Translates held host keys into the keypad image on the bus.
+fn apply_keypad(system: &mut System, window: &minifb::Window) {
+    use minifb::Key;
+    use runtime::input::Key as Button;
+
+    const MAP: [(Key, Button); 10] = [
+        (Key::X, Button::A),
+        (Key::Z, Button::B),
+        (Key::Enter, Button::Start),
+        (Key::Backspace, Button::Select),
+        (Key::Up, Button::Up),
+        (Key::Down, Button::Down),
+        (Key::Left, Button::Left),
+        (Key::Right, Button::Right),
+        (Key::A, Button::L),
+        (Key::S, Button::R),
+    ];
+    for (host, button) in MAP {
+        if window.is_key_down(host) {
+            system.bus_mut().press(button);
+        } else {
+            system.bus_mut().release(button);
+        }
+    }
 }
 
 /// Resolves the save file path: `<save-dir>/<game code>.sav`.
@@ -303,4 +356,50 @@ fn dump_png(path: &Path, frame: &[u8]) -> Result<(), Box<dyn std::error::Error>>
     png_writer.write_image_data(frame)?;
     png_writer.finish()?;
     Ok(())
+}
+#[cfg(test)]
+mod tests {
+    use super::{VISIBLE_LINES, WIDTH, scale_frame};
+
+    /// A frame whose pixel (x, y) encodes as 0x00RRGGBB from its coordinates.
+    fn gradient_frame() -> Vec<u8> {
+        let mut frame = vec![0u8; WIDTH * VISIBLE_LINES * 4];
+        for (i, px) in frame.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            let (x, y) = (i % WIDTH, i / WIDTH);
+            *px = [0x00, (x % 256) as u8, (y % 256) as u8, 0x00];
+        }
+        frame
+    }
+
+    #[test]
+    fn scale_one_is_the_identity() {
+        let frame = gradient_frame();
+        let out = scale_frame(&frame, 1);
+        assert_eq!(out.len(), WIDTH * VISIBLE_LINES);
+        for (i, word) in out.iter().enumerate() {
+            let (x, y) = (i % WIDTH, i / WIDTH);
+            assert_eq!(
+                *word,
+                0xFF00_0000 | u32::from((x % 256) as u8) << 8 | u32::from((y % 256) as u8)
+            );
+        }
+    }
+
+    #[test]
+    fn scale_three_replicates_blocks_and_rows() {
+        let frame = gradient_frame();
+        let out = scale_frame(&frame, 3);
+        let row = WIDTH * 3;
+        assert_eq!(out.len(), row * VISIBLE_LINES * 3);
+        let at = |x: usize, y: usize| out[y * row + x];
+        for (x, y) in [(0usize, 0usize), (6, 3), (239 * 3, 159 * 3)] {
+            let expected =
+                0xFF00_0000 | u32::from((x / 3 % 256) as u8) << 8 | u32::from((y / 3) as u8);
+            assert_eq!(at(x, y), expected, "block ({x},{y})");
+            assert_eq!(at(x + 2, y + 2), expected, "block tail ({x},{y})");
+        }
+        for dup in 1..3 {
+            assert_eq!(out[..row], out[dup * row..(dup + 1) * row], "row {dup}");
+        }
+    }
 }

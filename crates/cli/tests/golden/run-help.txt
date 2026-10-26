@@ -6,6 +6,7 @@ Options:
   -r, --rom <FILE>         Path to the .gba ROM image
   -v, --verbose...         Increase logging verbosity; repeat for more detail
       --headless           Run without a window for exactly `--frames` frames
+      --scale <N>          Window upscale factor (nearest-neighbor, 1 to 8) [default: 3]
       --frames <N>         Number of frames to run in headless mode [default: 1]
       --dump-frame <FILE>  Write the final rendered frame to this PNG path
       --save-dir <DIR>     Directory for save files. The default is the user data dir (never inside the repository)
