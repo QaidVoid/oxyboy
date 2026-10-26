@@ -78,8 +78,8 @@
       "hash": "447c4179a2c767fb"
     },
     {
-      "name": "emerald",
-      "rom": "corpus/Pokemon - Emerald Version (USA, Europe).gba",
+      "name": "cart",
+      "rom": "corpus/cart.gba",
       "frames": 120,
       "budget_ms": 80,
       "hash": "ea00149a2933bc67"

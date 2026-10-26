@@ -1759,7 +1759,7 @@ mod tests {
 
     #[test]
     fn while_loop_with_conditional_latch() {
-        // The Emerald memcpy shape: the header tests entry, the latch
+        // The test-cart memcpy shape: the header tests entry, the latch
         // has one arm back to the header and one out through the same
         // exit. b0 entry; b1 header; b2 body; b3 latch; b4 exit.
         let text = emitted(vec![
