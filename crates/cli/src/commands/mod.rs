@@ -1,6 +1,7 @@
 //! Subcommand implementations.
 
 pub mod analyze;
+pub mod audio;
 pub mod corpus;
 pub mod debug;
 pub mod diff;

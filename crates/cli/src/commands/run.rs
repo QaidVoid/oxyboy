@@ -235,9 +235,20 @@ fn run_windowed(system: &mut System, scale: u32) -> Result<(), String> {
     let mut window = Window::new("oxyboy", width, height, WindowOptions::default())
         .map_err(|e| format!("cannot open window: {e}"))?;
     window.set_target_fps(60);
+    let mut audio = match super::audio::start() {
+        Ok(output) => Some(output),
+        Err(e) => {
+            eprintln!("oxyboy run: audio disabled ({e})");
+            None
+        }
+    };
     while window.is_open() {
         apply_keypad(system, &window);
         system.step_frame();
+        let samples = system.take_audio();
+        if let Some(output) = &mut audio {
+            output.push(&samples);
+        }
         let buffer = scale_frame(system.framebuffer(), scale);
         window
             .update_with_buffer(&buffer, width, height)
