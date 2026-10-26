@@ -4,8 +4,8 @@
 //! the runtime. Headless mode runs a fixed number of frames and can dump
 //! the final frame as a PNG; this is the mode tests and scripting use.
 //! Without `--headless` a minifb window presents each rendered frame
-//! until the window closes or Escape is pressed (manual verification
-//! only; not test-gated).
+//! at 60 fps until the window closes (manual verification only; not
+//! test-gated).
 //!
 //! The machine boots directly at 0x08000000 with no BIOS reset, the
 //! documented boot decision. Standard crt0 places
@@ -214,7 +214,7 @@ fn run_traced(system: &mut System, path: &Path, frames: u32) -> Result<(), Strin
     Ok(())
 }
 
-/// Presents frames in a window until it closes or Escape is pressed.
+/// Presents frames in a window at 60 fps until it closes.
 ///
 /// The frame is scaled by whole-pixel replication and the host keyboard
 /// drives the keypad.
@@ -224,15 +224,18 @@ fn run_traced(system: &mut System, path: &Path, frames: u32) -> Result<(), Strin
 /// Returns a printable message when the window cannot open or a
 /// buffer presentation fails.
 fn run_windowed(system: &mut System, scale: u32) -> Result<(), String> {
-    use minifb::{Key, Window, WindowOptions};
+    use minifb::{Window, WindowOptions};
 
     let scale = scale as usize;
     let width = WIDTH * scale;
     let height = VISIBLE_LINES * scale;
-    println!("controls: arrows d-pad, X A, Z B, Enter start, Backspace select, A L, S R, Esc quit");
+    println!(
+        "controls: arrows d-pad, X A (confirm), Z B (back), Enter start, Backspace select, A L, S R; close the window to quit"
+    );
     let mut window = Window::new("oxyboy", width, height, WindowOptions::default())
         .map_err(|e| format!("cannot open window: {e}"))?;
-    while window.is_open() && !window.is_key_down(Key::Escape) {
+    window.set_target_fps(60);
+    while window.is_open() {
         apply_keypad(system, &window);
         system.step_frame();
         let buffer = scale_frame(system.framebuffer(), scale);
