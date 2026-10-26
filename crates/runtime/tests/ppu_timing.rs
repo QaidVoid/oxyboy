@@ -2,7 +2,7 @@
 //! clock is deterministic, so "within documented tolerance" here means
 //! exact: the H-Blank flag rises at cycle 1006 of every line (GBATEK
 //! DISPSTAT: the flag is low for 1006 cycles, high for the remaining
-//! 530 of the 1232-cycle line), VCOUNT/V-Blank flags update at line
+//! 226 of the 1232-cycle line), VCOUNT/V-Blank flags update at line
 //! boundaries, and each rising flag edge raises its IF bit once when
 //! the matching DISPSTAT enable is set (GBATEK "LCD I/O Registers",
 //! "DISPSTAT", "Interrupt Control").

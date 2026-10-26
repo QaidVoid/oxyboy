@@ -2,8 +2,9 @@
 //! master volume/enable coverage.
 //!
 //! Each scenario writes the sound registers on a bare bus, steps the
-//! APU a frame at a time (350,208 cycles = exactly 684 stereo samples
-//! at 32768 Hz), and drains the mix-down per frame. Golden files hold
+//! APU a frame at a time (280,896 cycles = 548 stereo samples at
+//! 32768 Hz, the fractional remainder carried), and drains the
+//! mix-down per frame. Golden files hold
 //! one labeled section per frame: 8 stereo cells per row, each cell
 //! `llllrrrr` in hex. Regenerate with `OXYBOY_UPDATE_GOLDEN=1 cargo
 //! test`. Register addresses and bit layouts follow GBATEK "GBA Sound
@@ -16,8 +17,9 @@ use testutil::golden;
 
 const BASE: u32 = 0x0400_0000;
 const CYCLES_PER_FRAME: u32 = CYCLES_PER_LINE * LINES_PER_FRAME as u32;
-/// Stereo sample pairs per frame (350,208 / 512).
-const SAMPLES_PER_FRAME: usize = 684;
+/// Stereo sample pairs per frame (280,896 / 512 = 548.625; the
+/// fractional part carries across frames via the APU remainder).
+const SAMPLES_PER_FRAME: usize = 548;
 
 /// Bus with the PSG master on, full volumes, 100 percent master level,
 /// and all four channels routed to both sides.
@@ -56,7 +58,11 @@ fn capture(bus: &mut Bus, frames: usize) -> Vec<i16> {
 fn render(sections: &[(String, Vec<i16>)]) -> String {
     let mut out = String::new();
     for (name, samples) in sections {
-        assert_eq!(samples.len(), SAMPLES_PER_FRAME * 2, "{name}");
+        let pairs = samples.len() / 2;
+        assert!(
+            pairs == SAMPLES_PER_FRAME || pairs == SAMPLES_PER_FRAME + 1,
+            "{name}: {pairs} pairs"
+        );
         out.push_str(name);
         out.push('\n');
         for chunk in samples.chunks(16) {
@@ -214,7 +220,7 @@ fn mix_routing_master_volume_and_enable() {
 }
 
 #[test]
-fn system_frame_mixdown_is_684_silent_samples() {
+fn system_frame_mixdown_is_548_silent_samples() {
     let mut system = System::new(vec![0xFE, 0xFF, 0xFF, 0xEA], 0x0800_0000);
     system.step_frame();
     let audio = system.take_audio();

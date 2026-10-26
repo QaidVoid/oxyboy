@@ -9,7 +9,7 @@
 //! Channels"; these tests need no assembler-built ROMs.
 
 use runtime::bus::Bus;
-use runtime::ppu::Ppu;
+use runtime::ppu::{CYCLES_PER_LINE, Ppu};
 use runtime::system::System;
 
 /// Channel N register base (`0x040000B0 + 12*N`).
@@ -217,12 +217,12 @@ fn vblank_dma_fires_exactly_at_the_vblank_flag_edge() {
     bus.write_u16(ch(0) + CNT_H, cnt_h(0b00, 0b00, 0b01, 0));
 
     // Line 100 of 160: the V-Blank flag has not risen yet.
-    ppu.step(&mut bus, 100 * 1536);
+    ppu.step(&mut bus, 100 * CYCLES_PER_LINE);
     assert_eq!(bus.dispstat() & 0x0001, 0);
     assert_eq!(bus.read_u16(DST), 0, "V-Blank DMA must not run early");
 
     // Crossing into line 160 raises the flag and runs the channel.
-    ppu.step(&mut bus, 60 * 1536);
+    ppu.step(&mut bus, 60 * CYCLES_PER_LINE);
     assert_eq!(bus.dispstat() & 0x0001, 0x0001);
     assert_eq!(bus.read_u16(DST), 0x0C0C);
     // Non-repeat: the channel is spent.
@@ -230,7 +230,7 @@ fn vblank_dma_fires_exactly_at_the_vblank_flag_edge() {
 
     // Later V-Blank lines are level, not edges: no second run.
     bus.write_u16(DST, 0);
-    ppu.step(&mut bus, 10 * 1536);
+    ppu.step(&mut bus, 10 * CYCLES_PER_LINE);
     assert_eq!(bus.read_u16(DST), 0);
 }
 
@@ -247,7 +247,8 @@ fn hblank_dma_fires_between_hdraw_and_hblank_flags() {
     bus.write_u16(ch(1) + CNT_H, cnt_h(0b10, 0b10, 0b10, 0x0010));
 
     // Dot 1005 of line 0: HDraw still holds (the flag rises at dot
-    // 1006, GBATEK H-Blank length 304 of 1232 draw cycles).
+    // 1006, GBATEK DISPSTAT: the flag is low for 1006 of the line's
+    // 1232 cycles).
     ppu.step(&mut bus, 1005);
     assert_eq!(bus.dispstat() & 0x0002, 0);
     assert_eq!(bus.read_u16(DST), 0, "H-Blank DMA must not run in HDraw");
@@ -261,7 +262,7 @@ fn hblank_dma_fires_between_hdraw_and_hblank_flags() {
 
     // The next line's H-Blank edge re-triggers and re-latches count.
     bus.write_u16(DST, 0);
-    ppu.step(&mut bus, 1536);
+    ppu.step(&mut bus, CYCLES_PER_LINE);
     assert_eq!(bus.read_u16(DST), 0x0D0D);
 }
 
@@ -276,7 +277,7 @@ fn repeat_with_inc_reload_restores_the_destination_each_frame() {
     // inc (the latched source advances across frames).
     bus.write_u16(ch(0) + CNT_H, cnt_h(0b11, 0b00, 0b01, 0x0010));
     fill_halfwords(&mut bus, SRC, 2, 0x0100);
-    ppu.step(&mut bus, 161 * 1536);
+    ppu.step(&mut bus, 161 * CYCLES_PER_LINE);
     assert_eq!(bus.read_u16(DST), 0x0100);
     assert_eq!(bus.read_u16(DST + 2), 0x0101);
 
@@ -284,7 +285,7 @@ fn repeat_with_inc_reload_restores_the_destination_each_frame() {
     // sits (src inc continues); the next frame's V-Blank re-copies to
     // the reloaded destination, not from DST + 4.
     fill_halfwords(&mut bus, SRC + 4, 2, 0x0200);
-    ppu.step(&mut bus, 228 * 1536);
+    ppu.step(&mut bus, 228 * CYCLES_PER_LINE);
     assert_eq!(bus.read_u16(DST), 0x0200, "destination reloaded");
     assert_eq!(bus.read_u16(DST + 2), 0x0201);
     assert_eq!(bus.read_u16(DST + 4), 0, "no third slot was touched");
@@ -321,6 +322,6 @@ fn special_timing_ignores_immediate_and_flag_edges() {
     bus.write_u32(ch(1) + DAD, 0x0400_00A0);
     bus.write_u16(ch(1) + CNT_L, 4);
     bus.write_u16(ch(1) + CNT_H, cnt_h(0b11, 0b00, 0b11, 0));
-    ppu.step(&mut bus, 228 * 1536);
+    ppu.step(&mut bus, 228 * CYCLES_PER_LINE);
     assert_eq!(bus.read_u32(0x0400_00A0), 0);
 }

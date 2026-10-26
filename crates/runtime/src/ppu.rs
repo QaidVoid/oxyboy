@@ -26,12 +26,12 @@ pub const VISIBLE_LINES: usize = 160;
 /// Total scanlines per frame including V-Blank.
 pub const LINES_PER_FRAME: usize = 228;
 /// System cycles per scanline (GBATEK "LCD Dimensions and Timings":
-/// 1232 draw + 304 blank).
-pub const CYCLES_PER_LINE: u32 = 1536;
+/// 308 dots per line at 4 cycles per dot = 1232 cycles, 228 lines =
+/// 280896 cycles per frame at 59.737 Hz).
+pub const CYCLES_PER_LINE: u32 = 1232;
 /// System cycles from line start until the H-Blank flag rises. GBATEK
 /// DISPSTAT note: "the H-Blank flag is '0' for a total of 1006 cycles",
-/// so the flag is high for the remaining 530 cycles of every line; the
-/// cruder 1232/304 split would put the flag edge 226 cycles late.
+/// so the flag is high for the remaining 226 cycles of every line.
 pub const HBLANK_FLAG_START: u32 = 1006;
 
 /// One RGBA8888 frame, row-major, `WIDTH * VISIBLE_LINES * 4` bytes.
@@ -39,7 +39,7 @@ pub type Frame = Box<[u8]>;
 
 /// Video state: scanline/dot position plus the output framebuffer.
 pub struct Ppu {
-    /// System cycles elapsed in the current scanline (0..1536).
+    /// System cycles elapsed in the current scanline (0..1232).
     dot: u32,
     /// Current scanline (0..=227).
     line: u16,

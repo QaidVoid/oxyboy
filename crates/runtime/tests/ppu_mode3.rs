@@ -186,7 +186,7 @@ fn thumb_system(rom: Vec<u8>) -> System {
 fn step_frame_advances_vcount_through_all_lines() {
     // ARM state on purpose: `b .` then has one stable cost per step
     // (two 16-bit ROM lanes), so the CPU-driven frame lands exactly on
-    // the PPU wrap at 228 * 1536 cycles.
+    // the PPU wrap at 228 * 1232 cycles.
     let mut system = System::new(idle_rom(), 0x0800_0000);
     system.cpu.set_cpsr_raw(0x13);
     let mut seen: HashSet<u16> = HashSet::new();
@@ -209,7 +209,7 @@ fn step_frame_advances_vcount_through_all_lines() {
         if (dispstat & 0x0001 != 0) != (160..=226).contains(&vc) {
             vblank_window_held = false;
         }
-        assert!(total_cycles < 10 * 350_208, "frame never ended");
+        assert!(total_cycles < 10 * 280_896, "frame never ended");
         if max_seen >= 227 && vc == 0 {
             break;
         }
@@ -220,7 +220,7 @@ fn step_frame_advances_vcount_through_all_lines() {
     assert!(saw_vblank);
     assert!(saw_hblank_set && saw_hblank_clear);
     assert!(vblank_window_held);
-    // A full frame is exactly 228 scanlines of 1536 cycles.
+    // A full frame is exactly 228 scanlines of 1232 cycles.
     assert_eq!(
         total_cycles,
         u64::from(LINES_PER_FRAME as u32 * CYCLES_PER_LINE)

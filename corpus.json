@@ -40,14 +40,14 @@
       "rom": "target/test-roms/irqtest.gba",
       "frames": 60,
       "budget_ms": 20,
-      "hash": "1a78d64d20076c23"
+      "hash": "61e13ea489404e03"
     },
     {
       "name": "mb-thumbptr",
       "rom": "target/test-roms/mb-thumbptr.gba",
       "frames": 60,
       "budget_ms": 60,
-      "hash": "8e158e0a19789fc5"
+      "hash": "8bc012bfa82e7350"
     },
     {
       "name": "mode3",
@@ -82,7 +82,7 @@
       "rom": "corpus/cart.gba",
       "frames": 120,
       "budget_ms": 80,
-      "hash": "ea00149a2933bc67"
+      "hash": "ed74543889358afb"
     }
   ]
 }

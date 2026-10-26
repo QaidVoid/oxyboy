@@ -16,8 +16,10 @@ use testutil::golden;
 
 const BASE: u32 = 0x0400_0000;
 const IWRAM: u32 = 0x0300_0000;
-/// Stereo sample pairs per frame (350,208 / 512).
-const SAMPLES_PER_FRAME: usize = 684;
+/// Stereo sample pairs per frame (280,896 / 512 = 548.625, so a
+/// whole-frame drain yields 548 or 549 pairs; 4389 pairs per 8
+/// frames). This test's slot capture rounds down to whole slots.
+const SAMPLES_PER_FRAME: usize = 548;
 /// Timer reload for one overflow per 512-cycle sample slot: 0x10000
 /// minus 512, i.e. 32768 Hz, the SOUNDBIAS default resolution.
 const TIMER_RELOAD: u16 = 0xFE00;
@@ -30,7 +32,7 @@ fn sample_slot(bus: &mut Bus) {
     bus.step_apu(512);
 }
 
-/// Captures one frame (684 latched stereo pairs).
+/// Captures one frame (548 latched stereo pairs).
 fn capture(bus: &mut Bus) -> Vec<i16> {
     let mut out = Vec::with_capacity(SAMPLES_PER_FRAME * 2);
     for _ in 0..SAMPLES_PER_FRAME {
