@@ -74,21 +74,46 @@ struct Region {
 }
 
 /// Runs the analysis over `image` and turns the accepted functions
-/// into lifted, compiled translated regions.
+/// into lifted, compiled translated regions. `config` seeds extra
+/// function starts and tables (user-asserted functions discovery
+/// never walks to).
 ///
 /// # Errors
 ///
 /// Returns a printable message when no host C compiler exists or the
 /// module fails to compile.
-pub fn build_hybrid(image: &Image, tag: &str) -> Result<Driver, String> {
+pub(crate) fn build_hybrid(
+    image: &Image,
+    tag: &str,
+    config: Option<&analysis::config::Config>,
+) -> Result<Driver, String> {
     let mut map = FlagMap::from_image(image);
     let base = map.canonical().base();
     let entry = Seed {
         addr: base,
         state: State::Arm,
     };
-    let seeds = [entry];
-    let analysis = analyze(image, &mut map, &seeds, &seeds, Thresholds::default(), &[]);
+    let mut seed_list = vec![entry];
+    let tables = match config {
+        Some(config) => {
+            seed_list.extend(config.functions.iter().map(|f| f.to_seed()));
+            config.tables.clone()
+        }
+        None => Vec::new(),
+    };
+    let seeds = if config.is_some() {
+        map.seed(&seed_list)
+    } else {
+        seed_list
+    };
+    let analysis = analyze(
+        image,
+        &mut map,
+        &seeds,
+        &seeds,
+        Thresholds::default(),
+        &tables,
+    );
     let mut starts: Vec<_> = analysis
         .discovery
         .functions
@@ -289,7 +314,7 @@ pub fn run(args: DiffArgs) -> i32 {
             .unwrap_or("diff")
             .to_string()
     });
-    let mut driver = match build_hybrid(&image, &tag) {
+    let mut driver = match build_hybrid(&image, &tag, None) {
         Ok(driver) => driver,
         Err(e) => {
             eprintln!("oxyboy diff: hybrid build failed: {e}");
@@ -384,7 +409,7 @@ fn fmt_checkpoint(c: &Checkpoint) -> String {
 ///
 /// Propagates native-call failures from the hybrid driver.
 fn meeting_point(image: &Image, tag: &str, frame: u32) -> Result<String, String> {
-    let mut driver = build_hybrid(image, tag)?;
+    let mut driver = build_hybrid(image, tag, None)?;
     let mut interpreted = boot(image);
     let mut hybrid = boot(image);
     let mut interp_log: Vec<Checkpoint> = Vec::new();
@@ -558,7 +583,7 @@ struct TracedRerun {
 /// side likewise (native chunks record nothing), and returns both
 /// trace bytes plus the native chunk entry PCs the hybrid entered.
 fn traced_rerun(image: &Image, tag: &str, frame: u32) -> Result<TracedRerun, String> {
-    let mut driver = build_hybrid(image, tag)?;
+    let mut driver = build_hybrid(image, tag, None)?;
     let mut interpreted = boot(image);
     let mut hybrid = boot(image);
     let mut interp_trace = Vec::new();
@@ -596,7 +621,7 @@ fn traced_rerun(image: &Image, tag: &str, frame: u32) -> Result<TracedRerun, Str
 /// captures the rendered frame (for the case-directory PNGs).
 fn rerun_frame(image: &Image, frame: u32, hybrid_path: bool) -> Vec<u8> {
     let Some(mut driver) = hybrid_path
-        .then(|| build_hybrid(image, "diff-frame").ok())
+        .then(|| build_hybrid(image, "diff-frame", None).ok())
         .flatten()
     else {
         let mut system = boot(image);

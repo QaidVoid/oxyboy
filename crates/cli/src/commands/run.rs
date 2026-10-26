@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 
 use rom::{Image, ImageKind};
 use runtime::ppu::{CYCLES_PER_LINE, LINES_PER_FRAME, VISIBLE_LINES, WIDTH};
+use runtime::recomp::Driver;
 use runtime::save::Save;
 use runtime::system::System;
 use trace::Writer;
@@ -38,6 +39,18 @@ pub struct RunArgs {
     /// Run without a window for exactly `--frames` frames.
     #[arg(long)]
     pub headless: bool,
+
+    /// Execute translated regions natively (compiled from the lifted
+    /// C), interpreting everything the IR cannot model. Requires a
+    /// host C compiler.
+    #[arg(long)]
+    pub hybrid: bool,
+
+    /// Analysis config seeding the hybrid translation: config-declared
+    /// functions are translated even when discovery never walks a call
+    /// to them. Requires `--hybrid`.
+    #[arg(long, value_name = "FILE", requires = "hybrid")]
+    pub config: Option<PathBuf>,
 
     /// Window upscale factor (nearest-neighbor, 1 to 8).
     #[arg(long, value_name = "N", default_value_t = 3, value_parser = clap::value_parser!(u32).range(1..=8))]
@@ -94,6 +107,12 @@ pub fn run(args: RunArgs) -> i32 {
         ImageKind::Multiboot => System::with_multiboot(image.bytes().to_vec()),
         ImageKind::Cart => System::new(image.bytes().to_vec(), CART_BASE),
     };
+    if args.hybrid && (args.trace.is_some() || args.io_log.is_some()) {
+        eprintln!(
+            "oxyboy run: --trace and --io-log require the interpreter (native chunks record nothing)"
+        );
+        return 1;
+    }
     let save_file = save_path(&args, &image);
     if let Some(Err(e)) = save_file.as_deref().map(|path| {
         path.parent()
@@ -112,8 +131,43 @@ pub fn run(args: RunArgs) -> i32 {
             }
         }
     }
+    let mut driver = if args.hybrid {
+        let config = match &args.config {
+            Some(path) => match analysis::config::Config::load(path) {
+                Ok(config) => Some(config),
+                Err(e) => {
+                    eprintln!("oxyboy run: {}: {e}", path.display());
+                    return 1;
+                }
+            },
+            None => None,
+        };
+        match super::diff::build_hybrid(&image, "run", config.as_ref()) {
+            Ok(driver) => {
+                println!("hybrid: {} regions translated", driver.translated_count());
+                Some(driver)
+            }
+            Err(e) => {
+                eprintln!("oxyboy run: {e}");
+                return 1;
+            }
+        }
+    } else {
+        None
+    };
     if args.headless {
-        if let Some(path) = &args.trace {
+        if args.hybrid {
+            for _ in 0..args.frames {
+                if let Err(e) = driver
+                    .as_mut()
+                    .expect("hybrid driver")
+                    .run_frame(&mut system)
+                {
+                    eprintln!("oxyboy run: hybrid: {e}");
+                    return 1;
+                }
+            }
+        } else if let Some(path) = &args.trace {
             if let Err(code) = run_traced(&mut system, path, args.frames) {
                 eprintln!("oxyboy run: {code}");
                 return 1;
@@ -132,7 +186,7 @@ pub fn run(args: RunArgs) -> i32 {
     } else if args.trace.is_some() || args.io_log.is_some() {
         eprintln!("oxyboy run: --trace and --io-log require --headless");
         return 1;
-    } else if let Err(code) = run_windowed(&mut system, args.scale) {
+    } else if let Err(code) = run_windowed(&mut system, args.scale, driver.as_mut()) {
         eprintln!("oxyboy run: {code}");
         return 1;
     }
@@ -154,17 +208,13 @@ pub fn run(args: RunArgs) -> i32 {
     0
 }
 
-/// Runs headless for `frames` frames, recording every instruction to
-/// the trace file at `path`. The step budget is the same cycle count
-/// plain headless mode charges (`frames * CYCLES_PER_FRAME`), spent
-/// through `System::step_recorded` one instruction at a time.
-///
-/// # Errors
-///
-/// Returns a printable message when the trace file cannot be written.
 /// Runs headless with the IO log armed, writing one CSV row per
 /// logged access inside `range`; the `pc` column is the instruction
 /// that performed (or contained) the access.
+///
+/// # Errors
+///
+/// Returns a printable message when the log file cannot be written.
 fn run_io_logged(
     system: &mut System,
     path: &Path,
@@ -193,6 +243,14 @@ fn run_io_logged(
     std::fs::write(path, rows).map_err(|e| format!("{}: {e}", path.display()))
 }
 
+/// Runs headless for `frames` frames, recording every instruction to
+/// the trace file at `path`. The step budget is the same cycle count
+/// plain headless mode charges (`frames * CYCLES_PER_FRAME`), spent
+/// through `System::step_recorded` one instruction at a time.
+///
+/// # Errors
+///
+/// Returns a printable message when the trace file cannot be written.
 fn run_traced(system: &mut System, path: &Path, frames: u32) -> Result<(), String> {
     let file = File::create(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let mut writer =
@@ -223,7 +281,11 @@ fn run_traced(system: &mut System, path: &Path, frames: u32) -> Result<(), Strin
 ///
 /// Returns a printable message when the window cannot open or a
 /// buffer presentation fails.
-fn run_windowed(system: &mut System, scale: u32) -> Result<(), String> {
+fn run_windowed(
+    system: &mut System,
+    scale: u32,
+    mut driver: Option<&mut Driver>,
+) -> Result<(), String> {
     use minifb::{Window, WindowOptions};
 
     let scale = scale as usize;
@@ -244,7 +306,11 @@ fn run_windowed(system: &mut System, scale: u32) -> Result<(), String> {
     };
     while window.is_open() {
         apply_keypad(system, &window);
-        system.step_frame();
+        if let Some(d) = driver.as_deref_mut() {
+            d.run_frame(system).map_err(|e| format!("hybrid: {e}"))?;
+        } else {
+            system.step_frame();
+        }
         let samples = system.take_audio();
         if let Some(output) = &mut audio {
             output.push(&samples);

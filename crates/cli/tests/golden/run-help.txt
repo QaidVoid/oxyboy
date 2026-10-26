@@ -6,6 +6,8 @@ Options:
   -r, --rom <FILE>         Path to the .gba ROM image
   -v, --verbose...         Increase logging verbosity; repeat for more detail
       --headless           Run without a window for exactly `--frames` frames
+      --hybrid             Execute translated regions natively (compiled from the lifted C), interpreting everything the IR cannot model. Requires a host C compiler
+      --config <FILE>      Analysis config seeding the hybrid translation: config-declared functions are translated even when discovery never walks a call to them. Requires `--hybrid`
       --scale <N>          Window upscale factor (nearest-neighbor, 1 to 8) [default: 3]
       --frames <N>         Number of frames to run in headless mode [default: 1]
       --dump-frame <FILE>  Write the final rendered frame to this PNG path
