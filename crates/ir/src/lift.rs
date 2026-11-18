@@ -226,9 +226,6 @@ impl Lifter<'_> {
         pc_mask: u32,
         table: &JumpTable,
     ) -> (RawTerm, Vec<u32>) {
-        // The walk allocates through `lift.next`; keep both counters in
-        // step while the chain blocks take their ids from `self.next`.
-        self.next = lift.next;
         // The dispatcher masks the exit value into the pc slot so the
         // chain blocks compare their own pc parameter against each
         // target (block-argument SSA: no cross-block value references).
@@ -243,6 +240,10 @@ impl Lifter<'_> {
         );
         lift.mask_pc(pc_mask);
         cycles.push(CycleCharge { addr, cycles: 0 });
+        // The walk allocates through `lift.next`; the chain blocks take
+        // their ids from `self.next`, so it picks up after the
+        // dispatcher's own allocations.
+        self.next = lift.next;
 
         let mut seen = BTreeSet::new();
         let targets: Vec<u32> = table
@@ -256,7 +257,10 @@ impl Lifter<'_> {
 
         for (index, &target) in targets.iter().enumerate() {
             let otherwise = chain_keys.get(index + 1).copied().unwrap_or(fallback);
-            let (params, flag_ids) = self.fresh_params();
+            // The compare defines new flag values; the block's own flag
+            // parameters stay the incoming ones (single assignment).
+            let params = self.fresh_params();
+            let flag_ids: Vec<ValueId> = (0..4).map(|_| self.fresh_id()).collect();
             let mut end_state = params.clone();
             end_state[FLAG_SLOT..FLAG_SLOT + 4].copy_from_slice(&flag_ids);
             let compare = Inst {
@@ -285,7 +289,7 @@ impl Lifter<'_> {
                 },
             );
         }
-        let fallback_params = self.fresh_params().0;
+        let fallback_params = self.fresh_params();
         self.raw.insert(
             fallback,
             RawBlock {
@@ -331,14 +335,12 @@ impl Lifter<'_> {
     ) -> RawTerm {
         self.next = lift.next;
         let key = self.synthetic_key();
-        let (params, flag_ids) = self.fresh_params();
-        let mut end_state = params.clone();
-        end_state[FLAG_SLOT..FLAG_SLOT + 4].copy_from_slice(&flag_ids);
+        let params = self.fresh_params();
         self.raw.insert(
             key,
             RawBlock {
+                end_state: params.clone(),
                 params,
-                end_state,
                 insts: Vec::new(),
                 cycles: Vec::new(),
                 term,
@@ -352,17 +354,16 @@ impl Lifter<'_> {
         }
     }
 
-    /// Fresh block parameters plus the four flag-slot ids.
-    fn fresh_params(&mut self) -> (Vec<ValueId>, Vec<ValueId>) {
-        let params: Vec<ValueId> = (0..STATE_COUNT)
-            .map(|_| {
-                let allocated = self.next;
-                self.next = ValueId(allocated.0 + 1);
-                allocated
-            })
-            .collect();
-        let flags = params[FLAG_SLOT..FLAG_SLOT + 4].to_vec();
-        (params, flags)
+    /// Fresh block parameters, one per machine slot.
+    fn fresh_params(&mut self) -> Vec<ValueId> {
+        (0..STATE_COUNT).map(|_| self.fresh_id()).collect()
+    }
+
+    /// One fresh value id.
+    fn fresh_id(&mut self) -> ValueId {
+        let allocated = self.next;
+        self.next = ValueId(allocated.0 + 1);
+        allocated
     }
 
     /// Whether the byte at `addr` is marked executed.
@@ -1283,6 +1284,31 @@ mod tests {
     /// A resolved switch dispatch lowers to a compare chain
     /// over the table's targets; the raw indirect exit survives only
     /// as the out-of-range fallback.
+    #[test]
+    fn switch_chains_define_every_value_once() {
+        let base = 0x0800_0000u32;
+        let mut words = [0xE1A0_0000u32; 9];
+        words[0] = 0xE1A0_F000; // mov pc, r0
+        let table = JumpTable {
+            site: base,
+            state: State::Arm,
+            base: base + 0x40,
+            entries: 2,
+            targets: vec![(base + 0x10, State::Arm), (base + 0x20, State::Arm)],
+        };
+        let function = lift_arm_with(&words, 9, &[table]);
+        let mut defined = std::collections::HashSet::new();
+        for block in &function.blocks {
+            for id in block
+                .params
+                .iter()
+                .chain(block.insts.iter().flat_map(|inst| inst.dests.iter()))
+            {
+                assert!(defined.insert(*id), "{id:?} defined twice");
+            }
+        }
+    }
+
     #[test]
     fn resolved_switch_lowers_to_a_compare_chain() {
         let base = 0x0800_0000u32;
