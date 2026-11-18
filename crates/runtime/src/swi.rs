@@ -176,8 +176,9 @@ fn register_ram_reset(cpu: &mut Cpu, bus: &mut Bus) {
 /// r1=1 and does then execute IntrWait", GBATEK SWI 05h). IME is
 /// forced on; with the discard flag set the waited bits of the BIOS
 /// flag word are cleared before halting, otherwise an already-set flag
-/// returns immediately. The CPU's wake path clears the waited bits on
-/// return (GBATEK: "automatically reset ... upon return").
+/// returns immediately. After each wake the CPU runs the IRQ handler,
+/// then checks the flag word the handler sets: a waited bit is cleared
+/// and the call returns, otherwise it halts again (GBATEK SWI 04h).
 fn intr_wait(cpu: &mut Cpu, bus: &mut Bus, vblank: bool) {
     let (discard, mask) = if vblank {
         (true, 0x0001u16)

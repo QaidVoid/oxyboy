@@ -33,14 +33,14 @@
       "rom": "target/test-roms/inputtest.gba",
       "frames": 60,
       "budget_ms": 20,
-      "hash": "c07ebce3c66be183"
+      "hash": "60015daccaec18d7"
     },
     {
       "name": "irqtest",
       "rom": "target/test-roms/irqtest.gba",
       "frames": 60,
       "budget_ms": 20,
-      "hash": "b4fd983c310fc622"
+      "hash": "cc6c640401817b6d"
     },
     {
       "name": "mb-thumbptr",
@@ -82,7 +82,7 @@
       "rom": "corpus/cart.gba",
       "frames": 120,
       "budget_ms": 80,
-      "hash": "ed74543889358afb"
+      "hash": "ce68ff0700faac93"
     }
   ]
 }

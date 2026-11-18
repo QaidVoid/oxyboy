@@ -10,14 +10,14 @@
 @
 @ The main loop polls KEYINPUT once per iteration and stores the halfword
 @ to IWRAM (+0x00), so the driver can read what the ROM actually saw.
-@ The handler checks the BIOS-HLE contract (r0 = IE & IF == 1000h for
-@ the single keypad source), counts entries at +0x04, records the check
+@ The handler checks the BIOS dispatcher contract (r0 = 0x04000000, the
+@ IO base the BIOS leaves there), counts entries at +0x04, records the check
 @ at +0x08, acknowledges IF, and returns through the HLE sentinel.
 @
 @ IWRAM scratch (0x03000000):
 @   +0x00 u16 polled KEYINPUT snapshot (overwritten every iteration)
 @   +0x04 u32 handler entry count
-@   +0x08 u32 contract flags: bit0 r0 == IE&IF, bit15 on any mismatch
+@   +0x08 u32 contract flags: bit0 r0 == 0x04000000, bit15 on any mismatch
 
     .syntax unified
     .cpu arm7tdmi
@@ -96,8 +96,8 @@ poll:
 
     .pool
 
-@ The BIOS-HLE dispatcher enters here in ARM System state with IRQs
-@ disabled and r0 = IE & IF = 1000h (the only enabled source).
+@ The BIOS dispatcher enters here in ARM IRQ mode with IRQs disabled
+@ and r0 = 0x04000000.
 irq_handler:
     ldr r2, =0x03000004
     ldr r3, [r2]
@@ -106,8 +106,7 @@ irq_handler:
 
     ldr r2, =0x03000008
     ldr r3, [r2]
-    ldr r12, =0x1000
-    cmp r0, r12                     @ r0 = IE & IF == keypad bit?
+    cmp r0, #0x04000000             @ the BIOS leaves the IO base in r0
     bne mismatch
     orr r3, r3, #1                  @ bit0: contract held
     b   store_flags

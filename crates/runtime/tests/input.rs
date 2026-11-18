@@ -177,7 +177,7 @@ fn input_rom_polled_input_and_key_irq() {
     system.step_frame();
     assert_eq!(half(&mut system, SNAPSHOT), 0x03FE, "the ROM polled A down");
     assert_eq!(word(&mut system, ENTRIES), 1, "exactly one key IRQ");
-    assert_eq!(word(&mut system, CONTRACT), 0x0001, "r0 == IE & IF");
+    assert_eq!(word(&mut system, CONTRACT), 0x0001, "r0 == 0x04000000");
 
     // Holding A across another frame fires nothing more.
     system.step_frame();

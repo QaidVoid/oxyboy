@@ -594,11 +594,11 @@ fn irq_entry_dispatches_through_bios_hle_and_returns() {
     run(&mut cpu, &mut bus, 1);
     // HLE dispatch: the handler runs in IRQ state (IntrMain keeps its
     // frame on sp_irq) with IRQs disabled, lr parks on the HLE
-    // sentinel, r0 = IE & IF (0 here).
+    // sentinel, r0 = 0x04000000 as the BIOS leaves it.
     assert_eq!(cpu.pc(), 0x0200_0000);
     assert_eq!(cpu.mode(), Mode::Irq);
     assert_eq!(cpu.cpsr() & 0x80, 0x80);
-    assert_eq!(reg(&cpu, 0), 0);
+    assert_eq!(reg(&cpu, 0), 0x0400_0000);
     assert_eq!(reg(&cpu, 14), IRQ_HLE_RETURN);
 
     // bx lr (to the sentinel) performs the interrupt return: the

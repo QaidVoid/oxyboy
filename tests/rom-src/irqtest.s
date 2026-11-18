@@ -12,14 +12,14 @@
 @
 @ The main loop parks on a heartbeat counter, keeping the interrupted
 @ registers (r0..r3, r12) at constant canary values. The handler checks
-@ the BIOS-HLE contract (r0 = IE & IF == 1 for the single VBlank source)
-@ and canary preservation, counts entries, acknowledges IF (write 1 to
+@ the BIOS dispatcher contract (r0 = 0x04000000, the IO base the BIOS
+@ leaves there) and canary preservation, counts entries, acknowledges IF (write 1 to
 @ clear), and returns with bx lr through the HLE sentinel.
 @
 @ IWRAM scratch (0x03000000):
 @   +0x00 u32 handler entry count
 @   +0x04 u32 unused (zero)
-@   +0x08 u32 contract flags: bit0 r0 == IE&IF, bit1 canaries preserved,
+@   +0x08 u32 contract flags: bit0 r0 == 0x04000000, bit1 canaries preserved,
 @                             bit15 set on any mismatch
 @   +0x0C u32 unused (zero)
 @   +0x10 u32 main-loop heartbeat
@@ -64,8 +64,8 @@ checksum:
     .org 0x0C0
 start:
     msr cpsr_c, #0xD2               @ IRQ mode, IRQ+FIQ disabled
-    ldr sp, =0x03003F00             @ sp_irq (crt0 convention; HLE does
-                                    @ not use it, but set it anyway)
+    ldr sp, =0x03003F00             @ sp_irq: the BIOS dispatcher pushes
+                                    @ its {r0-r3, r12, lr} frame here
     msr cpsr_c, #0xDF               @ System mode, IRQ+FIQ disabled
     ldr sp, =0x03007F00             @ system stack for the handler
 
@@ -108,8 +108,8 @@ park:
 
     .pool
 
-@ The BIOS-HLE dispatcher enters here in ARM System state with IRQs
-@ disabled and r0 = IE & IF. Interrupted r1..r3 and r12 are still live.
+@ The BIOS dispatcher enters here in ARM IRQ mode with IRQs disabled
+@ and r0 = 0x04000000. Interrupted r1..r3 and r12 are still live.
 irq_handler:
     cmp r1, #0x22                   @ canaries intact?
     bne mismatch
@@ -119,7 +119,7 @@ irq_handler:
     bne mismatch
     cmp r12, #0x55
     bne mismatch
-    cmp r0, #0x01                   @ IE&IF: exactly the VBlank bit
+    cmp r0, #0x04000000             @ the BIOS leaves the IO base in r0
     bne mismatch
 
     ldr r0, =0x03000008             @ contract flags: both checks pass

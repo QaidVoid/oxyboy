@@ -125,7 +125,7 @@ fn hle_dispatch_preserves_the_interrupted_context_across_a_return() {
 }
 
 #[test]
-fn hle_dispatch_passes_ie_and_if_in_r0() {
+fn hle_dispatch_passes_the_io_base_in_r0() {
     let mut system = dispatch_system();
     system.bus_mut().raise_if(0x0002); // an unrelated second source
     system.cpu.set_irq_line(true);
@@ -136,11 +136,10 @@ fn hle_dispatch_passes_ie_and_if_in_r0() {
         steps += 1;
         assert!(steps < 100, "dispatch never happened");
     }
-    assert_eq!(
-        system.cpu.reg_for_test(0),
-        u32::from(system.bus().int_enable() & system.bus().int_flags()),
-        "r0 must carry IE & IF at handler entry"
-    );
+    // The BIOS dispatcher leaves `mov r0, #0x04000000` in r0.
+    assert_eq!(system.cpu.reg_for_test(0), 0x0400_0000);
+    // Its preamble frame sits on the live IRQ stack.
+    assert_eq!(system.cpu.reg_for_test(13), 0x0300_7F88);
     assert_eq!(system.cpu.reg_for_test(14), IRQ_HLE_RETURN);
 }
 
@@ -219,8 +218,8 @@ fn i_bit_set_masks_the_irq_line_even_with_ime_on() {
 
 #[test]
 fn a_cpu_with_no_irq_support_in_flight_is_untouched_by_the_sentinel() {
-    // A bare CPU jumping to the sentinel with no dispatch in flight
-    // must not pop anything (defensive: the guard is depth-based).
+    // A bare CPU jumping to the sentinel outside IRQ mode must not pop
+    // anything.
     let mut rom = vec![0u8; 0x20];
     rom[..4].copy_from_slice(&PARK.to_le_bytes());
     let mut bus = Bus::new(rom);
@@ -278,7 +277,7 @@ fn irq_rom_vblank_masking_dispatch_and_return() {
     assert_eq!(
         word(&mut system, CONTRACT),
         0x0003,
-        "r0 = IE&IF and canary preservation"
+        "r0 = 0x04000000 and canary preservation"
     );
     assert_eq!(
         system.bus().int_flags() & 0x0001,
@@ -292,4 +291,89 @@ fn irq_rom_vblank_masking_dispatch_and_return() {
         word(&mut system, HEARTBEAT) > heartbeat,
         "the interrupted loop must keep running after returns"
     );
+}
+
+/// An SDK-style re-entrant handler at 0x02000000: it saves SPSR and
+/// lr_irq on the IRQ stack, acknowledges IF, counts the entry at
+/// 0x03000000, and opens a two-instruction window with IRQs enabled
+/// before restoring and returning to the BIOS dispatcher.
+const NESTING_HANDLER: [u32; 22] = [
+    0xE14F_3000, // mrs r3, spsr
+    0xE92D_4008, // stmfd sp!, {r3, lr}
+    0xE3A0_3301, // mov r3, #0x04000000
+    0xE283_3C02, // add r3, r3, #0x200
+    0xE1D3_20B2, // ldrh r2, [r3, #2]
+    0xE1C3_20B2, // strh r2, [r3, #2]
+    0xE59F_1034, // ldr r1, [pc, #0x34]   ; =0x03000000
+    0xE591_0000, // ldr r0, [r1]
+    0xE280_0001, // add r0, r0, #1
+    0xE581_0000, // str r0, [r1]
+    0xE10F_3000, // mrs r3, cpsr
+    0xE3C3_3080, // bic r3, r3, #0x80
+    0xE121_F003, // msr cpsr_c, r3        ; IRQs on
+    0xE1A0_0000, // nop                   ; (window)
+    0xE1A0_0000, // nop
+    0xE10F_3000, // mrs r3, cpsr
+    0xE383_3080, // orr r3, r3, #0x80
+    0xE121_F003, // msr cpsr_c, r3        ; IRQs off
+    0xE8BD_4008, // ldmfd sp!, {r3, lr}
+    0xE16F_F003, // msr spsr_fsxc, r3
+    0xE12F_FF1E, // bx lr
+    0x0300_0000,
+];
+
+#[test]
+fn nested_irqs_keep_each_frame_on_the_irq_stack() {
+    let mut rom = vec![0u8; 0x20];
+    rom[..4].copy_from_slice(&PARK.to_le_bytes());
+    let mut bus = Bus::new(rom);
+    for (i, word) in NESTING_HANDLER.iter().enumerate() {
+        bus.write_u32(0x0200_0000 + 4 * i as u32, *word);
+    }
+    bus.write_u32(IRQ_HANDLER_PTR, 0x0200_0000);
+    bus.write_u16(IE, 0x0003);
+    bus.write_u16(IME, 0x0001);
+    let mut cpu = Cpu::new(0x0800_0000);
+    cpu.set_cpsr_raw(0x1F);
+    for (i, v) in [0x11u32, 0x22, 0x33, 0x44].iter().enumerate() {
+        cpu.set_reg_for_test(i as u8, *v);
+    }
+    cpu.set_reg_for_test(12, 0x55);
+    cpu.set_reg_for_test(14, 0x0ADC_0DE0);
+    let sp = cpu.reg_for_test(13);
+
+    let step_until = |cpu: &mut Cpu, bus: &mut Bus, done: &dyn Fn(&Cpu, &mut Bus) -> bool| {
+        for _ in 0..1_000 {
+            if done(cpu, bus) {
+                return;
+            }
+            cpu.set_irq_line(bus.irq_pending());
+            cpu.step(bus);
+        }
+        panic!("condition never held; pc {:#010x}", cpu.pc());
+    };
+
+    // The outer IRQ reaches the handler's IRQs-on window...
+    bus.raise_if(0x0001);
+    step_until(&mut cpu, &mut bus, &|cpu, _| cpu.pc() == 0x0200_0034);
+    // ...where a second source nests a full dispatch.
+    bus.raise_if(0x0002);
+    step_until(&mut cpu, &mut bus, &|cpu, _| {
+        cpu.pc() == 0x0800_0000 && cpu.mode() == runtime::cpu::Mode::System
+    });
+    assert_eq!(bus.read_u32(0x0300_0000), 2, "both dispatches ran");
+    for (i, v) in [0x11u32, 0x22, 0x33, 0x44].iter().enumerate() {
+        assert_eq!(cpu.reg_for_test(i as u8), *v, "r{i} restored");
+    }
+    assert_eq!(cpu.reg_for_test(12), 0x55, "r12 restored");
+    assert_eq!(cpu.reg_for_test(13), sp, "sp restored");
+    assert_eq!(cpu.reg_for_test(14), 0x0ADC_0DE0, "lr restored");
+    assert_eq!(cpu.cpsr() & 0x80, 0, "I bit restored");
+
+    // The IRQ stack unwound fully: a later dispatch works the same.
+    bus.raise_if(0x0001);
+    step_until(&mut cpu, &mut bus, &|cpu, bus| {
+        bus.read_u32(0x0300_0000) == 3 && cpu.pc() == 0x0800_0000
+    });
+    assert_eq!(cpu.reg_for_test(0), 0x11);
 }

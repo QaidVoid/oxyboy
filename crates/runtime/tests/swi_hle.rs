@@ -221,25 +221,68 @@ fn intr_wait_returns_immediately_on_an_old_flag() {
     assert_eq!(bus.read_u16(0x0300_7FF8), 0);
 }
 
+/// An IRQ handler at 0x02000000 that acknowledges IF and ORs it into
+/// the BIOS flag word at 0x03007FF8, as every IntrWait user must.
+const FLAG_HANDLER: [u32; 10] = [
+    0xE3A0_3301, // mov r3, #0x04000000
+    0xE283_3C02, // add r3, r3, #0x200
+    0xE1D3_20B2, // ldrh r2, [r3, #2]   ; IF
+    0xE1C3_20B2, // strh r2, [r3, #2]   ; acknowledge
+    0xE59F_300C, // ldr r3, [pc, #12]   ; =0x03007FF8
+    0xE1D3_10B0, // ldrh r1, [r3]
+    0xE181_1002, // orr r1, r1, r2
+    0xE1C3_10B0, // strh r1, [r3]
+    0xE12F_FF1E, // bx lr
+    0x0300_7FF8,
+];
+
+fn install_flag_handler(bus: &mut Bus) {
+    for (i, word) in FLAG_HANDLER.iter().enumerate() {
+        bus.write_u32(0x0200_0000 + 4 * i as u32, *word);
+    }
+    bus.write_u32(0x0300_7FFC, 0x0200_0000);
+}
+
+/// Steps with the IRQ line following the bus until `done` holds.
+fn step_until(cpu: &mut Cpu, bus: &mut Bus, done: impl Fn(&Cpu, &mut Bus) -> bool) {
+    for _ in 0..1_000 {
+        if done(cpu, bus) {
+            return;
+        }
+        cpu.set_irq_line(bus.irq_pending());
+        cpu.step(bus);
+    }
+    panic!("condition never held; pc {:#010x}", cpu.pc());
+}
+
 #[test]
-fn intr_wait_halt_wakes_only_on_a_matching_flag() {
+fn intr_wait_returns_only_after_the_handler_sets_a_waited_flag() {
     let (mut cpu, mut bus) = run_arm_swi(0x04, &[], |cpu, bus| {
         cpu.set_reg_for_test(0, 1); // discard old flags
         cpu.set_reg_for_test(1, 0x0001);
         bus.write_u16(0x0400_0200, 0x0003); // IE: vblank + hblank
+        install_flag_handler(bus);
     });
     assert_eq!(cpu.pc(), 0x0800_0004, "halted at the return address");
-    // Non-matching IF stays halted.
+    assert!(cpu.is_halted());
+
+    // An unrelated IRQ runs the handler, then the BIOS loop halts again.
     bus.raise_if(0x0002);
-    let before = cpu.cycles();
-    cpu.step(&mut bus);
-    assert_eq!(cpu.pc(), 0x0800_0004, "still halted");
-    assert!(cpu.cycles() > before);
-    // The waited flag releases the halt and is consumed.
+    step_until(&mut cpu, &mut bus, |cpu, bus| {
+        bus.read_u16(0x0300_7FF8) & 2 != 0 && cpu.is_halted()
+    });
+    assert_eq!(cpu.pc(), 0x0800_0004, "still waiting");
+
+    // The waited source: the handler sets the flag, IntrWait clears it
+    // and returns; the unrelated flag is left alone.
     bus.raise_if(0x0001);
-    cpu.step(&mut bus);
-    assert_eq!(cpu.pc(), 0x0800_0008, "woke and moved on");
-    assert_eq!(bus.read_u16(0x0300_7FF8) & 1, 0, "flag cleared on return");
+    step_until(&mut cpu, &mut bus, |cpu, _| cpu.pc() == 0x0800_0008);
+    assert_eq!(
+        bus.read_u16(0x0300_7FF8),
+        0x0002,
+        "only the waited flag cleared"
+    );
+    assert_eq!(cpu.mode(), Mode::System);
 }
 
 #[test]
@@ -247,15 +290,17 @@ fn vblank_intr_wait_discards_an_old_vblank_flag() {
     let (mut cpu, mut bus) = run_arm_swi(0x05, &[], |_, bus| {
         bus.write_u16(0x0300_7FF8, 0x0001); // stale V-Blank flag
         bus.write_u16(0x0400_0200, 0x0001);
+        install_flag_handler(bus);
     });
     // r0=1, r1=1 per GBATEK SWI 05h; the old flag did not release it.
     assert_eq!(cpu.reg_for_test(0), 1);
     assert_eq!(cpu.reg_for_test(1), 1);
     assert_eq!(cpu.pc(), 0x0800_0004, "halted despite the old flag");
-    // A fresh V-Blank IRQ wakes it.
+    // A fresh V-Blank IRQ wakes it, and the flag is consumed so a
+    // following IntrWait(0, 1) waits for the next one.
     bus.raise_if(0x0001);
-    cpu.step(&mut bus);
-    assert_eq!(cpu.pc(), 0x0800_0008);
+    step_until(&mut cpu, &mut bus, |cpu, _| cpu.pc() == 0x0800_0008);
+    assert_eq!(bus.read_u16(0x0300_7FF8), 0);
 }
 
 #[test]
