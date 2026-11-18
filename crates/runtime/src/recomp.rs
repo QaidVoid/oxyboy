@@ -171,7 +171,7 @@ impl Driver {
     /// Whether `pc` is a translated function entry.
     #[must_use]
     pub fn is_translated(&self, pc: u32) -> bool {
-        self.entries.iter().any(|e| e.start == pc)
+        self.entry(pc).is_some()
     }
 
     /// How many translated function entries the driver holds.
@@ -182,7 +182,16 @@ impl Driver {
 
     /// The instruction state of a translated function entry.
     fn thumb_at(&self, pc: u32) -> Option<bool> {
-        self.entries.iter().find(|e| e.start == pc).map(|e| e.thumb)
+        self.entry(pc).map(|e| e.thumb)
+    }
+
+    /// The translated function starting at `pc`; `entries` stays
+    /// sorted by start, so this is a binary search on every step.
+    fn entry(&self, pc: u32) -> Option<&TranslatedFn> {
+        self.entries
+            .binary_search_by_key(&pc, |e| e.start)
+            .ok()
+            .map(|index| &self.entries[index])
     }
 
     /// Runs one unit: a whole native function call when the PC is at
