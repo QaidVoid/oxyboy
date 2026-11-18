@@ -118,6 +118,9 @@ pub struct Bus {
     dma: Dma,
     /// The four timers (registers in `io`, live counters here).
     timers: Timers,
+    /// Affine BGs whose reference point the CPU or DMA rewrote (bit 0
+    /// BG2, bit 1 BG3); the PPU reloads its internal point from them.
+    affine_reload: u8,
     /// The PSG sound channels (registers in `io`, engine state here).
     apu: Apu,
     /// The pressed keypad buttons (bit set = pressed, active high;
@@ -180,6 +183,7 @@ impl Bus {
             io: vec![0; 0x400].into_boxed_slice(),
             dma: Dma::default(),
             timers: Timers::default(),
+            affine_reload: 0,
             apu: Apu::new(),
             keys: 0,
             key_irq_line: false,
@@ -808,6 +812,12 @@ impl Bus {
         self.io_write_u16(half, merged);
     }
 
+    /// Takes the affine reference-point rewrite marks (bit 0 BG2,
+    /// bit 1 BG3) since the last call.
+    pub(crate) fn take_affine_reload(&mut self) -> u8 {
+        std::mem::take(&mut self.affine_reload)
+    }
+
     /// Writes an aligned IO halfword with per-register semantics.
     ///
     /// Implemented: DISPCNT, GREENSWAP, DISPSTAT, VCOUNT,
@@ -820,6 +830,11 @@ impl Bus {
     fn io_write_u16(&mut self, half: u32, value: u16) {
         self.log_io(half, u32::from(value), 2, false);
         let off = (half & 0x3FF) as usize;
+        match off {
+            0x028..=0x02F => self.affine_reload |= 1,
+            0x038..=0x03F => self.affine_reload |= 2,
+            _ => {}
+        }
         let snd = off as u32;
         if (0x060..0x082).contains(&snd) {
             // PSG registers: while the master enable is clear the image

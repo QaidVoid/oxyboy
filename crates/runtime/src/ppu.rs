@@ -50,6 +50,10 @@ pub struct Ppu {
     frame_ended: bool,
     /// RGBA8888 output, row-major.
     frame: Frame,
+    /// Internal affine reference points `(x, y)` of BG2 and BG3
+    /// (GBATEK "BG Rotation/Scaling"): reloaded from BGxX/BGxY at the
+    /// frame start and on every write, advanced by PB/PD per line.
+    affine: [(i32, i32); 2],
 }
 
 impl Default for Ppu {
@@ -70,6 +74,7 @@ impl Ppu {
             hblank: false,
             frame_ended: false,
             frame: vec![0; WIDTH * VISIBLE_LINES * 4].into_boxed_slice(),
+            affine: [(0, 0); 2],
         }
     }
 
@@ -96,7 +101,9 @@ impl Ppu {
                 // by the H-Blank IRQ handler or DMA land on the next
                 // line.
                 if visible {
+                    self.latch_affine(bus);
                     self.render_scanline(bus);
+                    self.advance_affine(bus);
                 }
                 let was = bus.dispstat();
                 bus.set_dispstat_flag(0x0002, true);
@@ -200,6 +207,27 @@ impl Ppu {
     /// layers plus the OBJ layer are resolved front-to-back over the
     /// backdrop, window masks gate layer visibility per pixel, and the
     /// BLDCNT color effects apply to the top two opaque pixels.
+    /// Reloads the internal affine reference points at the frame start
+    /// and wherever BGxX/BGxY were written since the last line.
+    fn latch_affine(&mut self, bus: &mut Bus) {
+        let written = bus.take_affine_reload();
+        for (index, point) in self.affine.iter_mut().enumerate() {
+            if self.line == 0 || written >> index & 1 != 0 {
+                let base = 0x0028 + 0x10 * index as u32;
+                *point = (affine_ref(bus, base), affine_ref(bus, base + 4));
+            }
+        }
+    }
+
+    /// Steps the internal reference points by PB and PD after a line.
+    fn advance_affine(&mut self, bus: &Bus) {
+        for (index, point) in self.affine.iter_mut().enumerate() {
+            let base = 0x0022 + 0x10 * index as u32;
+            point.0 += i32::from(bus.io_half(base) as i16);
+            point.1 += i32::from(bus.io_half(base + 4) as i16);
+        }
+    }
+
     fn render_scanline(&mut self, bus: &Bus) {
         let line = self.line as usize;
         let dispcnt = bus.dispcnt();
@@ -286,12 +314,20 @@ impl Ppu {
                         text_pixel(bus, id, sy, sx)
                     }
                     BgKind::Affine => {
-                        let (sx, sy) = if bg_mosaic[id] {
-                            mosaic_coords(x as u32, line as u32, mosaic)
+                        let (sx, origin) = if bg_mosaic[id] {
+                            let (sx, sy) = mosaic_coords(x as u32, line as u32, mosaic);
+                            // Vertical mosaic repeats the block's first
+                            // line: step the origin back to it.
+                            let back = line as i32 - sy as i32;
+                            let base = 0x0022 + 0x10 * (id - 2) as u32;
+                            let pb = i32::from(bus.io_half(base) as i16);
+                            let pd = i32::from(bus.io_half(base + 4) as i16);
+                            let (ox, oy) = self.affine[id - 2];
+                            (sx, (ox - back * pb, oy - back * pd))
                         } else {
-                            (x as u32, line as u32)
+                            (x as u32, self.affine[id - 2])
                         };
-                        affine_pixel(bus, id, sy, sx)
+                        affine_pixel(bus, id, origin, sx)
                     }
                     BgKind::Bitmap3 => Some(bus.vram_u16(((line * WIDTH + x) * 2) as u32)),
                     BgKind::Bitmap4 => {
@@ -505,30 +541,24 @@ fn text_pixel(bus: &Bus, id: usize, y: u32, x: u32) -> Option<u16> {
     }
 }
 
-/// The BGR555 color of affine BG `id` at line `y`, pixel `x`, or None
-/// for transparent color 0 / off-texture pixels without wraparound
-/// (GBATEK "Text BG Screens/tiles", "Affine BG Screen").
-fn affine_pixel(bus: &Bus, id: usize, y: u32, x: u32) -> Option<u16> {
+/// The BGR555 color of affine BG `id` at pixel `x` of the line whose
+/// internal reference point is `origin`, or None for transparent
+/// color 0 / off-texture pixels without wraparound (GBATEK "Text BG
+/// Screens/tiles", "Affine BG Screen").
+fn affine_pixel(bus: &Bus, id: usize, origin: (i32, i32), x: u32) -> Option<u16> {
     let cnt = bus.io_half(0x000C + 2 * (id - 2) as u32);
     let cbb = u32::from((cnt >> 2) & 0x0003) * 0x4000;
     let sbb = u32::from((cnt >> 8) & 0x001F) * 0x0800;
     let wrap = cnt & 0x2000 != 0;
     let tex = 128u32 << ((cnt >> 14) & 0x0003);
 
-    // The transform is s8.8 fixed point; X/Y are s20.8 reference
-    // points (GBATEK "Affine BG"). Reference-register evaluation per
-    // line is equivalent to the internal-register hardware behavior
-    // while parameters are only written outside scanout.
+    // The transform is s8.8 fixed point; the line origin is the s20.8
+    // internal reference point (GBATEK "Affine BG").
     let base = 0x0020 + 0x10 * (id - 2) as u32;
     let pa = i32::from(bus.io_half(base) as i16);
-    let pb = i32::from(bus.io_half(base + 2) as i16);
     let pc = i32::from(bus.io_half(base + 4) as i16);
-    let pd = i32::from(bus.io_half(base + 6) as i16);
-    let x0 = affine_ref(bus, base + 8);
-    let y0 = affine_ref(bus, base + 10);
-
-    let cx = x0 + pb * (y as i32) + pa * (x as i32);
-    let cy = y0 + pd * (y as i32) + pc * (x as i32);
+    let cx = origin.0 + pa * (x as i32);
+    let cy = origin.1 + pc * (x as i32);
     let tx = cx >> 8;
     let ty = cy >> 8;
 
@@ -559,7 +589,9 @@ fn affine_color(bus: &Bus, cbb: u32, sbb: u32, tex: u32, tx: u32, ty: u32) -> Op
 /// The s20.8 signed reference coordinate assembled from two IO
 /// halfwords.
 fn affine_ref(bus: &Bus, off: u32) -> i32 {
-    i32::from(bus.io_half(off)) | (i32::from(bus.io_half(off + 2)) << 16)
+    let raw = u32::from(bus.io_half(off)) | (u32::from(bus.io_half(off + 2)) << 16);
+    // A 28-bit signed value: bits 28-31 are unused.
+    ((raw << 4) as i32) >> 4
 }
 
 /// Computes the OBJ contribution for one scanline: the top-most opaque

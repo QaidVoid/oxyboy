@@ -286,3 +286,38 @@ fn large_text_maps_are_laid_out_as_screenblocks() {
     assert_eq!(first_pixel(&mut bus, 0xC800, 256, 256), reference[3]);
     assert_ne!(reference[1], reference[2]);
 }
+
+/// An affine scene for the reference-point tests: BG2 in mode 1 with
+/// an identity transform over a checkered 8bpp map.
+fn affine_scene() -> Bus {
+    let mut bus = Bus::new(Vec::new());
+    set_palette(&mut bus, 256);
+    tile8(&mut bus, 2, 1, 40);
+    affine_map(&mut bus, 2, 1);
+    bus.write_u16(0x0400_000C, 0x0288); // BG2CNT: CBB2 SBB2 8bpp size0
+    bus.write_u16(DISPCNT, 0x0401); // mode 1, BG2
+    affine_params(&mut bus, 0, 0x0100, 0, 0);
+    bus
+}
+
+#[test]
+fn writes_to_the_reference_point_reload_the_next_line() {
+    let row = |frame: &[u8], y: usize| frame[y * WIDTH * 4..(y + 1) * WIDTH * 4].to_vec();
+    let mut bus = affine_scene();
+    let plain = run(&mut bus, 1);
+    assert_ne!(row(&plain, 0), row(&plain, 1), "the texture varies by row");
+
+    // H-Blank DMA rewrites BG2Y = 0 on every line, so every line
+    // reloads the internal Y and samples texture row 0 (the frame's
+    // first line already starts at 0).
+    let mut bus = affine_scene();
+    bus.write_u32(0x0300_0000, 0);
+    bus.write_u32(0x0400_00B0, 0x0300_0000);
+    bus.write_u32(0x0400_00B4, 0x0400_002C);
+    bus.write_u16(0x0400_00B8, 1);
+    bus.write_u16(0x0400_00BA, 0xA740); // H-Blank, repeat, 32-bit, src+dst fixed
+    let frame = run(&mut bus, 1);
+    for y in 1..VISIBLE_LINES {
+        assert_eq!(row(&frame, y), row(&frame, 0), "line {y}");
+    }
+}
