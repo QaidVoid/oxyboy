@@ -66,16 +66,19 @@ impl Database {
     /// [`DatabaseError::InvalidEntry`] when an entry's hashes are not the
     /// right length or not hex.
     pub fn from_json(text: &str) -> Result<Self, DatabaseError> {
-        let db: Database = serde_json::from_str(text).map_err(DatabaseError::Json)?;
-        for (index, entry) in db.entries.iter().enumerate() {
-            validate_hash(&entry.md5, 32).map_err(|reason| DatabaseError::InvalidEntry {
-                index,
-                reason: format!("md5: {reason}"),
-            })?;
-            validate_hash(&entry.sha1, 40).map_err(|reason| DatabaseError::InvalidEntry {
-                index,
-                reason: format!("sha1: {reason}"),
-            })?;
+        let mut db: Database = serde_json::from_str(text).map_err(DatabaseError::Json)?;
+        // Hashes are stored lowercase so lookups match either case.
+        for (index, entry) in db.entries.iter_mut().enumerate() {
+            entry.md5 =
+                validate_hash(&entry.md5, 32).map_err(|reason| DatabaseError::InvalidEntry {
+                    index,
+                    reason: format!("md5: {reason}"),
+                })?;
+            entry.sha1 =
+                validate_hash(&entry.sha1, 40).map_err(|reason| DatabaseError::InvalidEntry {
+                    index,
+                    reason: format!("sha1: {reason}"),
+                })?;
         }
         Ok(db)
     }
@@ -144,6 +147,18 @@ mod tests {
         assert_eq!(found.name, "Known Game");
         assert_eq!(found.status.as_deref(), Some("Verified"));
         assert_eq!(found.save_type.as_deref(), Some("eeprom8k"));
+    }
+
+    #[test]
+    fn uppercase_hashes_still_match() {
+        let db = Database::from_json(
+            r#"{ "entries": [ { "name": "Known Game", "status": null,
+                "md5": "900150983CD24FB0D6963F7D28E17F72",
+                "sha1": "A9993E364706816ABA3E25717850C26C9CD0D89D" } ] }"#,
+        )
+        .expect("valid");
+        let hashes = Hashes::compute(b"abc");
+        assert!(db.find(&hashes).is_some());
     }
 
     #[test]
