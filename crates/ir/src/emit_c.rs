@@ -86,6 +86,7 @@ impl Annotations {
 const UNIT_PREAMBLE: &str = r#"typedef unsigned int u32;
 typedef signed int i32;
 typedef unsigned long long u64;
+typedef signed long long i64;
 extern u32 load_u8(u32);
 extern u32 load_u16(u32);
 extern u32 load_u32(u32);
@@ -131,6 +132,9 @@ struct Emitter<'a> {
     callees: &'a BTreeMap<u32, String>,
     out: String,
     indent: usize,
+    /// Inside a guarded `if`: definitions assign to locals declared
+    /// before the `if` instead of declaring them.
+    assigning: bool,
 }
 
 /// Emits `function` as structured C-like text.
@@ -146,6 +150,7 @@ pub fn emit_function(function: &Function) -> String {
         consumed: BTreeSet::new(),
         loop_stack: Vec::new(),
         unit: false,
+        assigning: false,
         callees: &callees,
         out: String::new(),
         indent: 1,
@@ -228,6 +233,7 @@ pub fn emit_unit(addrs: &[u32], functions: &[Function], annotations: &Annotation
             consumed: BTreeSet::new(),
             loop_stack: Vec::new(),
             unit: true,
+            assigning: false,
             callees: &callees,
             out: String::new(),
             indent: 1,
@@ -283,6 +289,35 @@ fn recognize_loops(cfg: &Cfg, function: &Function) -> Vec<Shape> {
         };
         let in_body = |b: BlockId| loop_.body.contains(&b);
         let header_term = &function.blocks[header.0 as usize].term;
+        // A single-block loop tests at its end: do-while over itself.
+        if latch == header {
+            if let Terminator::BranchCond {
+                cond,
+                then_target,
+                else_target,
+                ..
+            } = header_term
+            {
+                let (invert, exit) = if *then_target == header {
+                    (false, *else_target)
+                } else {
+                    (true, *then_target)
+                };
+                if !in_body(exit) {
+                    shapes.push(Shape {
+                        header,
+                        body_enter: header,
+                        exit,
+                        latch,
+                        close: Close::DoWhile {
+                            cond: *cond,
+                            invert,
+                        },
+                    });
+                }
+            }
+            continue;
+        }
         // while: the header condition picks body-in vs body-out and
         // the latch closes unconditionally.
         if let Terminator::BranchCond {
@@ -617,35 +652,57 @@ impl Emitter<'_> {
 
     /// Emits the closing line of the innermost open loop.
     fn emit_close(&mut self, latch: BlockId) {
-        match self.loop_stack.last().map(|(_, _, close)| close.clone()) {
-            Some(Close::While) => self.line("}"),
-            Some(Close::WhileLatch { cond, invert }) => {
-                let text = self.condition_text(cond, latch, invert);
-                self.line(&format!("if ({text}) {{ break; }}"));
-                self.line("}");
-            }
+        let close = self.loop_stack.last().map(|(_, _, close)| close.clone());
+        if let Some(Close::WhileLatch { cond, invert }) = close {
+            let text = self.condition_text(cond, latch, invert);
+            self.line(&format!("if ({text}) {{ break; }}"));
+        }
+        // The walk runs at body indentation; the brace closes outside.
+        self.indent -= 1;
+        match close {
             Some(Close::DoWhile { cond, invert }) => {
                 let text = self.condition_text(cond, latch, invert);
                 self.line(&format!("}} while ({text});"));
             }
-            None => self.line("}"),
+            _ => self.line("}"),
         }
+        self.indent += 1;
     }
 
     /// Emits one recognized loop and continues at its exit. `stop`
     /// is the enclosing walk's latch, used for the exit continuation.
     fn open_loop(&mut self, shape: Shape, stop: Option<(BlockId, BlockId)>) {
-        let skip = matches!(shape.close, Close::While | Close::WhileLatch { .. })
-            && self.last_inst_is_cmp(shape.header);
         self.consumed.insert(shape.header);
-        self.emit_insts(shape.header, skip);
-        let (opening, entry) = if matches!(shape.close, Close::While | Close::WhileLatch { .. }) {
+        if shape.header == shape.latch {
+            self.single_block_loop(&shape, stop);
+            return;
+        }
+        let tested = matches!(shape.close, Close::While | Close::WhileLatch { .. });
+        let skip = tested && self.last_inst_is_cmp(shape.header);
+        let header_len = self.function.blocks[shape.header.0 as usize].insts.len();
+        let entry = if tested && header_len > usize::from(skip) {
+            // The header does work before its test, and that work
+            // runs on every iteration: `for (;;) { work; test; body }`.
+            self.line("for (;;) {");
+            self.indent += 1;
+            self.emit_insts(shape.header, skip);
             let (cond, entry) = self.loop_condition(&shape);
-            (format!("while ({cond}) {{"), entry)
+            self.line(&format!("if (!({cond})) break;"));
+            self.indent -= 1;
+            entry
+        } else if tested {
+            self.emit_insts(shape.header, skip);
+            let (cond, entry) = self.loop_condition(&shape);
+            self.line(&format!("while ({cond}) {{"));
+            entry
         } else {
-            ("do {".to_string(), shape.body_enter)
+            // The header runs every iteration, so it opens the body.
+            self.line("do {");
+            self.indent += 1;
+            self.emit_insts(shape.header, false);
+            self.indent -= 1;
+            shape.body_enter
         };
-        self.line(&opening);
         self.loop_stack
             .push((shape.header, shape.latch, shape.close.clone()));
         self.indent += 1;
@@ -661,6 +718,24 @@ impl Emitter<'_> {
         }
     }
 
+    /// `do { block } while (cond);` for a loop that is one block.
+    fn single_block_loop(&mut self, shape: &Shape, stop: Option<(BlockId, BlockId)>) {
+        let Close::DoWhile { cond, invert } = shape.close else {
+            return;
+        };
+        self.line("do {");
+        self.indent += 1;
+        let skip = self.last_inst_is_cmp(shape.header);
+        self.emit_insts(shape.header, skip);
+        self.indent -= 1;
+        let text = self.condition_text(cond, shape.header, invert);
+        self.line(&format!("}} while ({text});"));
+        let (action, next) = self.fallthrough_or_goto(shape.exit);
+        if action == Action::Fallthrough {
+            self.emit_from(next, stop);
+        }
+    }
+
     /// The loop close emitted by the open_loop frame itself, when the
     /// body walk ended without reaching the latch.
     fn frame_close(&mut self, shape: &Shape) {
@@ -668,7 +743,9 @@ impl Emitter<'_> {
             Close::While => self.line("}"),
             Close::WhileLatch { cond, invert } => {
                 let text = self.condition_text(*cond, shape.latch, *invert);
+                self.indent += 1;
                 self.line(&format!("if ({text}) {{ break; }}"));
+                self.indent -= 1;
                 self.line("}");
             }
             Close::DoWhile { cond, invert } => {
@@ -753,13 +830,79 @@ impl Emitter<'_> {
 
     fn emit_insts(&mut self, block: BlockId, skip_trailing_cmp: bool) {
         let insts = self.function.blocks[block.0 as usize].insts.clone();
-        let count = insts.len();
-        for (index, inst) in insts.iter().enumerate() {
-            if skip_trailing_cmp && index + 1 == count && matches!(inst.op, Op::Cmp { .. }) {
+        let mut count = insts.len();
+        if skip_trailing_cmp
+            && insts
+                .last()
+                .is_some_and(|inst| matches!(inst.op, Op::Cmp { .. }))
+        {
+            count -= 1;
+        }
+        let mut index = 0;
+        while index < count {
+            let Some(cond) = insts[index].guard.filter(|cond| *cond != Condition::Al) else {
+                self.emit_inst(&insts[index]);
+                index += 1;
                 continue;
+            };
+            // One guest instruction lifts to a run of insts under the
+            // same guard; the run ends where a flag write could change
+            // what the guard reads.
+            let text = self.condition_at(cond, block, index, false);
+            let start = index;
+            while index < count && insts[index].guard == insts[start].guard {
+                let writes_flags = crate::opt::flag_dests(&insts[index].op, &insts[index].dests)
+                    .iter()
+                    .any(Option::is_some);
+                index += 1;
+                if writes_flags {
+                    break;
+                }
             }
+            self.emit_guarded(&text, &insts[start..index]);
+        }
+    }
+
+    /// `if (cond) { run } else { fallbacks }`: a failed guard leaves
+    /// each written slot at its previous value.
+    fn emit_guarded(&mut self, cond: &str, run: &[Inst]) {
+        if !self.unit {
+            for inst in run {
+                for (position, dest) in inst.dests.iter().enumerate() {
+                    let fallback = inst.fallbacks.get(position).is_some_and(Option::is_some);
+                    if position == 0 || fallback {
+                        self.line(&format!("u32 v{};", dest.0));
+                    }
+                }
+            }
+        }
+        self.line(&format!("if ({cond}) {{"));
+        self.indent += 1;
+        self.assigning = true;
+        for inst in run {
             self.emit_inst(inst);
         }
+        self.assigning = false;
+        self.indent -= 1;
+        let fallbacks: Vec<(ValueId, Value)> = run
+            .iter()
+            .flat_map(|inst| {
+                inst.dests
+                    .iter()
+                    .zip(&inst.fallbacks)
+                    .filter_map(|(dest, prev)| prev.map(|prev| (*dest, prev)))
+            })
+            .collect();
+        if !fallbacks.is_empty() {
+            self.line("} else {");
+            self.indent += 1;
+            for (dest, prev) in fallbacks {
+                let value = self.value(&prev);
+                self.line(&format!("v{} = {value};", dest.0));
+            }
+            self.indent -= 1;
+        }
+        self.line("}");
     }
 
     fn last_inst_is_cmp(&self, block: BlockId) -> bool {
@@ -838,7 +981,9 @@ impl Emitter<'_> {
                 && inner_else != not_taken
                 && inner_else != block
             {
-                let inner = self.condition_text(inner_cond, not_taken, true);
+                // The inner block reaches `taken` when its condition
+                // holds, so it joins the disjunction as is.
+                let inner = self.condition_text(inner_cond, not_taken, false);
                 cond_text = format!("({cond_text}) || ({inner})");
                 folded.push(not_taken);
                 taken_preds.push(not_taken);
@@ -859,9 +1004,11 @@ impl Emitter<'_> {
             };
             let text = if holds {
                 format!("if ({cond_text}) {{")
-            } else {
+            } else if folded.is_empty() {
                 let inverted = self.condition_text(cond, block, true);
                 format!("if ({inverted}) {{")
+            } else {
+                format!("if (!({cond_text})) {{")
             };
             self.line(&text);
             self.indent += 1;
@@ -1102,11 +1249,13 @@ impl Emitter<'_> {
                 acc_hi,
                 set_flags: _,
             } => {
-                let sign = if *unsigned { "u" } else { "i" };
+                // Signed operands sign-extend from 32 bits; the
+                // accumulator pair widens before the shift.
+                let (sign, narrow) = if *unsigned { ("u", "") } else { ("i", "(i32)") };
                 let acc = if *accumulate {
                     let hi = self.value(acc_hi);
                     let lo = self.value(acc_lo);
-                    format!(" + ({hi} << 32) + {lo}")
+                    format!(" + ((u64){hi} << 32) + {lo}")
                 } else {
                     String::new()
                 };
@@ -1119,15 +1268,15 @@ impl Emitter<'_> {
                 if self.unit {
                     if inst.dests.is_empty() {
                         format!(
-                            "{{ u64 __pair = ({sign}64){a} * ({sign}64){b}{acc}; (void)__pair; }}"
+                            "{{ u64 __pair = ({sign}64){narrow}{a} * ({sign}64){narrow}{b}{acc}; (void)__pair; }}"
                         )
                     } else {
                         format!(
-                            "{{ u64 __pair = ({sign}64){a} * ({sign}64){b}{acc}; {lo} = (u32)__pair; {hi} = (u32)(__pair >> 32); }}"
+                            "{{ u64 __pair = ({sign}64){narrow}{a} * ({sign}64){narrow}{b}{acc}; {lo} = (u32)__pair; {hi} = (u32)(__pair >> 32); }}"
                         )
                     }
                 } else {
-                    format!("u64 {lo}:{hi} = ({sign}64){a} * ({sign}64){b}{acc};")
+                    format!("u64 {lo}:{hi} = ({sign}64){narrow}{a} * ({sign}64){narrow}{b}{acc};")
                 }
             }
             Op::Cmp { a, b } => {
@@ -1289,9 +1438,16 @@ impl Emitter<'_> {
     ) -> String {
         let (a, b, carry) = (self.value(a), self.value(b), self.value(carry));
         let flags = if set_flags { " /* sets flags */" } else { "" };
+        // ADC adds the carry; SBC and RSC subtract its complement, the
+        // borrow.
+        let carry = if op == "-" {
+            format!("- !{carry}")
+        } else {
+            format!("+ {carry}")
+        };
         match dest {
-            Some(dest) => format!("{}{a} {op} {b} + {carry};{flags}", self.def_prefix(dest)),
-            None => format!("__discard({a} {op} {b} + {carry});"),
+            Some(dest) => format!("{}{a} {op} {b} {carry};{flags}", self.def_prefix(dest)),
+            None => format!("__discard({a} {op} {b} {carry});"),
         }
     }
 
@@ -1305,7 +1461,7 @@ impl Emitter<'_> {
     /// A dest binding: a declaration in the readable form, a plain
     /// assignment in the unit form (declared once at the top).
     fn def_prefix(&self, dest: &str) -> String {
-        if self.unit {
+        if self.unit || self.assigning {
             format!("{dest} = ")
         } else {
             format!("u32 {dest} = ")
@@ -1428,38 +1584,135 @@ impl Emitter<'_> {
         Some(format!(" /* swi 0x{number:02x}{name} */"))
     }
 
-    /// Renders `cond` against the block's trailing `cmp` when
-    /// present, else as a flag expression. `invert` negates.
+    /// Renders `cond` at the end of `block`. `invert` negates.
     fn condition_text(&self, cond: Condition, block: BlockId, invert: bool) -> String {
+        let upto = self
+            .function
+            .blocks
+            .get(block.0 as usize)
+            .map_or(0, |b| b.insts.len());
+        self.condition_at(cond, block, upto, invert)
+    }
+
+    /// Renders `cond` over the flags live before inst `upto` of
+    /// `block`: from the instruction that defined them when one did
+    /// (`cmp a, b` reads as `a < b`), else as a flag expression over
+    /// the flag values themselves. `invert` negates.
+    fn condition_at(&self, cond: Condition, block: BlockId, upto: usize, invert: bool) -> String {
         let (cond, wrapped) = if invert {
             (negate(cond), cond == Condition::Al)
         } else {
             (Some(cond), false)
         };
+        let sources = self.flag_sources(block, upto);
         let Some(cond) = cond else {
-            let text = self.flag_expr(Condition::Al, block);
-            return format!("!({text})");
+            return format!(
+                "!({})",
+                flag_expr(Condition::Al, &self.flag_names(block, &sources))
+            );
         };
-        let text = match self.block_cmp(block) {
-            Some((a, b)) => self.comparison_text(cond, a, b, block),
-            None => self.flag_expr(cond, block),
-        };
+        let defs: Vec<Option<usize>> = (0..4)
+            .filter(|&flag| cond_flags(cond)[flag])
+            .map(|flag| sources[flag].map(|(index, _)| index))
+            .collect();
+        let text = match defs.first() {
+            Some(Some(index)) if defs.iter().all(|d| *d == Some(*index)) => {
+                let inst = &self.function.blocks[block.0 as usize].insts[*index];
+                self.semantic_condition(cond, inst)
+            }
+            _ => None,
+        }
+        .unwrap_or_else(|| flag_expr(cond, &self.flag_names(block, &sources)));
         if wrapped { format!("!({text})") } else { text }
     }
 
-    /// The operands of the block's last instruction, when it is a
-    /// `cmp`.
-    fn block_cmp(&self, block: BlockId) -> Option<(Value, Value)> {
-        let block = self.function.blocks.get(block.0 as usize)?;
-        match &block.insts.last()?.op {
-            Op::Cmp { a, b } => Some((*a, *b)),
+    /// The defining inst index and id of each flag `[N, Z, C, V]`
+    /// before inst `upto`; `None` where the block's incoming flag
+    /// still holds.
+    fn flag_sources(&self, block: BlockId, upto: usize) -> [Option<(usize, ValueId)>; 4] {
+        let mut sources = [None; 4];
+        let Some(block) = self.function.blocks.get(block.0 as usize) else {
+            return sources;
+        };
+        for (index, inst) in block.insts.iter().take(upto).enumerate() {
+            for (slot, dest) in crate::opt::flag_dests(&inst.op, &inst.dests)
+                .into_iter()
+                .enumerate()
+            {
+                if let Some(id) = dest {
+                    sources[slot] = Some((index, id));
+                }
+            }
+        }
+        sources
+    }
+
+    /// C names of the four flags: defined ids, else block parameters.
+    fn flag_names(&self, block: BlockId, sources: &[Option<(usize, ValueId)>; 4]) -> [String; 4] {
+        [Flag::N, Flag::Z, Flag::C, Flag::V]
+            .into_iter()
+            .enumerate()
+            .map(|(slot, flag)| match sources[slot] {
+                Some((_, id)) => format!("v{}", id.0),
+                None => self.flag_slot(block, flag),
+            })
+            .collect::<Vec<_>>()
+            .try_into()
+            .expect("four flags")
+    }
+
+    /// `cond` in terms of the instruction that set every flag it
+    /// reads, or `None` when only a flag expression says it exactly.
+    fn semantic_condition(&self, cond: Condition, inst: &Inst) -> Option<String> {
+        use Condition as C;
+        let zero_sign = |value: String| match cond {
+            C::Eq => Some(format!("(({value}) == 0u)")),
+            C::Ne => Some(format!("(({value}) != 0u)")),
+            C::Mi => Some(format!("((i32)({value}) < 0)")),
+            C::Pl => Some(format!("((i32)({value}) >= 0)")),
             _ => None,
+        };
+        match &inst.op {
+            // `subs` then `bne` reads best as a test of the result.
+            Op::Sub {
+                set_flags: true, ..
+            } if matches!(cond, C::Eq | C::Ne) && !inst.dests.is_empty() => {
+                zero_sign(format!("v{}", inst.dests[0].0))
+            }
+            Op::Cmp { a, b }
+            | Op::Sub {
+                set_flags: true,
+                a,
+                b,
+            } => self.comparison(cond, a, b),
+            Op::Rsb {
+                set_flags: true,
+                a,
+                b,
+            } => self.comparison(cond, b, a),
+            Op::Cmn { a, b }
+            | Op::Add {
+                set_flags: true,
+                a,
+                b,
+            } => zero_sign(format!("{} + {}", self.value(a), self.value(b))),
+            Op::Tst { a, b, .. } => zero_sign(format!("{} & {}", self.value(a), self.value(b))),
+            Op::Teq { a, b, .. } => match cond {
+                C::Eq => Some(format!("({} == {})", self.value(a), self.value(b))),
+                C::Ne => Some(format!("({} != {})", self.value(a), self.value(b))),
+                _ => zero_sign(format!("{} ^ {}", self.value(a), self.value(b))),
+            },
+            _ => {
+                let result = inst.dests.first()?;
+                zero_sign(format!("v{}", result.0))
+            }
         }
     }
 
-    fn comparison_text(&self, cond: Condition, a: Value, b: Value, block: BlockId) -> String {
-        let (a, b) = (self.value(&a), self.value(&b));
-        match cond {
+    /// `cond` after `cmp a, b`.
+    fn comparison(&self, cond: Condition, a: &Value, b: &Value) -> Option<String> {
+        let (a, b) = (self.value(a), self.value(b));
+        Some(match cond {
             Condition::Eq => format!("({a} == {b})"),
             Condition::Ne => format!("({a} != {b})"),
             Condition::Hi => format!("((u32){a} > (u32){b})"),
@@ -1470,32 +1723,10 @@ impl Emitter<'_> {
             Condition::Lt => format!("((i32){a} < (i32){b})"),
             Condition::Gt => format!("((i32){a} > (i32){b})"),
             Condition::Le => format!("((i32){a} <= (i32){b})"),
-            _ => format!("{} /* {cond:?} */", self.flag_expr(cond, block)),
-        }
-    }
-
-    fn flag_expr(&self, cond: Condition, block: BlockId) -> String {
-        let n = self.flag_slot(block, Flag::N);
-        let z = self.flag_slot(block, Flag::Z);
-        let c = self.flag_slot(block, Flag::C);
-        let v = self.flag_slot(block, Flag::V);
-        match cond {
-            Condition::Eq => z,
-            Condition::Ne => format!("!{z}"),
-            Condition::Cs => c,
-            Condition::Cc => format!("!{c}"),
-            Condition::Mi => n,
-            Condition::Pl => format!("!{n}"),
-            Condition::Vs => v,
-            Condition::Vc => format!("!{v}"),
-            Condition::Hi => format!("({c} && !{z})"),
-            Condition::Ls => format!("(!{c} || {z})"),
-            Condition::Ge => format!("({n} == {v})"),
-            Condition::Lt => format!("({n} != {v})"),
-            Condition::Gt => format!("(!{z} && {n} == {v})"),
-            Condition::Le => format!("({z} || {n} != {v})"),
-            Condition::Al => "1".to_string(),
-        }
+            Condition::Mi => format!("((i32)({a} - {b}) < 0)"),
+            Condition::Pl => format!("((i32)({a} - {b}) >= 0)"),
+            Condition::Vs | Condition::Vc | Condition::Al => return None,
+        })
     }
 
     /// The SSA name of one flag slot in `block`'s parameters, or a
@@ -1519,6 +1750,43 @@ impl Emitter<'_> {
     }
 }
 
+/// Which flags `[N, Z, C, V]` a condition reads.
+fn cond_flags(cond: Condition) -> [bool; 4] {
+    use Condition as C;
+    match cond {
+        C::Eq | C::Ne => [false, true, false, false],
+        C::Cs | C::Cc => [false, false, true, false],
+        C::Mi | C::Pl => [true, false, false, false],
+        C::Vs | C::Vc => [false, false, false, true],
+        C::Hi | C::Ls => [false, true, true, false],
+        C::Ge | C::Lt => [true, false, false, true],
+        C::Gt | C::Le => [true, true, false, true],
+        C::Al => [false; 4],
+    }
+}
+
+/// `cond` as an expression over the named flags `[N, Z, C, V]`.
+fn flag_expr(cond: Condition, names: &[String; 4]) -> String {
+    let [n, z, c, v] = names;
+    match cond {
+        Condition::Eq => z.clone(),
+        Condition::Ne => format!("!{z}"),
+        Condition::Cs => c.clone(),
+        Condition::Cc => format!("!{c}"),
+        Condition::Mi => n.clone(),
+        Condition::Pl => format!("!{n}"),
+        Condition::Vs => v.clone(),
+        Condition::Vc => format!("!{v}"),
+        Condition::Hi => format!("({c} && !{z})"),
+        Condition::Ls => format!("(!{c} || {z})"),
+        Condition::Ge => format!("({n} == {v})"),
+        Condition::Lt => format!("({n} != {v})"),
+        Condition::Gt => format!("(!{z} && {n} == {v})"),
+        Condition::Le => format!("({z} || {n} != {v})"),
+        Condition::Al => "1".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1535,9 +1803,10 @@ mod tests {
         }
     }
 
+    /// A `cmp` binding all four flags, as the lifter emits it.
     fn cmp(a: u32, b: u32) -> Inst {
         inst(
-            Vec::new(),
+            (1000..1004).map(ValueId).collect(),
             Op::Cmp {
                 a: Value::Const(a),
                 b: Value::Const(b),
@@ -1691,7 +1960,10 @@ mod tests {
             block(vec![], value_return(0x0)),
         ]);
         assert_wellformed(&text);
-        assert!(text.contains("||"), "{text}");
+        assert!(
+            text.contains("if (((0x1u != 0x0u)) || ((0x2u != 0x0u))) {"),
+            "{text}"
+        );
         assert!(!text.contains("goto"), "{text}");
     }
 
@@ -1800,6 +2072,30 @@ mod tests {
     }
 
     #[test]
+    fn early_return_negates_the_whole_folded_condition() {
+        let text = emitted(vec![
+            // b0: a ? b1 : b3; b1: b ? b2 : b3 (a && b); b2 falls on to
+            // b4; b3 returns
+            block(
+                vec![cmp(0x1, 0x0)],
+                branch_cond(Condition::Ne, BlockId(1), BlockId(3)),
+            ),
+            block(
+                vec![cmp(0x2, 0x0)],
+                branch_cond(Condition::Ne, BlockId(2), BlockId(3)),
+            ),
+            block(vec![], branch(BlockId(4))),
+            block(vec![], value_return(0x0)),
+            block(vec![], value_return(0x1)),
+        ]);
+        assert_wellformed(&text);
+        assert!(
+            text.contains("if (!(((0x1u != 0x0u)) && ((0x2u != 0x0u)))) {"),
+            "{text}"
+        );
+    }
+
+    #[test]
     fn switch_site_falls_back_to_marked_goto() {
         let text = emitted(vec![block(
             vec![],
@@ -1885,6 +2181,66 @@ mod tests {
             },
             &[],
         )
+    }
+
+    /// Lifts and optimizes ARM `words`, then renders the readable C.
+    fn lifted_text(words: &[u32]) -> String {
+        let mut function = lift_arm(words, words.len());
+        crate::opt::optimize(&mut function);
+        emit_function(&function)
+    }
+
+    #[test]
+    fn guarded_instructions_render_as_if_else() {
+        // cmp r0, #0; movne r0, #1; moveq r0, #0; bx lr
+        let text = lifted_text(&[0xE350_0000, 0x13A0_0001, 0x03A0_0000, 0xE12F_FF1E]);
+        assert_wellformed(&text);
+        assert_eq!(text.matches("if (").count(), 2, "{text}");
+        assert!(text.contains(" != 0x0u)) {"), "{text}");
+        assert!(text.contains(" == 0x0u)) {"), "{text}");
+        assert_eq!(text.matches("} else {").count(), 2, "{text}");
+    }
+
+    #[test]
+    fn conditions_read_the_flags_live_at_the_branch() {
+        // mov r0, #5; loop: subs r0, r0, #1; bne loop; bx lr
+        let text = lifted_text(&[0xE3A0_0005, 0xE250_0001, 0x1AFF_FFFD, 0xE12F_FF1E]);
+        assert_wellformed(&text);
+        assert!(text.contains("do {"), "{text}");
+        assert!(text.contains(") != 0u));"), "{text}");
+        assert!(!text.contains("/* Z */"), "{text}");
+        assert_eq!(text.matches("b1:;").count(), 1, "{text}");
+
+        // tst r0, #1; beq +4; mov r0, #7; bx lr
+        let text = lifted_text(&[0xE310_0001, 0x0A00_0000, 0xE3A0_0007, 0xE12F_FF1E]);
+        assert!(text.contains(" & 0x1u) == 0u)"), "{text}");
+    }
+
+    #[test]
+    fn loop_header_work_runs_every_iteration() {
+        // loop: ldrb r1, [r0]; cmp r1, #0; beq exit; add r0, r0, #1;
+        // b loop; exit: bx lr
+        let text = lifted_text(&[
+            0xE5D0_1000,
+            0xE351_0000,
+            0x0A00_0001,
+            0xE280_0001,
+            0xEAFF_FFFA,
+            0xE12F_FF1E,
+        ]);
+        assert_wellformed(&text);
+        let open = text.find("for (;;) {").expect("a for loop");
+        let load = text.find("mem_u8").expect("the load");
+        let test = text.find(")) break;").expect("the loop test");
+        assert!(open < load && load < test, "{text}");
+    }
+
+    #[test]
+    fn long_multiply_and_borrow_render_exactly() {
+        // smull r0, r1, r2, r3; sbc r0, r1, r2; bx lr
+        let text = lifted_text(&[0xE0C1_0392, 0xE0C1_0002, 0xE12F_FF1E]);
+        assert!(text.contains("(i64)(i32)"), "{text}");
+        assert!(text.contains(" - !v"), "{text}");
     }
 
     #[test]
@@ -2026,7 +2382,35 @@ mod tests {
                 },
             )],
         };
-        let text = emit_unit(&[base], &[caller, callee], &Annotations::default());
+        let mut functions = vec![caller, callee];
+        for (name, words) in [
+            (
+                "guarded",
+                vec![0xE350_0000, 0x13A0_0001, 0x03A0_0000, 0xE12F_FF1E],
+            ),
+            (
+                "down",
+                vec![0xE3A0_0005, 0xE250_0001, 0x1AFF_FFFD, 0xE12F_FF1E],
+            ),
+            (
+                "scan",
+                vec![
+                    0xE5D0_1000,
+                    0xE351_0000,
+                    0x0A00_0001,
+                    0xE280_0001,
+                    0xEAFF_FFFA,
+                    0xE12F_FF1E,
+                ],
+            ),
+            ("wide", vec![0xE0C1_0392, 0xE0C1_0002, 0xE12F_FF1E]),
+        ] {
+            let mut function = lift_arm(&words, words.len());
+            crate::opt::optimize(&mut function);
+            function.name = name.to_string();
+            functions.push(function);
+        }
+        let text = emit_unit(&[base], &functions, &Annotations::default());
         let Ok(check) = std::process::Command::new("gcc").arg("--version").output() else {
             eprintln!("skipping: gcc not runnable");
             return;

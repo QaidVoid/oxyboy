@@ -48,7 +48,7 @@ fn unconditional(inst: &Inst) -> bool {
 /// The flag dests of one op in `[N, Z, C, V]` order, `None` for flags
 /// the op does not write. Positions follow the per-variant dest
 /// contracts documented on [`Op`].
-fn flag_dests(op: &Op, dests: &[ValueId]) -> [Option<ValueId>; 4] {
+pub(crate) fn flag_dests(op: &Op, dests: &[ValueId]) -> [Option<ValueId>; 4] {
     let d = |i: usize| dests.get(i).copied();
     match op {
         Op::Add {
