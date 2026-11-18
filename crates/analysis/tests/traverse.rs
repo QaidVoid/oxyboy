@@ -453,3 +453,37 @@ fn ldr_pc_literal_veneer_follows_the_target() {
         reason: StopReason::Return,
     }));
 }
+
+#[test]
+fn agbcc_pop_then_bx_is_a_return() {
+    // THUMB at 0x40: push {lr}; movs r0, #1; pop {r1}; bx r1, the agbcc
+    // epilogue that restores the return address into a low register.
+    // At 0x60: movs r1, #1; bx r1 jumps through a computed register.
+    let mut bytes = RomBuilder::new().title("AGBR").build();
+    bytes[0x40..0x48].copy_from_slice(&[0x00, 0xB5, 0x01, 0x20, 0x02, 0xBC, 0x08, 0x47]);
+    bytes[0x60..0x64].copy_from_slice(&[0x01, 0x21, 0x08, 0x47]);
+    let image = Image::from_bytes(bytes).expect("parse");
+    let mut map = FlagMap::from_image(&image);
+    let seeds = vec![
+        Seed {
+            addr: 0x0800_0040,
+            state: State::Thumb,
+        },
+        Seed {
+            addr: 0x0800_0060,
+            state: State::Thumb,
+        },
+    ];
+    let traversal = traverse(&image, &mut map, &seeds);
+    assert!(traversal.stops.contains(&Stop {
+        addr: 0x0800_0046,
+        state: State::Thumb,
+        reason: StopReason::Return,
+    }));
+    assert!(
+        !traversal
+            .stops
+            .iter()
+            .any(|stop| stop.addr == 0x0800_0062 && stop.reason == StopReason::Return)
+    );
+}

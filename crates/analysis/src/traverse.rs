@@ -262,6 +262,24 @@ impl PathWalk<'_, '_> {
         self.read(addr, 4)
     }
 
+    /// Whether the THUMB instruction before `addr` pops `reg` (and not
+    /// pc): agbcc returns with `pop {r0}; bx r0`, restoring the saved
+    /// return address into a low register, since THUMB `pop {pc}`
+    /// cannot switch state on ARMv4T.
+    fn popped_just_before(&self, addr: u32, reg: Register) -> bool {
+        let Some(half) = self.read(addr.wrapping_sub(2), 2) else {
+            return false;
+        };
+        matches!(
+            decode_thumb(half as u16, 0),
+            ThumbInstr::PushPop {
+                pop: true,
+                include_pc_or_lr: false,
+                registers,
+            } if registers >> reg.bits() & 1 != 0
+        )
+    }
+
     /// Enqueues a path continuation if it has not been visited. The
     /// fork inherits the copy arguments: they belong to the caller's
     /// argument registers, which survive a call return.
@@ -653,7 +671,12 @@ impl PathWalk<'_, '_> {
                                     addr = value & !1;
                                 }
                                 None => {
-                                    self.stop(addr, state, StopReason::UnknownTarget);
+                                    let reason = if self.popped_just_before(addr, rs) {
+                                        StopReason::Return
+                                    } else {
+                                        StopReason::UnknownTarget
+                                    };
+                                    self.stop(addr, state, reason);
                                     return;
                                 }
                             }
