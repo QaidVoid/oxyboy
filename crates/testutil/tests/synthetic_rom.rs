@@ -23,7 +23,10 @@ fn header_layout_is_gbatek_shaped() {
     assert_eq!(&rom[0x0B0..0x0B2], b"01");
     assert_eq!(rom[0x0B2], 0x96);
     let sum: u32 = rom[0x0A0..0x0BD].iter().map(|&b| u32::from(b)).sum();
-    assert_eq!((0x100u32.wrapping_sub(sum) & 0xFF) as u8, rom[0x0BD]);
+    assert_eq!(
+        (0u32.wrapping_sub(sum).wrapping_sub(0x19) & 0xFF) as u8,
+        rom[0x0BD]
+    );
     assert_eq!(&rom[0x100..0x104], &[1, 2, 3, 4]);
 }
 

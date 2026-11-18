@@ -5,77 +5,77 @@
       "rom": "target/test-roms/eeprom512test.gba",
       "frames": 60,
       "budget_ms": 20,
-      "hash": "4c22200b67ff8c13"
+      "hash": "0fbc44c8cedf4ec6"
     },
     {
       "name": "eeprom8ktest",
       "rom": "target/test-roms/eeprom8ktest.gba",
       "frames": 60,
       "budget_ms": 20,
-      "hash": "360d4a88840da27f"
+      "hash": "1ae25a93bfb644e6"
     },
     {
       "name": "flash128test",
       "rom": "target/test-roms/flash128test.gba",
       "frames": 60,
       "budget_ms": 20,
-      "hash": "26a80db9d04e3c4f"
+      "hash": "b309e2ceb7c75a1a"
     },
     {
       "name": "flash64test",
       "rom": "target/test-roms/flash64test.gba",
       "frames": 60,
       "budget_ms": 20,
-      "hash": "a45aded21807381d"
+      "hash": "15d8ea25fdef98fe"
     },
     {
       "name": "inputtest",
       "rom": "target/test-roms/inputtest.gba",
       "frames": 60,
       "budget_ms": 20,
-      "hash": "feff6a42d7f671aa"
+      "hash": "c07ebce3c66be183"
     },
     {
       "name": "irqtest",
       "rom": "target/test-roms/irqtest.gba",
       "frames": 60,
       "budget_ms": 20,
-      "hash": "61e13ea489404e03"
+      "hash": "b4fd983c310fc622"
     },
     {
       "name": "mb-thumbptr",
       "rom": "target/test-roms/mb-thumbptr.gba",
       "frames": 60,
       "budget_ms": 60,
-      "hash": "8bc012bfa82e7350"
+      "hash": "525424bdadad05b7"
     },
     {
       "name": "mode3",
       "rom": "target/test-roms/mode3.gba",
       "frames": 60,
       "budget_ms": 20,
-      "hash": "b830a3db4f1a81b7"
+      "hash": "e6ad640872e987cc"
     },
     {
       "name": "sramtest",
       "rom": "target/test-roms/sramtest.gba",
       "frames": 60,
       "budget_ms": 20,
-      "hash": "871c34ec92095829"
+      "hash": "8d50073af91c8f7e"
     },
     {
       "name": "switest",
       "rom": "target/test-roms/switest.gba",
       "frames": 60,
       "budget_ms": 20,
-      "hash": "0a4a4deaf0cfdb81"
+      "hash": "ce8ddfe8f7c8238e"
     },
     {
       "name": "thumbmix",
       "rom": "target/test-roms/thumbmix.gba",
       "frames": 60,
       "budget_ms": 30,
-      "hash": "447c4179a2c767fb"
+      "hash": "39b50e2817bee91c"
     },
     {
       "name": "cart",

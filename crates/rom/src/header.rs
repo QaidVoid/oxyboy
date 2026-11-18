@@ -117,7 +117,7 @@ impl Header {
     }
 
     /// Computes the complement checksum the header should carry:
-    /// `0x100 - sum(bytes 0x0A0..0x0BD) mod 256` (GBATEK, "The Cartridge
+    /// `-(sum(bytes 0x0A0..0x0BD) + 0x19) mod 256` (GBATEK, "The Cartridge
     /// Header").
     #[must_use]
     pub fn expected_checksum(&self) -> u8 {
@@ -141,7 +141,7 @@ impl Header {
         {
             sum += u32::from(byte);
         }
-        (0x100u32.wrapping_sub(sum) & 0xFF) as u8
+        (0u32.wrapping_sub(sum).wrapping_sub(0x19) & 0xFF) as u8
     }
 
     /// Reports whether the stored complement checksum matches the header
@@ -210,7 +210,7 @@ mod tests {
         image[0x0BC] = 0x07;
         let checksum = {
             let sum: u32 = image[0x0A0..0x0BD].iter().map(|&b| u32::from(b)).sum();
-            (0x100u32.wrapping_sub(sum) & 0xFF) as u8
+            (0u32.wrapping_sub(sum).wrapping_sub(0x19) & 0xFF) as u8
         };
         image[0x0BD] = checksum;
         let header = header_from(&image);
@@ -225,6 +225,15 @@ mod tests {
         assert_eq!(header.version, 0x07);
         assert_eq!(header.complement_checksum, checksum);
         assert!(header.checksum_valid());
+    }
+
+    #[test]
+    fn checksum_matches_the_bios_formula() {
+        // Blank header with only the fixed 0x96 at 0x0B2:
+        // -(0x96 + 0x19) mod 256 = 0x51.
+        let mut image = [0u8; 0x100];
+        image[0x0B2] = 0x96;
+        assert_eq!(header_from(&image).expected_checksum(), 0x51);
     }
 
     #[test]

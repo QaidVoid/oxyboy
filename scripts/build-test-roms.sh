@@ -45,11 +45,11 @@ for src in "$src_dir"/*.s; do
     rm -f "$out_dir/$name.o" "$elf"
 
     # Patch the header complement checksum at 0x0BD:
-    # 0x100 - sum(header[0x0A0..0x0BD]) mod 256 (GBATEK, "The Cartridge
+    # -(sum(header[0x0A0..0x0BD]) + 0x19) mod 256 (GBATEK, "The Cartridge
     # Header"). The assembler cannot compute it across the byte field, so
     # the source stores a placeholder.
     sum=$(od -An -tu1 -j 160 -N 29 "$bin" | awk '{for (i = 1; i <= NF; i++) s += $i} END {print s}')
-    checksum=$(( (256 - sum % 256) % 256 ))
+    checksum=$(( (512 - (sum + 0x19) % 256) % 256 ))
     printf "\\$(printf '%03o' "$checksum")" |
         dd of="$bin" bs=1 seek=189 conv=notrunc 2>/dev/null
 

@@ -98,7 +98,7 @@ impl RomBuilder {
     }
 
     /// Builds the image and fixes up the complement checksum at `0x0BD`,
-    /// computed as `0x100 - sum(header[0x0A0..0x0BD]) mod 256` (GBATEK,
+    /// computed as `-(sum(header[0x0A0..0x0BD]) + 0x19) mod 256` (GBATEK,
     /// "The Cartridge Header").
     #[must_use]
     pub fn build(self) -> Vec<u8> {
@@ -128,7 +128,7 @@ impl Default for RomBuilder {
 /// Computes the header complement checksum over bytes `0x0A0..0x0BD`.
 fn complement_checksum(header: &[u8]) -> u8 {
     let sum: u32 = header[0x0A0..0x0BD].iter().map(|&b| u32::from(b)).sum();
-    (0x100u32.wrapping_sub(sum) & 0xFF) as u8
+    (0u32.wrapping_sub(sum).wrapping_sub(0x19) & 0xFF) as u8
 }
 
 /// Copies `s` into a fixed-width buffer, truncating and NUL padding.
@@ -145,14 +145,14 @@ mod tests {
     use super::{RomBuilder, complement_checksum};
 
     #[test]
-    fn checksum_matches_story_formula() {
+    fn checksum_matches_the_bios_formula() {
         let mut header = vec![0u8; 0x100];
         header[0x0A0..0x0AC].copy_from_slice(b"CHECKSUMTEST");
         header[0x0B2] = 0x96;
-        let expected = {
-            let sum: i32 = header[0x0A0..0x0BD].iter().map(|&b| i32::from(b)).sum();
-            (0x100 - sum).rem_euclid(0x100) as u8
-        };
+        let expected = header[0x0A0..0x0BD]
+            .iter()
+            .fold(0u8, |chk, &b| chk.wrapping_sub(b))
+            .wrapping_sub(0x19);
         assert_eq!(complement_checksum(&header), expected);
     }
 
