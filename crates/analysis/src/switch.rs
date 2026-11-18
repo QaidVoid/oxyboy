@@ -12,15 +12,18 @@
 //!   reads an entry from a table sitting just after the code, then
 //!   `mov pc, rX` (a leading `lsl rY, rZ, #2` scales the index and
 //!   does not change detection).
-//! - THUMB relative: `ldr rT, [pc, ...]` pulls an entry of byte
-//!   offsets, `add rT, pc` makes it absolute, `mov pc, rT`.
+//! - THUMB relative: `ldr rT, [pc, ...]` pulls one byte offset,
+//!   `add rT, pc` makes it absolute, `mov pc, rT`. The load has a fixed
+//!   address, so this resolves to a single target.
 //!
 //! Detection is a bounded backward window per indirect-jump site: the
 //! twelve instructions before the site are re-decoded and evaluated
 //! forward with a tiny abstract domain (literal-pool word, absolute
-//! table base, pool word plus PC anchor). Any branch or other
+//! table base, pool word plus PC anchor). A branch or other
 //! register-indirect jump inside the window breaks the linear
-//! dataflow, so such sites are skipped and stay unresolved. Resolved
+//! dataflow, so evaluation restarts after it. When that branch is the
+//! switch's range check (`cmp rX, #N` then `bhi`/`bcs` to the default
+//! case), it caps the table at the checked count. Resolved
 //! tables are reported with their entry targets; [`mark_tables`] flags
 //! the table words as `WORD`, and the pipeline feeds the targets back
 //! into the traversal as branch targets.
@@ -29,8 +32,8 @@
 //! and declare a table outright, forcing the transfer bit per state.
 
 use decode::{
-    ArmInstr, DataOp, Register, RegisterShift, ShiftAmount, ShiftKind, ShifterOperand, ThumbHiOp,
-    ThumbImmOp, ThumbInstr, ThumbMemOp, TransferOffset, decode_arm, decode_thumb,
+    ArmInstr, Condition, DataOp, Register, RegisterShift, ShiftAmount, ShiftKind, ShifterOperand,
+    ThumbHiOp, ThumbImmOp, ThumbInstr, ThumbMemOp, TransferOffset, decode_arm, decode_thumb,
 };
 use rom::Image;
 
@@ -186,6 +189,8 @@ fn analyze_site(image: &Image, map: &FlagMap, site: u32, state: State) -> Option
         count += 1;
     }
     let mut sources = [Source::Bot; 16];
+    let mut bound = None;
+    let mut compared = None;
     let mut addr = start;
     while addr < site {
         match state {
@@ -193,9 +198,17 @@ fn analyze_site(image: &Image, map: &FlagMap, site: u32, state: State) -> Option
                 let word = read_word(bytes, canon, addr)?;
                 let instr = decode_arm(word);
                 if breaks_arm_window(&instr) {
-                    return None;
+                    sources = [Source::Bot; 16];
+                    let cond = Condition::from_bits((word >> 28) as u8);
+                    bound = match instr {
+                        ArmInstr::Branch { link: false, .. } => range_bound(compared, cond),
+                        _ => None,
+                    };
+                    compared = None;
+                } else {
+                    compared = arm_compare_imm(&instr);
+                    eval_arm(addr, instr, &mut sources, bytes, canon);
                 }
-                eval_arm(addr, instr, &mut sources, bytes, canon);
                 addr += 4;
             }
             State::Thumb => {
@@ -203,9 +216,25 @@ fn analyze_site(image: &Image, map: &FlagMap, site: u32, state: State) -> Option
                 let next = read_half(bytes, canon, addr.wrapping_add(2)).unwrap_or(0);
                 let instr = decode_thumb(half, next);
                 if breaks_thumb_window(&instr) {
-                    return None;
+                    sources = [Source::Bot; 16];
+                    bound = match instr {
+                        ThumbInstr::ConditionalBranch { cond, .. } => {
+                            range_bound(compared, Some(cond))
+                        }
+                        _ => None,
+                    };
+                    compared = None;
+                } else {
+                    compared = match instr {
+                        ThumbInstr::ImmediateOperation {
+                            op: ThumbImmOp::Cmp,
+                            imm8,
+                            ..
+                        } => Some(u32::from(imm8)),
+                        _ => None,
+                    };
+                    eval_thumb(addr, instr, &mut sources, bytes, canon);
                 }
-                eval_thumb(addr, instr, &mut sources, bytes, canon);
                 addr += if matches!(instr, ThumbInstr::LongBranchWithLink { .. }) {
                     4
                 } else {
@@ -248,8 +277,31 @@ fn analyze_site(image: &Image, map: &FlagMap, site: u32, state: State) -> Option
         }
     };
     match source {
-        Source::Base { addr } => absolute_table(bytes, canon, site, state, addr, via_bx),
-        Source::Relative { addr, anchor } => relative_table(bytes, canon, site, addr, anchor),
+        Source::Base { addr } => absolute_table(bytes, canon, site, state, addr, via_bx, bound),
+        Source::Relative { addr, anchor } => relative_target(bytes, canon, site, addr, anchor),
+        _ => None,
+    }
+}
+
+/// The immediate of an ARM `cmp rX, #imm`.
+fn arm_compare_imm(instr: &ArmInstr) -> Option<u32> {
+    match instr {
+        ArmInstr::DataProcessing {
+            opcode: DataOp::Cmp,
+            operand2: ShifterOperand::Immediate { rotate, value },
+            ..
+        } => Some(u32::from(*value).rotate_right(u32::from(*rotate) * 2)),
+        _ => None,
+    }
+}
+
+/// The entry count a switch range check allows: `cmp rX, #N` followed
+/// by a branch to the default case when the index is out of range
+/// (`bhi`: index > N, so N + 1 entries; `bcs`: index >= N, so N).
+fn range_bound(compared: Option<u32>, cond: Option<Condition>) -> Option<u32> {
+    match (compared?, cond?) {
+        (n, Condition::Hi) => Some(n + 1),
+        (n, Condition::Cs) => Some(n),
         _ => None,
     }
 }
@@ -385,7 +437,8 @@ fn eval_thumb(
 }
 
 /// Resolves an absolute table: consecutive plausible entry words from
-/// the base until the first one that cannot be a code address.
+/// the base until the first one that cannot be a code address, capped
+/// by the switch's range check when one guards the window.
 fn absolute_table(
     bytes: &[u8],
     canon: Canonical,
@@ -393,9 +446,10 @@ fn absolute_table(
     state: State,
     base: u32,
     via_bx: bool,
+    bound: Option<u32>,
 ) -> Option<JumpTable> {
     let mut targets = Vec::new();
-    for index in 0..MAX_ENTRIES {
+    for index in 0..bound.unwrap_or(MAX_ENTRIES).min(MAX_ENTRIES) {
         let Some(word) = read_word(bytes, canon, base.wrapping_add(index * 4)) else {
             break;
         };
@@ -419,26 +473,18 @@ fn absolute_table(
     finish_table(site, state, base, targets)
 }
 
-/// Resolves a relative table: entries are byte offsets added to the
-/// `add ..., pc` anchor.
-fn relative_table(
+/// Resolves the relative idiom: one pool word of byte offset added
+/// to the `add ..., pc` anchor, so exactly one target.
+fn relative_target(
     bytes: &[u8],
     canon: Canonical,
     site: u32,
     addr: u32,
     anchor: u32,
 ) -> Option<JumpTable> {
-    let mut targets = Vec::new();
-    for index in 0..MAX_ENTRIES {
-        let Some(word) = read_word(bytes, canon, addr.wrapping_add(index * 4)) else {
-            break;
-        };
-        let Some(entry) = canon.canonicalize(anchor.wrapping_add(word)) else {
-            break;
-        };
-        targets.push((entry, State::Thumb));
-    }
-    finish_table(site, State::Thumb, addr, targets)
+    let word = read_word(bytes, canon, addr)?;
+    let target = canon.canonicalize(anchor.wrapping_add(word))?;
+    finish_table(site, State::Thumb, addr, vec![(target, State::Thumb)])
 }
 
 fn finish_table(

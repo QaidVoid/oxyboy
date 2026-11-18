@@ -127,7 +127,9 @@ fn thumb_relative_rom() -> Image {
 }
 
 #[test]
-fn thumb_relative_switch_is_found() {
+fn thumb_relative_jump_resolves_its_single_target() {
+    // The immediate-offset load always reads the word at 0x1C, so only
+    // case0 is reachable; the next word is not a table entry.
     let rom = thumb_relative_rom();
     let (analysis, map) = analyze_rom(&rom, &[]);
     assert_eq!(
@@ -136,11 +138,12 @@ fn thumb_relative_switch_is_found() {
             site: 0x0800_0018,
             state: State::Thumb,
             base: 0x0800_001C,
-            entries: 2,
-            targets: vec![(0x0800_0024, State::Thumb), (0x0800_0028, State::Thumb)],
+            entries: 1,
+            targets: vec![(0x0800_0024, State::Thumb)],
         }]
     );
     assert_eq!(map.get(0x0800_0024), E | W | T);
+    assert_eq!(map.get(0x0800_0028), Flags::EMPTY);
     assert!(analysis.unresolved.is_empty());
 }
 
@@ -225,4 +228,53 @@ fn pointer_like_data_stays_unanalyzed() {
     assert!(analysis.discovery.rejected.is_empty());
     assert_eq!(map.get(0x0800_0008), Flags::EMPTY, "data stays empty");
     assert_eq!(map.get(0x0800_00FC), Flags::EMPTY, "data stays empty");
+}
+
+/// A range-checked ARM switch whose two-entry table is followed by a
+/// literal pool word that also looks like a code address.
+fn bounded_switch_rom() -> Image {
+    let words: [(usize, u32); 13] = [
+        (0x00, 0xE3A0_0001), // mov r0, #1
+        (0x04, 0xE350_0001), // cmp r0, #1
+        (0x08, 0x8A00_0006), // bhi default (0x28)
+        (0x0C, 0xE59F_1008), // ldr r1, [pc, #8]   ; pool at 0x1C
+        (0x10, 0xE791_2100), // ldr r2, [r1, r0, lsl #2]
+        (0x14, 0xE1A0_F002), // mov pc, r2
+        (0x1C, 0x0800_0030), // table base
+        (0x20, 0xE3A0_4001), // case0: mov r4, #1
+        (0x24, 0xE12F_FF1E), // bx lr
+        (0x28, 0xE3A0_4003), // default/case1: mov r4, #3
+        (0x2C, 0xE12F_FF1E), // bx lr
+        (0x30, 0x0800_0020), // table: case0
+        (0x34, 0x0800_0028), //        case1
+    ];
+    let mut bytes = RomBuilder::new().title("BNDSW").build();
+    for (offset, word) in words {
+        bytes[offset..offset + 4].copy_from_slice(&word.to_le_bytes());
+    }
+    // A pool word right after the table, pointing at bytes that decode.
+    bytes[0x38..0x3C].copy_from_slice(&0x0800_0040u32.to_le_bytes());
+    bytes[0x40..0x44].copy_from_slice(&0xE3A0_5005u32.to_le_bytes());
+    Image::from_bytes(bytes).expect("parse")
+}
+
+#[test]
+fn range_check_caps_the_table() {
+    let rom = bounded_switch_rom();
+    let (analysis, map) = analyze_rom(&rom, &[]);
+    assert_eq!(
+        analysis.tables,
+        vec![JumpTable {
+            site: 0x0800_0014,
+            state: State::Arm,
+            base: 0x0800_0030,
+            entries: 2,
+            targets: vec![(0x0800_0020, State::Arm), (0x0800_0028, State::Arm)],
+        }]
+    );
+    assert_eq!(
+        map.get(0x0800_0040),
+        Flags::EMPTY,
+        "the pool word is not a case"
+    );
 }
