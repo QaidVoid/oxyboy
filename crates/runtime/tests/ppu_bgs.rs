@@ -246,3 +246,43 @@ fn bg_priority_orders_overlapping_layers() {
     out += &grid(&run(&mut bus, 1));
     golden::assert_matches(golden_path("bg-priority.txt"), &out);
 }
+
+/// The RGB of framebuffer pixel (0, 0) for BG0 with `cnt` scrolled by
+/// (`hofs`, `vofs`).
+fn first_pixel(bus: &mut Bus, cnt: u16, hofs: u16, vofs: u16) -> [u8; 3] {
+    bus.write_u16(0x0400_0008, cnt);
+    bus.write_u16(0x0400_0010, hofs);
+    bus.write_u16(0x0400_0012, vofs);
+    bus.write_u16(DISPCNT, 0x0100); // mode 0, BG0
+    let frame = run(bus, 1);
+    [frame[0], frame[1], frame[2]]
+}
+
+#[test]
+fn large_text_maps_are_laid_out_as_screenblocks() {
+    let mut bus = Bus::new(Vec::new());
+    set_palette(&mut bus, 16);
+    // Screenblocks 8..12 each hold one solid 4bpp tile (k + 1).
+    for k in 0..4u32 {
+        let index = k + 1;
+        for row in 0..8 {
+            bus.write_u32(VRAM + index * 32 + row * 4, index * 0x1111_1111);
+        }
+        for cell in 0..1024 {
+            bus.write_u16(VRAM + (8 + k) * 0x800 + cell * 2, index as u16);
+        }
+    }
+    // A 256x256 map aimed straight at each screenblock is the reference.
+    let reference: Vec<[u8; 3]> = (0..4u16)
+        .map(|k| first_pixel(&mut bus, (8 + k) << 8, 0, 0))
+        .collect();
+    // Size 1 (512x256): SC0 SC1 side by side.
+    assert_eq!(first_pixel(&mut bus, 0x4800, 256, 0), reference[1]);
+    // Size 2 (256x512): SC0 above SC1.
+    assert_eq!(first_pixel(&mut bus, 0x8800, 0, 256), reference[1]);
+    // Size 3 (512x512): SC0 SC1 over SC2 SC3.
+    assert_eq!(first_pixel(&mut bus, 0xC800, 256, 0), reference[1]);
+    assert_eq!(first_pixel(&mut bus, 0xC800, 0, 256), reference[2]);
+    assert_eq!(first_pixel(&mut bus, 0xC800, 256, 256), reference[3]);
+    assert_ne!(reference[1], reference[2]);
+}

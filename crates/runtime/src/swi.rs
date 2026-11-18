@@ -611,4 +611,3 @@ fn put_byte(bus: &mut Bus, dest: &mut u32, halfword: &mut u16, vram: bool, byte:
     }
     *dest = dest.wrapping_add(1);
 }
-

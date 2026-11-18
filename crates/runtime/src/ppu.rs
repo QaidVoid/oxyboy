@@ -456,7 +456,11 @@ fn text_pixel(bus: &Bus, id: usize, y: u32, x: u32) -> Option<u16> {
     let tx = (x + hofs) % w;
     let ty = (y + vofs) % h;
 
-    let entry = bus.vram_u16(sbb + 2 * ((ty / 8) * (w / 8) + tx / 8));
+    // Maps wider or taller than 256 pixels are 32x32-entry
+    // screenblocks laid out SC0 SC1 / SC2 SC3, not one linear map.
+    let block = tx / 256 + (ty / 256) * (w / 256);
+    let cell = ((ty % 256) / 8) * 32 + (tx % 256) / 8;
+    let entry = bus.vram_u16(sbb + block * 0x0800 + 2 * cell);
     let tile = u32::from(entry & 0x03FF);
     let hflip = entry & 0x0400 != 0;
     let vflip = entry & 0x0800 != 0;
