@@ -410,15 +410,11 @@ impl Bus {
                 self.log_io(a, u32::from(value), 1, true);
                 value
             }
-            // Palette and OAM sit on 16/32-bit buses with no 8-bit data
-            // lane; 8-bit reads return 0 (GBATEK bus-width table).
-            0x05 | 0x07 => OPEN_BUS_BYTE,
-            // VRAM multiplexes its 16-bit bus: an 8-bit read yields the
-            // low byte of the containing halfword.
-            0x06 => {
-                let i = (Self::vram_index(a) & !1) as usize;
-                self.vram[i]
-            }
+            // Palette, VRAM, and OAM restrict 8-bit writes only; 8-bit
+            // reads return the addressed byte (GBATEK bus-width table).
+            0x05 => self.palette[(a & 0x0000_03FF) as usize],
+            0x06 => self.vram[Self::vram_index(a) as usize],
+            0x07 => self.oam[(a & 0x0000_03FF) as usize],
             // The EEPROM answers on the upper ROM window when it is
             // the cart's medium; otherwise 0x0D is plain ROM.
             0x0D if matches!(self.save.kind(), SaveKind::Eeprom512 | SaveKind::Eeprom8k) => self

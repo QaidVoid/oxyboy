@@ -351,8 +351,7 @@ fn cpu_set(cpu: &mut Cpu, bus: &mut Bus, fast: bool) {
 /// SWI 11h/12h: LZ77UnCompWram/Vram. Header type 1, 24-bit output
 /// size; flag bytes MSB-first over 8-block groups; compressed blocks
 /// copy N+3 bytes from `dest-disp-1`. The VRAM variant emits 16-bit
-/// lanes (see [`put_byte`]) and reads the copy window through the
-/// containing halfword (see [`get_byte`]).
+/// lanes (see [`put_byte`]).
 fn lz77(cpu: &mut Cpu, bus: &mut Bus, vram: bool) {
     let mut src = cpu.gpr(0);
     let mut dest = cpu.gpr(1);
@@ -382,7 +381,7 @@ fn lz77(cpu: &mut Cpu, bus: &mut Bus, vram: bool) {
                     break;
                 }
                 remaining -= 1;
-                let byte = get_byte(bus, from, vram);
+                let byte = bus.read_u8(from);
                 put_byte(bus, &mut dest, &mut halfword, vram, byte);
                 from = from.wrapping_add(1);
             }
@@ -613,18 +612,3 @@ fn put_byte(bus: &mut Bus, dest: &mut u32, halfword: &mut u16, vram: bool, byte:
     *dest = dest.wrapping_add(1);
 }
 
-/// One copy-window byte of a decompression run. The VRAM variants
-/// must take the byte from its containing halfword (the bus returns
-/// only the low byte of the lane on an 8-bit read).
-fn get_byte(bus: &mut Bus, addr: u32, vram: bool) -> u8 {
-    if vram {
-        let h = bus.read_u16(addr & !1);
-        if addr & 1 != 0 {
-            (h >> 8) as u8
-        } else {
-            h as u8
-        }
-    } else {
-        bus.read_u8(addr)
-    }
-}

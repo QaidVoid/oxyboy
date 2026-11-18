@@ -197,28 +197,32 @@ fn sram_wide_accesses_use_the_single_data_lane() {
 }
 
 #[test]
-fn vram_eight_bit_reads_return_low_byte_of_halfword() {
+fn vram_eight_bit_reads_return_the_addressed_byte() {
     let mut bus = Bus::new(Vec::new());
     bus.write_u16(0x0600_0010, 0xABCD);
     assert_eq!(bus.read_u8(0x0600_0010), 0xCD);
-    assert_eq!(bus.read_u8(0x0600_0011), 0xCD);
+    assert_eq!(bus.read_u8(0x0600_0011), 0xAB);
 }
 
 #[test]
 fn palette_and_oam_eight_bit_accesses() {
     let mut bus = Bus::new(Vec::new());
-    // 8-bit writes are discarded on both 16-bit-bus regions.
+    // An 8-bit palette write fills both bytes of the halfword; an
+    // 8-bit OAM write is ignored (GBATEK).
     bus.write_u8(0x0500_0000, 0x12);
     bus.write_u8(0x0700_0000, 0x12);
-    assert_eq!(bus.read_u8(0x0500_0000), 0);
-    assert_eq!(bus.read_u8(0x0700_0000), 0);
-    // Halfword and word accesses work normally.
+    assert_eq!(bus.read_u16(0x0500_0000), 0x1212);
+    assert_eq!(bus.read_u16(0x0700_0000), 0);
+    // Wide accesses work normally, and 8-bit reads return the
+    // addressed byte.
     bus.write_u32(0x0500_0000, 0x7FFF_0321);
     bus.write_u16(0x0700_0000, 0x00C0);
     assert_eq!(bus.read_u32(0x0500_0000), 0x7FFF_0321);
     assert_eq!(bus.read_u16(0x0700_0000), 0x00C0);
-    assert_eq!(bus.read_u8(0x0500_0000), 0);
-    assert_eq!(bus.read_u8(0x0700_0000), 0);
+    assert_eq!(bus.read_u8(0x0500_0000), 0x21);
+    assert_eq!(bus.read_u8(0x0500_0003), 0x7F);
+    assert_eq!(bus.read_u8(0x0700_0000), 0xC0);
+    assert_eq!(bus.read_u8(0x0700_0001), 0x00);
 }
 
 #[test]
@@ -312,12 +316,10 @@ fn vram_byte_writes_fill_both_halves_of_the_cell() {
     let mut bus = Bus::new(Vec::new());
     bus.write_u8(0x0600_0100, 0xAB);
     // The byte lands in both bytes of the containing halfword (GBATEK
-    // "VRAM": 8-bit writes store to upper and lower bytes), and reads
-    // of the odd lane return the containing cell's low byte.
+    // "VRAM": 8-bit writes store to upper and lower bytes).
     assert_eq!(bus.read_u8(0x0600_0100), 0xAB);
     assert_eq!(bus.read_u16(0x0600_0100), 0xABAB);
-    // A byte write to the high lane of a halfword still lands low in
-    // the cell, mirroring the 8-bit read rule.
+    // A byte write to the high lane fills the same halfword.
     bus.write_u8(0x0600_0103, 0x5A);
     assert_eq!(bus.read_u16(0x0600_0102), 0x5A5A);
 }
