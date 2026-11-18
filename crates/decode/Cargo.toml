@@ -3,6 +3,3 @@ name = "decode"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-
-[dependencies]
-rom = { version = "0.1.0", path = "../rom" }

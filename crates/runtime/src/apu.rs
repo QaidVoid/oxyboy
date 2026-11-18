@@ -428,15 +428,15 @@ impl Apu {
 
     /// Advances the sounding channels' oscillators by `cycles` cycles.
     fn advance(&mut self, bus: &Bus, cycles: u32) {
-        for ch in 0..2usize {
-            if !self.sq[ch].enabled {
+        for (ch, sq) in self.sq.iter_mut().enumerate() {
+            if !sq.enabled {
                 continue;
             }
             let period = square_period(bus, ch);
-            self.sq[ch].freq_acc += cycles;
-            while self.sq[ch].freq_acc >= period {
-                self.sq[ch].freq_acc -= period;
-                self.sq[ch].duty_pos = (self.sq[ch].duty_pos + 1) & 7;
+            sq.freq_acc += cycles;
+            while sq.freq_acc >= period {
+                sq.freq_acc -= period;
+                sq.duty_pos = (sq.duty_pos + 1) & 7;
             }
         }
         let nr30 = bus.io_half(NR30);
@@ -484,10 +484,8 @@ impl Apu {
     /// Clocks every enabled channel's length counter at 256 Hz; a
     /// length flag stops the channel when its counter reaches zero.
     fn clock_lengths(&mut self, bus: &Bus) {
-        for ch in 0..2usize {
-            let ctrl = if ch == 0 { NR13_NR14 } else { NR23_NR24 };
+        for (sq, ctrl) in self.sq.iter_mut().zip([NR13_NR14, NR23_NR24]) {
             let flag = bus.io_half(ctrl) & 0x4000 != 0;
-            let sq = &mut self.sq[ch];
             if flag && sq.enabled && sq.length > 0 {
                 sq.length -= 1;
                 sq.enabled = sq.length != 0;
