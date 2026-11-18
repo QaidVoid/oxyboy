@@ -87,18 +87,19 @@ fn channel1_sweep_and_envelope_waveform() {
     let mut bus = bus_with_sound();
     let w = |bus: &mut Bus, off: u32, value: u16| bus.write_u16(BASE + off, value);
     // NR10: pace 1, down (pitch rises), shift 1. NR11/NR12: duty 50,
-    // envelope 15 decaying at pace 1. NR13/NR14: restart at n=2040
-    // (16 output samples per duty cycle, so the glide is visible).
+    // envelope 15 decaying at pace 1. NR13/NR14: restart at n=1984, a
+    // 2048 Hz tone (16 output samples per waveform, so the glide is
+    // visible).
     w(&mut bus, 0x060, 0x0019);
     w(&mut bus, 0x062, 0xF180);
-    w(&mut bus, 0x064, 0x8000 | 2040);
+    w(&mut bus, 0x064, 0x8000 | 1984);
     let a = capture(&mut bus, 1);
     let b = capture(&mut bus, 1);
     assert_golden(
         "apu-sq1.txt",
         &[
             (
-                "A: ch1 frame 1, sweep down x2 (n 2040->510), envelope 15->14".into(),
+                "A: ch1 frame 1, sweep down x2 (n 1984->496), envelope 15->14".into(),
                 a,
             ),
             (
@@ -116,9 +117,9 @@ fn channel2_length_counter_cuts_the_note() {
     // NR51: channel 2 right side only.
     w(&mut bus, 0x080, 0x77 | 0x0200);
     // NR21/NR22: duty 25, constant volume 9, length 56 (8 ticks).
-    // NR23/NR24: length flag + restart at n=2040.
+    // NR23/NR24: length flag + restart at n=1984.
     w(&mut bus, 0x068, 0x9078);
-    w(&mut bus, 0x06C, 0xC000 | 2040);
+    w(&mut bus, 0x06C, 0xC000 | 1984);
     let a = capture(&mut bus, 1);
     let b = capture(&mut bus, 1);
     assert_golden(
@@ -182,11 +183,11 @@ fn channel4_noise_with_envelope_decay() {
 fn mix_routing_master_volume_and_enable() {
     let mut bus = bus_with_sound();
     let w = |bus: &mut Bus, off: u32, value: u16| bus.write_u16(BASE + off, value);
-    // ch1 (square, n=2040) to the left side; ch3 (wave ramp) to the
+    // ch1 (square, n=1984) to the left side; ch3 (wave ramp) to the
     // right side.
     w(&mut bus, 0x060, 0x0000);
     w(&mut bus, 0x062, 0xF080);
-    w(&mut bus, 0x064, 0x8000 | 2040);
+    w(&mut bus, 0x064, 0x8000 | 1984);
     w(&mut bus, 0x070, 0x00A0);
     set_wave_ram(&mut bus, 0, false);
     set_wave_ram(&mut bus, 1, true);
@@ -202,7 +203,7 @@ fn mix_routing_master_volume_and_enable() {
     // were reset by the disable, so this must still sound.
     w(&mut bus, 0x084, 0x0080);
     w(&mut bus, 0x068, 0xF080);
-    w(&mut bus, 0x06C, 0x8000 | 2040);
+    w(&mut bus, 0x06C, 0x8000 | 1984);
     w(&mut bus, 0x080, 0x77 | 0x2200);
     let d = capture(&mut bus, 1);
     assert_golden(
@@ -226,4 +227,45 @@ fn system_frame_mixdown_is_548_silent_samples() {
     let audio = system.take_audio();
     assert_eq!(audio.len(), SAMPLES_PER_FRAME * 2);
     assert!(audio.iter().all(|&s| s == 0), "no sound configured");
+}
+
+/// GBATEK SOUND2CNT_H: the tone is 131072/(2048-n) Hz. At n=1792 that
+/// is 512 Hz, one waveform per 64 output samples (32768 Hz), so a
+/// frame of ~548 samples holds 8 or 9 rising edges.
+#[test]
+fn square_pitch_follows_the_frequency_register() {
+    let mut bus = bus_with_sound();
+    let w = |bus: &mut Bus, off: u32, value: u16| bus.write_u16(BASE + off, value);
+    w(&mut bus, 0x068, 0xF080); // 50% duty, constant volume 15
+    w(&mut bus, 0x06C, 0x8000 | 1792);
+    let samples = capture(&mut bus, 1);
+    let right: Vec<i16> = samples.iter().skip(1).step_by(2).copied().collect();
+    let rising = right.windows(2).filter(|w| w[0] == 0 && w[1] != 0).count();
+    assert!((8..=9).contains(&rising), "{rising} rising edges");
+}
+
+/// GBATEK SOUND4CNT_H: the noise shifts at 524288/r/2^(s+1) Hz. With
+/// r=2, s=3 that is one shift per 1024 cycles, exactly two output
+/// samples, so every run of equal samples has even length.
+#[test]
+fn noise_shift_rate_follows_the_divider() {
+    let mut bus = bus_with_sound();
+    let w = |bus: &mut Bus, off: u32, value: u16| bus.write_u16(BASE + off, value);
+    w(&mut bus, 0x078, 0xF000); // constant volume 15
+    w(&mut bus, 0x07C, 0x8000 | 0x0030 | 0x0008 | 0x0002); // s=3, 7-bit, r=2
+    let samples = capture(&mut bus, 1);
+    let right: Vec<i16> = samples.iter().skip(1).step_by(2).copied().collect();
+    let mut runs = Vec::new();
+    let mut length = 1;
+    for pair in right.windows(2) {
+        if pair[0] == pair[1] {
+            length += 1;
+        } else {
+            runs.push(length);
+            length = 1;
+        }
+    }
+    // The first run starts at an arbitrary phase.
+    assert!(runs.len() > 20, "the output toggles");
+    assert!(runs[1..].iter().all(|run| run % 2 == 0), "{runs:?}");
 }

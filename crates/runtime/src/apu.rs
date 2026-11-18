@@ -657,11 +657,12 @@ impl Apu {
     }
 }
 
-/// Square duty-step period in cycles: 131072/(2048-n) Hz means 8 steps
-/// per (2048-n)*128 cycles.
+/// Square duty-step period in cycles: the tone is 131072/(2048-n) Hz
+/// (GBATEK SOUND1CNT_X), one waveform per (2048-n)*128 cycles, so each
+/// of its 8 duty steps lasts (2048-n)*16.
 fn square_period(bus: &Bus, ch: usize) -> u32 {
     let ctrl = if ch == 0 { NR13_NR14 } else { NR23_NR24 };
-    (2048 - u32::from(bus.io_half(ctrl) & 0x07FF)) * 128
+    (2048 - u32::from(bus.io_half(ctrl) & 0x07FF)) * 16
 }
 
 /// Wave sample period in cycles: 2097152/(2048-n) Hz.
@@ -670,13 +671,13 @@ fn wave_period(bus: &Bus) -> u32 {
 }
 
 /// Noise shift period in cycles: 524288/r/2^(s+1) Hz with r=0 read as
-/// 0.5 (GBATEK "Sound Channel 4"), so the period is
-/// `(r == 0 ? 16 : 32*r) << s`.
+/// 0.5 (GBATEK "Sound Channel 4"), so 32*r*2^(s+1) cycles, that is
+/// `(r == 0 ? 32 : 64*r) << s`.
 fn noise_period(bus: &Bus) -> u32 {
     let reg = bus.io_half(NR43_NR44);
     let r = u32::from(reg & 0x7);
     let s = (reg >> 4) & 0xF;
-    (if r == 0 { 16 } else { 32 * r }) << s
+    (if r == 0 { 32 } else { 64 * r }) << s
 }
 
 #[cfg(test)]
@@ -932,11 +933,13 @@ mod tests {
 
     #[test]
     fn noise_period_formula_matches_524288_over_r_over_2s() {
+        // 16777216 / (524288 / r / 2^(s+1)) = 64 * r * 2^s cycles, with
+        // r = 0 read as 0.5.
         for (reg, expected) in [
-            (0x0000u16, 16u32),
-            (0x0001, 32),
-            (0x0002, 64),
-            (0x0042, 1024),
+            (0x0000u16, 32u32),
+            (0x0001, 64),
+            (0x0002, 128),
+            (0x0042, 2048),
         ] {
             let mut bus = bus_with(&[]);
             bus.write_u16(0x0400_0000 + NR43_NR44, reg);
