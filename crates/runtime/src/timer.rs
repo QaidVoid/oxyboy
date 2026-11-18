@@ -87,6 +87,23 @@ impl Timers {
         self.subcounts[ch] = 0;
     }
 
+    /// System cycles until the next overflow of any clocked timer
+    /// (cascade timers only overflow on a predecessor's overflow), or
+    /// `None` when no timer runs from the clock.
+    pub(super) fn cycles_to_overflow(&self, bus: &Bus) -> Option<u32> {
+        (0..4usize)
+            .filter_map(|ch| {
+                let ctrl = bus.io_half(0x0102 + 4 * ch as u32);
+                if ctrl & 0x0080 == 0 || (ctrl & 0x0004 != 0 && ch > 0) {
+                    return None;
+                }
+                let period = PERIODS[(ctrl & 0x0003) as usize];
+                let ticks = 0x1_0000 - u32::from(self.counters[ch]);
+                Some(ticks * period - self.subcounts[ch])
+            })
+            .min()
+    }
+
     /// The live counter of channel `ch` (TMxCNT_L readback).
     pub(super) fn counter(&self, ch: usize) -> u16 {
         self.counters[ch]

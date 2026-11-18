@@ -945,6 +945,14 @@ impl Bus {
         self.timers = timers;
     }
 
+    /// The longest span a halted CPU can sleep through without moving
+    /// any timer overflow or APU sample: the step that ends there
+    /// applies them exactly as single-cycle steps would.
+    pub(crate) fn idle_span(&self) -> u32 {
+        let timers = self.timers.cycles_to_overflow(self).unwrap_or(u32::MAX);
+        timers.min(self.apu.cycles_to_sample()).max(1)
+    }
+
     /// Advances the APU by `cycles` system cycles. `System::step`
     /// calls this with every step's cycle budget; exposing it also lets
     /// tests and tools run the audio pipeline without a CPU.

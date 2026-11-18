@@ -127,6 +127,18 @@ impl Ppu {
         self.frame_ended
     }
 
+    /// System cycles to the next video event that can raise an
+    /// interrupt or run DMA: the H-Blank flag edge or the line end.
+    #[must_use]
+    pub fn cycles_to_next_edge(&self) -> u32 {
+        let edge = if self.hblank {
+            CYCLES_PER_LINE
+        } else {
+            HBLANK_FLAG_START
+        };
+        edge.saturating_sub(self.dot).max(1)
+    }
+
     /// System cycles from the current dot to the next frame boundary.
     /// The frame runner budgets native units to this so a chunk cannot
     /// run past the boundary it is supposed to stop at.

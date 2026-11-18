@@ -401,6 +401,11 @@ impl Apu {
         requests
     }
 
+    /// System cycles until the next mixed sample.
+    pub(crate) fn cycles_to_sample(&self) -> u32 {
+        SAMPLE_PERIOD - self.sample_acc
+    }
+
     /// Advances the APU by `cycles` system cycles, mixing whole
     /// 512-cycle samples and ticking the frame sequencer every 64th
     /// sample (a step takes effect on the sample after it ticks).

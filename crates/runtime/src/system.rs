@@ -74,7 +74,16 @@ impl System {
     /// refreshes the CPU IRQ input line from the interrupt controller
     /// state.
     pub fn step(&mut self) -> u32 {
-        let cycles = self.cpu.step(&mut self.bus);
+        // A halted CPU with nothing to wake it sleeps up to the next
+        // event that could: a video edge, a timer overflow, or an APU
+        // sample. Each such span replays exactly like one-cycle steps.
+        let cycles = if self.cpu.is_halted() && self.bus.int_enable() & self.bus.int_flags() == 0 {
+            let span = self.ppu.cycles_to_next_edge().min(self.bus.idle_span());
+            self.cpu.charge(span);
+            span
+        } else {
+            self.cpu.step(&mut self.bus)
+        };
         let dma_cycles = self.bus.dma_run_deferred();
         self.ppu.step(&mut self.bus, cycles + dma_cycles);
         self.bus.step_timers(cycles + dma_cycles);
