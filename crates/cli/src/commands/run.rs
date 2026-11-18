@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use rom::{Image, ImageKind};
 use runtime::ppu::{CYCLES_PER_LINE, LINES_PER_FRAME, VISIBLE_LINES, WIDTH};
 use runtime::recomp::Driver;
-use runtime::save::Save;
+use runtime::save::{Save, SaveKind};
 use runtime::system::System;
 use trace::Writer;
 
@@ -64,8 +64,9 @@ pub struct RunArgs {
     #[arg(long, value_name = "FILE")]
     pub dump_frame: Option<std::path::PathBuf>,
 
-    /// Directory for save files. The default is the user data dir
-    /// (never inside the repository).
+    /// Directory for save files. Windowed runs default to
+    /// $XDG_DATA_HOME/oxyboy/saves; headless runs save only with this
+    /// flag.
     #[arg(long, value_name = "DIR")]
     pub save_dir: Option<PathBuf>,
 
@@ -113,7 +114,10 @@ pub fn run(args: RunArgs) -> i32 {
         );
         return 1;
     }
-    let save_file = save_path(&args, &image);
+    apply_save_override(&mut system, &args, &image);
+    // A cart without backup media has nothing to persist.
+    let mut save_file =
+        save_path(&args, &image).filter(|_| system.bus().save().kind() != SaveKind::None);
     if let Some(Err(e)) = save_file.as_deref().map(|path| {
         path.parent()
             .map(std::fs::create_dir_all)
@@ -122,12 +126,18 @@ pub fn run(args: RunArgs) -> i32 {
         eprintln!("oxyboy run: {e}");
         return 1;
     }
-    if let Some(path) = &save_file {
-        apply_save_override(&mut system, &args, &image);
-        if path.exists() {
-            match Save::from_file(path) {
-                Ok(loaded) => *system.bus_mut().save_mut() = loaded,
-                Err(e) => eprintln!("oxyboy run: {}: {e}", path.display()),
+    if let Some(path) = save_file.clone()
+        && path.exists()
+    {
+        match Save::from_file(&path) {
+            Ok(loaded) => *system.bus_mut().save_mut() = loaded,
+            Err(e) => {
+                // Never overwrite a save this run could not read.
+                eprintln!(
+                    "oxyboy run: {}: {e}; saving is disabled for this run",
+                    path.display()
+                );
+                save_file = None;
             }
         }
     }
@@ -372,23 +382,31 @@ fn apply_keypad(system: &mut System, window: &minifb::Window) {
 
 /// Resolves the save file path: `<save-dir>/<game code>.sav`.
 ///
-/// With `--save-dir` the directory is used as given; otherwise the
-/// default is `$XDG_DATA_HOME/oxyboy/saves` or
-/// `$HOME/.local/share/oxyboy/saves`. Returns `None` when persistence
-/// is impossible (no directory resolvable or no game code in the
-/// header).
+/// With `--save-dir` the directory is used as given. Windowed runs
+/// otherwise default to `$XDG_DATA_HOME/oxyboy/saves` or
+/// `$HOME/.local/share/oxyboy/saves`; headless runs (tests, traces,
+/// automation) persist only with `--save-dir`, so they never read or
+/// overwrite a player's save. Returns `None` when there is nowhere to
+/// persist or the game code is not a safe file name.
 fn save_path(args: &RunArgs, image: &Image) -> Option<PathBuf> {
-    let dir = args.save_dir.clone().map_or_else(default_save_dir, Some)?;
-    let code = image.header().game_code_str()?;
+    let dir = match &args.save_dir {
+        Some(dir) => dir.clone(),
+        None if args.headless => return None,
+        None => default_save_dir()?,
+    };
+    let code = image
+        .header()
+        .game_code_str()
+        .filter(|code| !code.is_empty() && code.bytes().all(|b| b.is_ascii_alphanumeric()))?;
     Some(dir.join(format!("{code}.sav")))
 }
 
-/// The user data directory for saves, or `None` when neither
-/// `XDG_DATA_HOME` nor `HOME` is set.
+/// The user data directory for saves, or `None` when neither an
+/// absolute `XDG_DATA_HOME` nor `HOME` is set.
 fn default_save_dir() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_DATA_HOME")
-        .filter(|v| !v.is_empty())
         .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
         .or_else(|| {
             std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local").join("share"))
         })?;
@@ -415,7 +433,7 @@ fn apply_save_override(system: &mut System, args: &RunArgs, image: &Image) {
     let Some(name) = entry.save_type.as_deref() else {
         return;
     };
-    match runtime::save::SaveKind::from_name(name) {
+    match SaveKind::from_name(name) {
         Some(kind) => *system.bus_mut().save_mut() = Save::new(kind),
         None => eprintln!("oxyboy run: unknown save_type {name:?} in {path:?}"),
     }

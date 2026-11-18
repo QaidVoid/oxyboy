@@ -217,3 +217,82 @@ fn missing_rom_fails_with_error() {
         .expect("spawn oxyboy");
     assert_eq!(status.code(), Some(1), "missing ROM must exit 1");
 }
+
+/// The mode-3 program in a cart that declares SRAM backup media.
+fn sram_rom(dir: &Path, name: &str) -> PathBuf {
+    let mut bytes = RomBuilder::new()
+        .game_code("SVTS")
+        .payload(b"SRAM_V113")
+        .build();
+    bytes[..MODE3_PROGRAM.len()].copy_from_slice(&MODE3_PROGRAM);
+    let path = dir.join(name);
+    fs::write(&path, &bytes).expect("write ROM");
+    path
+}
+
+/// Runs `oxyboy run --headless` with the user data dirs pointed into
+/// `dir`, returning the exit status and stderr.
+fn run_headless(dir: &Path, rom: &Path, extra: &[&str]) -> (std::process::ExitStatus, String) {
+    let output = oxyboy()
+        .env("XDG_DATA_HOME", dir.join("xdg"))
+        .env("HOME", dir.join("home"))
+        .args([
+            "run",
+            "--rom",
+            rom.to_str().expect("utf-8 path"),
+            "--headless",
+        ])
+        .args(extra)
+        .output()
+        .expect("spawn oxyboy");
+    (
+        output.status,
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+#[test]
+fn headless_runs_save_only_with_an_explicit_dir() {
+    let dir = temp_dir("headless-save");
+    let rom = sram_rom(&dir, "sram.gba");
+    let (status, _) = run_headless(&dir, &rom, &[]);
+    assert!(status.success(), "run failed: {status}");
+    assert!(!dir.join("xdg").exists(), "no default save dir");
+    assert!(!dir.join("home").exists(), "no HOME fallback");
+
+    let saves = dir.join("saves");
+    let (status, _) = run_headless(&dir, &rom, &["--save-dir", saves.to_str().expect("utf-8")]);
+    assert!(status.success(), "run failed: {status}");
+    assert_eq!(
+        fs::read(saves.join("SVTS.sav")).expect("save").len(),
+        0x8000
+    );
+}
+
+#[test]
+fn cart_without_backup_media_writes_no_save() {
+    let dir = temp_dir("no-media");
+    let rom = mode3_rom(&dir, "mode3.gba");
+    let saves = dir.join("saves");
+    let (status, _) = run_headless(&dir, &rom, &["--save-dir", saves.to_str().expect("utf-8")]);
+    assert!(status.success(), "run failed: {status}");
+    let files = fs::read_dir(&saves).map_or(0, |entries| entries.count());
+    assert_eq!(files, 0, "nothing to persist");
+}
+
+#[test]
+fn unreadable_save_is_left_untouched() {
+    let dir = temp_dir("bad-save");
+    let rom = sram_rom(&dir, "sram.gba");
+    let saves = dir.join("saves");
+    fs::create_dir_all(&saves).expect("create saves");
+    fs::write(saves.join("SVTS.sav"), b"not a save").expect("write save");
+    let (status, stderr) =
+        run_headless(&dir, &rom, &["--save-dir", saves.to_str().expect("utf-8")]);
+    assert!(status.success(), "run failed: {status}");
+    assert!(stderr.contains("saving is disabled"), "{stderr}");
+    assert_eq!(
+        fs::read(saves.join("SVTS.sav")).expect("save"),
+        b"not a save"
+    );
+}
