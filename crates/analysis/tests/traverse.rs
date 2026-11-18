@@ -398,3 +398,58 @@ fn swi_clobbers_r0_r1_r3_and_thumb_number_is_direct() {
     assert_eq!(map.get(0x0800_0040), E | W | T);
     assert_eq!(map.get(0x0800_0042), E | W | T);
 }
+
+/// Places little-endian ARM `words` at ROM offset `at` and walks from
+/// there in ARM state.
+fn walk_arm(title: &str, words: &[(usize, u32)], at: u32) -> (FlagMap, analysis::Traversal) {
+    let mut bytes = RomBuilder::new().title(title).build();
+    for (offset, word) in words {
+        bytes[*offset..*offset + 4].copy_from_slice(&word.to_le_bytes());
+    }
+    let image = Image::from_bytes(bytes).expect("parse");
+    let mut map = FlagMap::from_image(&image);
+    let seeds = vec![Seed {
+        addr: 0x0800_0000 + at,
+        state: State::Arm,
+    }];
+    let traversal = traverse(&image, &mut map, &seeds);
+    (map, traversal)
+}
+
+#[test]
+fn conditional_pc_writes_fall_through() {
+    let (map, _) = walk_arm(
+        "CPCW",
+        &[
+            (0x20, 0x012F_FF1E), // bxeq lr
+            (0x24, 0x18BD_8010), // ldmnefd sp!, {r4, pc}
+            (0x28, 0xE3A0_0001), // mov r0, #1
+            (0x2C, 0xE12F_FF1E), // bx lr
+        ],
+        0x20,
+    );
+    for addr in [0x0800_0024, 0x0800_0028, 0x0800_002C] {
+        assert_eq!(map.get(addr), E | W, "{addr:#x}");
+    }
+}
+
+#[test]
+fn ldr_pc_literal_veneer_follows_the_target() {
+    let (map, traversal) = walk_arm(
+        "LDPC",
+        &[
+            (0x20, 0xE51F_F004), // ldr pc, [pc, #-4]
+            (0x24, 0x0800_0060), // .word target
+            (0x60, 0xE3A0_0001), // mov r0, #1
+            (0x64, 0xE12F_FF1E), // bx lr
+        ],
+        0x20,
+    );
+    assert_eq!(map.get(0x0800_0024), L | W, "the pool word is data");
+    assert_eq!(map.get(0x0800_0060), E | W, "the veneer target is code");
+    assert!(traversal.stops.contains(&Stop {
+        addr: 0x0800_0064,
+        state: State::Arm,
+        reason: StopReason::Return,
+    }));
+}

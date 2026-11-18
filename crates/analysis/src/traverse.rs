@@ -331,6 +331,12 @@ impl PathWalk<'_, '_> {
                     }
                     let cond = Condition::from_bits((word >> 28) as u8);
                     self.mark(addr, 4, state, Flags::EXEC | Flags::WORD);
+                    // A conditional pc write may not happen, so the next
+                    // instruction is reachable too.
+                    if cond != Some(Condition::Al) && arm_writes_pc(&decode_arm(word)) {
+                        let pending = self.pending;
+                        self.fork(addr.wrapping_add(4), state, regs, pending);
+                    }
                     match decode_arm(word) {
                         ArmInstr::Branch { link, offset } => {
                             let target = addr.wrapping_add(8).wrapping_add(offset as u32);
@@ -403,8 +409,39 @@ impl PathWalk<'_, '_> {
                                 -(imm as i32)
                             });
                             self.mark(target, 4, State::Arm, Flags::LITERAL | Flags::WORD);
-                            regs[rd.bits() as usize] = self.read_word(target);
-                            addr = addr.wrapping_add(4);
+                            let value = self.read_word(target);
+                            if rd != Register::Pc {
+                                regs[rd.bits() as usize] = value;
+                                addr = addr.wrapping_add(4);
+                                continue;
+                            }
+                            // `ldr pc, =target`, the linker veneer: a
+                            // load into pc branches without interworking.
+                            let Some(value) = value else {
+                                self.stop(addr, state, StopReason::UnknownTarget);
+                                return;
+                            };
+                            regs = [None; 16];
+                            self.pending = None;
+                            let target = value & !3;
+                            if !self.jump(target, state) {
+                                return;
+                            }
+                            addr = target;
+                        }
+                        ArmInstr::LoadStore {
+                            load: true,
+                            rd: Register::Pc,
+                            rn,
+                            ..
+                        } => {
+                            let reason = if rn == Register::Sp {
+                                StopReason::Return
+                            } else {
+                                StopReason::UnknownTarget
+                            };
+                            self.stop(addr, state, reason);
+                            return;
                         }
                         ArmInstr::DataProcessing {
                             opcode: DataOp::Mov,
@@ -739,5 +776,31 @@ impl PathWalk<'_, '_> {
                 }
             }
         }
+    }
+}
+
+/// Whether an ARM instruction other than `b`/`bl` writes pc.
+fn arm_writes_pc(instr: &ArmInstr) -> bool {
+    match instr {
+        ArmInstr::BranchExchange { .. } => true,
+        ArmInstr::DataProcessing {
+            opcode,
+            rd: Register::Pc,
+            ..
+        } => !matches!(
+            opcode,
+            DataOp::Tst | DataOp::Teq | DataOp::Cmp | DataOp::Cmn
+        ),
+        ArmInstr::LoadStore {
+            load: true,
+            rd: Register::Pc,
+            ..
+        } => true,
+        ArmInstr::BlockTransfer {
+            load: true,
+            registers,
+            ..
+        } => registers.contains(Register::Pc),
+        _ => false,
     }
 }
