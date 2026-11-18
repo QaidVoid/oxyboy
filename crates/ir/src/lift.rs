@@ -707,7 +707,9 @@ impl Lifter<'_> {
                                 fallbacks: Vec::new(),
                                 op: Op::Mov {
                                     set_flags: false,
-                                    a: Value::Const(addr + 4),
+                                    // The return address carries the
+                                    // THUMB bit so `bx lr` stays in THUMB.
+                                    a: Value::Const((addr + 4) | 1),
                                     carry_in: Value::Const(0),
                                 },
                                 pc: addr,
@@ -723,12 +725,34 @@ impl Lifter<'_> {
                                 cont: linked.then_some(cont),
                             };
                         }
-                        ThumbInstr::LongBranchWithLinkFromLr { .. } => {
+                        ThumbInstr::LongBranchWithLinkFromLr { offset } => {
+                            // PC = LR + offset*2, then LR = $+2 with the
+                            // THUMB bit (GBATEK THUMB.19).
                             cycles.push(CycleCharge { addr, cycles: 1 });
+                            lift.addr = addr;
+                            let lr = lift.read(Register::Lr);
+                            let pc = lift.write(Register::Pc);
+                            lift.emit(
+                                Op::Add {
+                                    set_flags: false,
+                                    a: lr,
+                                    b: Value::Const((i32::from(offset) * 2) as u32),
+                                },
+                                vec![pc],
+                            );
+                            let link = lift.write(Register::Lr);
+                            lift.emit(
+                                Op::Mov {
+                                    set_flags: false,
+                                    a: Value::Const((addr + 2) | 1),
+                                    carry_in: Value::Const(0),
+                                },
+                                vec![link],
+                            );
+                            // Thumb `bl` does not interwork; the target
+                            // state stays as it is.
                             break RawTerm::IndirectExit {
-                                reg: Register::Lr,
-                                // Thumb `bl` does not interwork; the
-                                // target state stays as it is.
+                                reg: Register::Pc,
                                 switches_state: false,
                                 pc_mask: !1,
                             };
@@ -1972,15 +1996,58 @@ mod tests {
         }));
     }
 
-    /// The second BL halfword standing alone (F800, real games emit it
-    /// as a cheap call) is an indirect exit through LR.
+    /// The second BL halfword standing alone (real games emit it as a
+    /// cheap call) exits to LR + offset*2 and links $+2 with the THUMB
+    /// bit, as the interpreter does.
     #[test]
-    fn thumb_bl_from_lr_is_an_indirect_exit() {
-        let function = lift_thumb(&[0xF800], 1);
-        assert_eq!(function.blocks.len(), 1);
+    fn thumb_bl_from_lr_exits_to_lr_plus_offset_and_links() {
+        let function = lift_thumb(&[0xF802], 1);
+        let block = &function.blocks[0];
+        let lr_in = Value::Id(block.params[Register::Lr.bits() as usize]);
+        let Terminator::IndirectExit { target, state, .. } = &block.term else {
+            panic!("an indirect exit");
+        };
+        let add = block
+            .insts
+            .iter()
+            .find(|inst| Value::Id(inst.dests[0]) == *target)
+            .expect("the target is computed");
+        assert_eq!(
+            add.op,
+            Op::Add {
+                set_flags: false,
+                a: lr_in,
+                b: Value::Const(4),
+            }
+        );
+        let link = block
+            .insts
+            .iter()
+            .find(|inst| Value::Id(inst.dests[0]) == state[Register::Lr.bits() as usize])
+            .expect("lr is rewritten");
         assert!(matches!(
-            function.blocks[0].term,
-            Terminator::IndirectExit { .. }
+            link.op,
+            Op::Mov { a: Value::Const(a), .. } if a == (block.addr + 2) | 1
+        ));
+    }
+
+    /// THUMB `bl` links with the THUMB bit set so the callee's `bx lr`
+    /// returns in THUMB state.
+    #[test]
+    fn thumb_bl_links_with_the_thumb_bit() {
+        let function = lift_thumb(&[0xF000, 0xF800, 0x4770], 3);
+        let block = &function.blocks[0];
+        let Terminator::Call { state, .. } = &block.term else {
+            panic!("bl is a call");
+        };
+        let link = block
+            .insts
+            .iter()
+            .find(|inst| Value::Id(inst.dests[0]) == state[Register::Lr.bits() as usize])
+            .expect("lr is written");
+        assert!(matches!(
+            link.op,
+            Op::Mov { a: Value::Const(a), .. } if a == (block.addr + 4) | 1
         ));
     }
 
