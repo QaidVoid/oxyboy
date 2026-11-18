@@ -281,39 +281,43 @@ fn substitute_op(op: &mut Op, subs: &[(ValueId, u32)]) {
     }
 }
 
-/// Rewrites every argument list a terminator carries.
-fn substitute_term(term: &mut Terminator, subs: &[(ValueId, u32)]) {
-    let lists: Vec<&mut Vec<Value>> = match term {
-        Terminator::Branch { args, .. } => vec![args],
+/// Every value a terminator reads: edge arguments, exit state, and
+/// call or jump targets.
+fn term_values_mut(term: &mut Terminator) -> Vec<&mut Value> {
+    match term {
+        Terminator::Branch { args, .. } => args.iter_mut().collect(),
         Terminator::BranchCond {
             then_args,
             else_args,
             ..
-        } => vec![then_args, else_args],
-        Terminator::Call { cont, state, .. } => {
-            // A cont-free call is an exit: its state list is the
-            // outgoing machine state and must see folded constants
-            // just like the cont-bearing form.
-            let mut lists = vec![state];
+        } => then_args.iter_mut().chain(else_args.iter_mut()).collect(),
+        Terminator::Call {
+            target,
+            cont,
+            state,
+        } => {
+            let mut values: Vec<&mut Value> = vec![target];
+            values.extend(state.iter_mut());
             if let Some((_, args)) = cont {
-                lists.push(args);
+                values.extend(args.iter_mut());
             }
-            lists
+            values
         }
-        Terminator::Return { state, .. } => vec![state],
-        Terminator::IndirectExit { state, .. } => vec![state],
+        Terminator::Return { state, .. } => state.iter_mut().collect(),
+        Terminator::IndirectExit { target, state, .. } => {
+            std::iter::once(target).chain(state.iter_mut()).collect()
+        }
         Terminator::Unreachable => Vec::new(),
-    };
-    for list in lists {
-        for value in list.iter_mut() {
-            if let Value::Id(id) = *value {
-                for (from, to) in subs {
-                    if *from == id {
-                        *value = Value::Const(*to);
-                        break;
-                    }
-                }
-            }
+    }
+}
+
+/// Rewrites every value a terminator reads through `subs`.
+fn substitute_term(term: &mut Terminator, subs: &[(ValueId, u32)]) {
+    for value in term_values_mut(term) {
+        if let Value::Id(id) = *value
+            && let Some((_, to)) = subs.iter().find(|(from, _)| *from == id)
+        {
+            *value = Value::Const(*to);
         }
     }
 }
@@ -408,14 +412,12 @@ fn exit_live(
 ) -> HashSet<u32> {
     let mut live: HashSet<u32> = HashSet::new();
     match &function.blocks[index].term {
-        Terminator::Return { state, .. }
-        | Terminator::IndirectExit { state, .. }
-        | Terminator::Call { state, .. } => {
-            for value in state {
-                if let Value::Id(id) = value {
-                    live.insert(id.0);
-                }
-            }
+        Terminator::Return { state, .. } => {
+            live.extend(ids(state));
+        }
+        Terminator::IndirectExit { target, state, .. } | Terminator::Call { target, state, .. } => {
+            live.extend(ids(state));
+            live.extend(ids(std::slice::from_ref(target)));
         }
         _ => {}
     }
@@ -429,6 +431,13 @@ fn exit_live(
         }
     }
     live
+}
+
+fn ids(values: &[Value]) -> impl Iterator<Item = u32> + '_ {
+    values.iter().filter_map(|value| match value {
+        Value::Id(id) => Some(id.0),
+        Value::Const(_) => None,
+    })
 }
 
 /// Fixpoint liveness: per-block live-in sets over the whole CFG.
@@ -967,32 +976,11 @@ fn rewrite_copies(inst: &mut Inst, copies: &[(ValueId, Value)]) {
 }
 
 fn rewrite_term_copies(term: &mut Terminator, copies: &[(ValueId, Value)]) {
-    let lists: Vec<&mut Vec<Value>> = match term {
-        Terminator::Branch { args, .. } => vec![args],
-        Terminator::BranchCond {
-            then_args,
-            else_args,
-            ..
-        } => vec![then_args, else_args],
-        Terminator::Call {
-            cont: Some((_, args)),
-            state,
-            ..
-        } => vec![args, state],
-        Terminator::Return { state, .. } => vec![state],
-        Terminator::IndirectExit { state, .. } => vec![state],
-        _ => vec![],
-    };
-    for list in lists {
-        for value in list.iter_mut() {
-            if let Value::Id(id) = *value {
-                for (from, to) in copies {
-                    if *from == id {
-                        *value = *to;
-                        break;
-                    }
-                }
-            }
+    for value in term_values_mut(term) {
+        if let Value::Id(id) = *value
+            && let Some((_, to)) = copies.iter().find(|(from, _)| *from == id)
+        {
+            *value = *to;
         }
     }
 }
@@ -1070,6 +1058,20 @@ mod tests {
             },
             &[],
         )
+    }
+
+    /// The ARM-to-THUMB veneer: the folded `add` must reach the
+    /// `bx` target as a constant, not as the id of a removed inst.
+    #[test]
+    fn folded_constants_reach_the_indirect_exit_target() {
+        // add r12, pc, #1; bx r12
+        let mut function = lift_arm(&[0xE28F_C001, 0xE12F_FF1C]);
+        let base = function.blocks[0].addr;
+        optimize(&mut function);
+        let Terminator::IndirectExit { target, .. } = &function.blocks[0].term else {
+            panic!("bx exits indirectly");
+        };
+        assert_eq!(*target, Value::Const(base + 8 + 1));
     }
 
     /// A conditional branch reads the comparison's flags; the pass
