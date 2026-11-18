@@ -167,23 +167,27 @@ fn execute(
     }
 }
 
-/// Steps until a breakpoint, a halt, or the frame budget.
+/// Steps until a breakpoint is reached, the CPU enters a halt, or
+/// the frame budget runs out. It always steps first, so a `run` from a
+/// breakpoint or from inside a halt makes progress.
 fn run_until_stop(system: &mut System, breakpoints: &[u32], frames: u32) {
     let mut frames_done = 0u32;
     while frames_done < frames {
-        let pc = system.cpu.pc();
-        if breakpoints.contains(&pc) {
-            println!("break at 0x{pc:08x}");
-            return;
-        }
-        if system.cpu.is_halted() {
-            println!("halted at 0x{pc:08x}");
-            return;
-        }
+        let was_halted = system.cpu.is_halted();
+        system.step();
         if system.take_frame_ended() {
             frames_done += 1;
         }
-        system.step();
+        let pc = system.cpu.pc();
+        if system.cpu.is_halted() {
+            if !was_halted {
+                println!("halted at 0x{pc:08x}");
+                return;
+            }
+        } else if breakpoints.contains(&pc) {
+            println!("break at 0x{pc:08x}");
+            return;
+        }
     }
     println!("ran {frames} frames");
 }

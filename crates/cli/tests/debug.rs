@@ -145,3 +145,44 @@ fn io_log_requires_headless() {
     let stderr = String::from_utf8(output.stderr).expect("utf-8 stderr");
     assert!(stderr.contains("--headless"), "{stderr}");
 }
+
+/// Runs a debug script over `rom`, returning stdout.
+fn debug_session(rom: &std::path::Path, script: &str, tag: &str) -> String {
+    let path = std::env::temp_dir().join(format!("oxyboy_dbg_{tag}_{}.txt", std::process::id()));
+    std::fs::write(&path, script).expect("writes script");
+    let output = oxyboy()
+        .args(["debug", "--rom"])
+        .arg(rom)
+        .arg("--script")
+        .arg(&path)
+        .output()
+        .expect("run oxyboy");
+    let _ = std::fs::remove_file(&path);
+    assert!(output.status.success(), "debug failed: {:?}", output.stderr);
+    String::from_utf8(output.stdout).expect("utf-8 session")
+}
+
+#[test]
+fn run_leaves_a_breakpoint_it_stopped_at() {
+    let Some(rom) = rom_or_skip("switest") else {
+        return;
+    };
+    let stdout = debug_session(&rom, "break 0x02000110\nrun\nrun 2\nquit\n", "leave");
+    assert_eq!(stdout.matches("break at 0x02000110").count(), 1, "{stdout}");
+    assert!(stdout.contains("ran 2 frames"), "{stdout}");
+}
+
+#[test]
+fn run_keeps_going_while_the_cpu_stays_halted() {
+    // swi 0x05 (VBlankIntrWait) with no interrupt enabled, in a loop:
+    // the CPU halts for good.
+    let mut bytes = testutil::synthetic::RomBuilder::new().title("HALT").build();
+    bytes[0..4].copy_from_slice(&0xEF05_0000u32.to_le_bytes());
+    bytes[4..8].copy_from_slice(&0xEAFF_FFFDu32.to_le_bytes());
+    let rom = std::env::temp_dir().join(format!("oxyboy_dbg_halt_{}.gba", std::process::id()));
+    std::fs::write(&rom, &bytes).expect("writes ROM");
+    let stdout = debug_session(&rom, "run\nrun 2\nquit\n", "halt");
+    let _ = std::fs::remove_file(&rom);
+    assert_eq!(stdout.matches("halted at").count(), 1, "{stdout}");
+    assert!(stdout.contains("ran 2 frames"), "{stdout}");
+}
