@@ -14,7 +14,7 @@
 
 use crate::bus::Bus;
 
-/// Timing-field selectors (CNT_H bits 8-9).
+/// Timing-field selectors (CNT_H bits 12-13).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DmaTiming {
     /// Fires when the channel enable rises.
@@ -46,6 +46,25 @@ pub struct Dma {
     deferred: u8,
 }
 
+/// DMAxCNT_H fields (GBATEK "DMA Transfer Channels"): destination
+/// control in bits 5-6, source control in bits 7-8, repeat in bit 9,
+/// 32-bit units in bit 10, start timing in bits 12-13, the end IRQ in
+/// bit 14, and the enable in bit 15.
+fn dst_control(cnt_h: u16) -> u8 {
+    ((cnt_h >> 5) & 0x0003) as u8
+}
+
+fn src_control(cnt_h: u16) -> u8 {
+    ((cnt_h >> 7) & 0x0003) as u8
+}
+
+fn timing_of(cnt_h: u16) -> u8 {
+    ((cnt_h >> 12) & 0x0003) as u8
+}
+
+const REPEAT: u16 = 0x0200;
+const WORD_UNITS: u16 = 0x0400;
+
 /// Halfword IO offsets of CNT_H per channel.
 const CNT_H: [u32; 4] = [0x0BA, 0x0C6, 0x0D2, 0x0DE];
 /// CNT_L (word count) halfword IO offsets per channel.
@@ -70,8 +89,7 @@ impl Dma {
             u32::from(cnt_l)
         };
         self.channels[ch] = Channel { sad, dad, count };
-        let timing = (half(io, CNT_H[ch] as usize) >> 8) & 0x0003;
-        if timing == DmaTiming::Immediate as u16 {
+        if timing_of(half(io, CNT_H[ch] as usize)) == DmaTiming::Immediate as u8 {
             self.deferred |= 1 << ch;
         }
     }
@@ -82,11 +100,11 @@ impl Dma {
     pub(super) fn rearm(&mut self, io: &[u8], timing: DmaTiming) {
         for (ch, &cnt_h_off) in CNT_H.iter().enumerate() {
             let cnt_h = half(io, cnt_h_off as usize);
-            if cnt_h & 0x8000 == 0 || ((cnt_h >> 8) & 0x0003) as u8 != timing as u8 {
+            if cnt_h & 0x8000 == 0 || timing_of(cnt_h) != timing as u8 {
                 continue;
             }
             self.channels[ch].count = latch_count(io, ch);
-            if (cnt_h & 0x0003) == 0b0011 {
+            if dst_control(cnt_h) == 0b11 {
                 self.channels[ch].dad = word_at(io, 0xB4 + 12 * ch);
             }
         }
@@ -98,7 +116,7 @@ impl Dma {
         let mut cycles = 0;
         for (ch, &cnt_h_off) in CNT_H.iter().enumerate() {
             let cnt_h = bus.io_half(cnt_h_off);
-            if cnt_h & 0x8000 == 0 || ((cnt_h >> 8) & 0x0003) as u8 != timing as u8 {
+            if cnt_h & 0x8000 == 0 || timing_of(cnt_h) != timing as u8 {
                 continue;
             }
             cycles += self.transfer(bus, ch);
@@ -131,7 +149,7 @@ impl Dma {
             for ch in 1..=2 {
                 let cnt_h = bus.io_half(CNT_H[ch]);
                 if cnt_h & 0x8000 != 0
-                    && ((cnt_h >> 8) & 0x0003) as u8 == DmaTiming::Special as u8
+                    && timing_of(cnt_h) == DmaTiming::Special as u8
                     && self.channels[ch].dad & 0x0FFF_FFFF == fifo_addr
                 {
                     self.transfer(bus, ch);
@@ -143,8 +161,8 @@ impl Dma {
     /// Executes one channel transfer and returns the charged cycles.
     fn transfer(&mut self, bus: &mut Bus, ch: usize) -> u32 {
         let cnt_h = bus.io_half(CNT_H[ch]);
-        let timing = ((cnt_h >> 8) & 0x0003) as u8;
-        let repeat = cnt_h & 0x0010 != 0;
+        let timing = timing_of(cnt_h);
+        let repeat = cnt_h & REPEAT != 0;
         let irq_on_complete = cnt_h & 0x4000 != 0;
 
         // Special timing on channels 1/2 is the sound FIFO drain:
@@ -152,13 +170,17 @@ impl Dma {
         // Reset/Drain"). Channel 0 has no special timing; channel 3's
         // (video capture) is not modeled yet.
         let fifo = timing == DmaTiming::Special as u8 && (1..=2).contains(&ch);
-        let unit: u32 = if fifo || cnt_h & 0x0020 != 0 { 4 } else { 2 };
+        let unit: u32 = if fifo || cnt_h & WORD_UNITS != 0 {
+            4
+        } else {
+            2
+        };
         let count = if fifo { 4 } else { self.channels[ch].count };
         // FIFO drains write a fixed address regardless of the CNT_H
         // destination adjust bits (GBATEK: "the destination address
         // will not be incremented in FIFO mode").
-        let dst_adj = if fifo { 0b10 } else { (cnt_h & 0x0003) as u8 };
-        let src_adj = ((cnt_h >> 2) & 0x0003) as u8;
+        let dst_adj = if fifo { 0b10 } else { dst_control(cnt_h) };
+        let src_adj = src_control(cnt_h);
         let mut sad = self.channels[ch].sad;
         let mut dad = self.channels[ch].dad;
 
@@ -179,9 +201,13 @@ impl Dma {
         if unit == 2 && (0x0D00_0000..0x0E00_0000).contains(&dad) && (9..=81).contains(&count) {
             bus.save_mut().announce_eeprom_stream(count as u8);
         }
-        for _ in 0..count {
-            cycles += bus.access_cost(sad, unit as u8);
-            cycles += bus.access_cost(dad, unit as u8);
+        // 2I internal cycles, 4I when both ends are on the Game Pak.
+        let gamepak = |addr: u32| (0x08..=0x0E).contains(&((addr >> 24) & 0x0F));
+        cycles += if gamepak(sad) && gamepak(dad) { 4 } else { 2 };
+        for index in 0..count {
+            let seq = index > 0;
+            cycles += bus.dma_access_cost(sad, unit as u8, seq);
+            cycles += bus.dma_access_cost(dad, unit as u8, seq);
             if unit == 4 {
                 let v = bus.read_u32(sad);
                 bus.write_u32(dad, v);
@@ -192,7 +218,6 @@ impl Dma {
             sad = step(sad, src_adj);
             dad = step(dad, dst_adj);
         }
-        cycles += count * 2; // DMA internal overhead, coarse model
 
         // End-of-transfer state: the latched addresses carry the final
         // positions into the next repeat trigger, so a FIFO drain's
@@ -236,4 +261,31 @@ fn half(bytes: &[u8], i: usize) -> u16 {
 /// Little-endian word at `off`.
 fn word_at(io: &[u8], off: usize) -> u32 {
     u32::from(half(io, off)) | (u32::from(half(io, off + 2)) << 16)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::bus::Bus;
+
+    /// GBATEK "DMA Transfer Time": 2N + 2(n-1)S + 2I, with the first
+    /// unit non-sequential and the rest sequential on each side.
+    #[test]
+    fn transfer_time_follows_gbatek() {
+        // Four words ROM -> IWRAM at the reset WAITCNT (a ROM word is
+        // N=6, S=4; IWRAM is 1): 2I + (6 + 1) + 3 * (4 + 1) = 24.
+        let mut bus = Bus::new(vec![0u8; 0x100]);
+        bus.write_u32(0x0400_00D4, 0x0800_0000);
+        bus.write_u32(0x0400_00D8, 0x0300_0000);
+        bus.write_u16(0x0400_00DC, 4);
+        bus.write_u16(0x0400_00DE, 0x8400); // enable, 32-bit, immediate
+        assert_eq!(bus.dma_run_deferred(), 24);
+
+        // Sixteen halfwords EWRAM -> EWRAM (3 cycles each way):
+        // 2 + 16 * 6.
+        bus.write_u32(0x0400_00D4, 0x0200_0000);
+        bus.write_u32(0x0400_00D8, 0x0200_1000);
+        bus.write_u16(0x0400_00DC, 16);
+        bus.write_u16(0x0400_00DE, 0x8000);
+        assert_eq!(bus.dma_run_deferred(), 98);
+    }
 }

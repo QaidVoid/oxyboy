@@ -49,7 +49,7 @@ fn halting_system() -> System {
     bus.write_u32(IO + 0x0BC, IWRAM);
     bus.write_u32(IO + 0x0C0, IO + 0x0A0);
     bus.write_u16(IO + 0x0C4, 4);
-    bus.write_u16(IO + 0x0C6, 0x0002 | 0x0010 | 0x0020 | 0x0300 | 0x8000);
+    bus.write_u16(IO + 0x0C6, 0xB640); // special, 32-bit, repeat, dst fixed
     // Timer 0: one overflow per 512 cycles; timer 1: IRQ at prescaler 64.
     bus.write_u16(IO + 0x100, 0xFE00);
     bus.write_u16(IO + 0x102, 0x0080);

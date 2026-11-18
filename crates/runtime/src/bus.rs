@@ -256,6 +256,16 @@ impl Bus {
         self.access_cycles(addr, width, seq)
     }
 
+    /// Cycle cost of one DMA unit: GBATEK "DMA Transfer Time" prices
+    /// the first unit of a transfer non-sequential and the rest
+    /// sequential, on each side independently. The CPU's sequential
+    /// tracker and prefetch buffer restart after the DMA held the bus.
+    pub(crate) fn dma_access_cost(&mut self, addr: u32, width: u8, seq: bool) -> u32 {
+        self.prefetch = None;
+        self.last_access = (0, 0);
+        self.access_cycles(addr, width, seq)
+    }
+
     /// Bus-level cycle cost of one opcode fetch, honoring the Game Pak
     /// prefetch buffer (WAITCNT bit 14) with a hit-only model: a fetch
     /// at the buffered successor address completes in one cycle, and

@@ -131,11 +131,11 @@ fn timer_and_dma_sustain_fifo_playback() {
     }
     // DMA 1 (channel 1 is one of the two sound channels): source
     // inc, FIFO A fixed destination, 4 words, repeat, 32-bit,
-    // special (demand) timing bits 8-9, enabled.
+    // special (demand) timing bits 12-13, enabled.
     bus.write_u32(BASE + 0x0BC, IWRAM);
     bus.write_u32(BASE + 0x0C0, BASE + 0x0A0);
     w(&mut bus, 0x0C4, 4);
-    w(&mut bus, 0x0C6, 0x0002 | 0x0010 | 0x0020 | 0x0300 | 0x8000);
+    w(&mut bus, 0x0C6, 0xB640);
 
     // Timer 0: one overflow per sample slot.
     w(&mut bus, 0x0100, TIMER_RELOAD);
@@ -186,7 +186,7 @@ fn fifo_dma_follows_the_destination_not_the_channel_number() {
     bus.write_u32(BASE + 0x0C8, IWRAM);
     bus.write_u32(BASE + 0x0CC, BASE + 0x0A0);
     w(&mut bus, 0x0D0, 4);
-    w(&mut bus, 0x0D2, 0x0002 | 0x0010 | 0x0020 | 0x0300 | 0x8000);
+    w(&mut bus, 0x0D2, 0xB640);
     w(&mut bus, 0x0100, TIMER_RELOAD);
     w(&mut bus, 0x0102, 0x0080);
 

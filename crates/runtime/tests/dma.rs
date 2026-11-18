@@ -32,7 +32,7 @@ fn parked() -> Vec<u8> {
 
 /// CNT_H builders: `(dst_adj, src_adj, timing, extra_bits)`.
 fn cnt_h(dst_adj: u16, src_adj: u16, timing: u16, extra: u16) -> u16 {
-    0x8000 | extra | (timing << 8) | (src_adj << 2) | dst_adj
+    0x8000 | extra | (timing << 12) | (src_adj << 7) | (dst_adj << 5)
 }
 
 /// Fills `count` halfwords at `addr` with `seed + i` patterns.
@@ -80,7 +80,7 @@ fn word_width_transfers_32_bit_units() {
     bus.write_u32(ch(1) + DAD, DST);
     bus.write_u16(ch(1) + CNT_L, 2);
     // Width bit 5 selects 32-bit units.
-    bus.write_u16(ch(1) + CNT_H, cnt_h(0b00, 0b00, 0b00, 0x0020));
+    bus.write_u16(ch(1) + CNT_H, cnt_h(0b00, 0b00, 0b00, 0x0400));
     system.step();
 
     let bus = system.bus_mut();
@@ -244,7 +244,7 @@ fn hblank_dma_fires_between_hdraw_and_hblank_flags() {
     bus.write_u16(ch(1) + CNT_L, 1);
     // H-Blank timing (10) with repeat (CNT_H bit 4); src and dst fixed
     // so every line's run reads and writes the same cells.
-    bus.write_u16(ch(1) + CNT_H, cnt_h(0b10, 0b10, 0b10, 0x0010));
+    bus.write_u16(ch(1) + CNT_H, cnt_h(0b10, 0b10, 0b10, 0x0200));
 
     // Dot 1005 of line 0: HDraw still holds (the flag rises at dot
     // 1006, GBATEK DISPSTAT: the flag is low for 1006 of the line's
@@ -275,7 +275,7 @@ fn repeat_with_inc_reload_restores_the_destination_each_frame() {
     bus.write_u16(ch(0) + CNT_L, 2);
     // V-Blank timing, repeat (CNT_H bit 4), dst adjust inc+reload, src
     // inc (the latched source advances across frames).
-    bus.write_u16(ch(0) + CNT_H, cnt_h(0b11, 0b00, 0b01, 0x0010));
+    bus.write_u16(ch(0) + CNT_H, cnt_h(0b11, 0b00, 0b01, 0x0200));
     fill_halfwords(&mut bus, SRC, 2, 0x0100);
     ppu.step(&mut bus, 161 * CYCLES_PER_LINE);
     assert_eq!(bus.read_u16(DST), 0x0100);

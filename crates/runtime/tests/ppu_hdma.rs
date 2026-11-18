@@ -47,7 +47,7 @@ fn set_up(bus: &mut Bus) {
     bus.write_u32(0x0400_00D4, TABLE); // 3SAD
     bus.write_u32(0x0400_00D8, 0x0400_0054); // 3DAD
     bus.write_u16(0x0400_00DC, 1); // 3CNT_L: one unit per trigger
-    bus.write_u16(0x0400_00DE, 0x8212); // enable, HBlank, repeat, dst fixed
+    bus.write_u16(0x0400_00DE, 0xA240); // enable, HBlank, repeat, dst fixed
 }
 
 fn run_two_frames(bus: &mut Bus) -> (Vec<u8>, Vec<u8>) {

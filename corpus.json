@@ -5,14 +5,14 @@
       "rom": "target/test-roms/eeprom512test.gba",
       "frames": 60,
       "budget_ms": 20,
-      "hash": "0fbc44c8cedf4ec6"
+      "hash": "99a79c42731ece90"
     },
     {
       "name": "eeprom8ktest",
       "rom": "target/test-roms/eeprom8ktest.gba",
       "frames": 60,
       "budget_ms": 20,
-      "hash": "1ae25a93bfb644e6"
+      "hash": "bf6d661003709b3c"
     },
     {
       "name": "flash128test",
@@ -82,7 +82,7 @@
       "rom": "corpus/cart.gba",
       "frames": 120,
       "budget_ms": 80,
-      "hash": "ce68ff0700faac93"
+      "hash": "47f088c8cd9137ae"
     }
   ]
 }

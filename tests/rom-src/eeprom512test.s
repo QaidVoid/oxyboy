@@ -102,9 +102,9 @@ read_page:
     str r1, [r0, #4]
     mov r1, #9
     strh r1, [r0, #8]
-    @ CNT_H: enable, dst fixed (bits 0-1 = 10), 16-bit units,
-    @ immediate timing (the runtime's CNT_H encoding).
-    ldr r1, =0x8002
+    @ CNT_H: enable, dst fixed (bits 5-6 = 10), 16-bit units,
+    @ immediate timing (GBATEK DMAxCNT_H).
+    ldr r1, =0x8040
     strh r1, [r0, #10]
     @ Reply fetch: DMA3 reads 68 halfwords from 0x0D000000 with a
     @ fixed source into the reply buffer.
@@ -114,9 +114,9 @@ read_page:
     str r1, [r0, #4]
     mov r1, #68
     strh r1, [r0, #8]
-    @ CNT_H: enable, src fixed (bits 2-3 = 10), 16-bit units,
+    @ CNT_H: enable, src fixed (bits 7-8 = 10), 16-bit units,
     @ immediate timing.
-    ldr r1, =0x8008
+    ldr r1, =0x8100
     strh r1, [r0, #10]
     @ Pack reply bits 4..67 (64 data bits, MSB first) into 8 bytes
     @ at 0x03000004.
@@ -170,9 +170,9 @@ write_page:
     str r1, [r0, #4]
     mov r1, #73
     strh r1, [r0, #8]
-    @ CNT_H: enable, dst fixed (bits 0-1 = 10), 16-bit units,
-    @ immediate timing (the runtime's CNT_H encoding).
-    ldr r1, =0x8002
+    @ CNT_H: enable, dst fixed (bits 5-6 = 10), 16-bit units,
+    @ immediate timing (GBATEK DMAxCNT_H).
+    ldr r1, =0x8040
     strh r1, [r0, #10]
     pop {r4, r5, r6, r7, lr}
     bx  lr
