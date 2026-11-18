@@ -1024,3 +1024,32 @@ fn loop_back_edge_keeps_the_previous_iteration_values() {
     let hybrid = assert_hybrid_matches(&image, &[(0x100, 0x134)], "recomp-loop-copy", 0x0800_0134);
     assert_eq!(hybrid.cpu.reg_for_test(2), 0x0800_01C0 + 0x0800_01C8);
 }
+
+#[test]
+fn failed_guard_keeps_the_writeback_base() {
+    if !recomp::Module::compiler_available() {
+        println!("skipping: no host C compiler on PATH");
+        return;
+    }
+    let image = arm_image(
+        "RCWB",
+        &[
+            0xE3A0_1408, // mov r1, #0x08000000
+            0xE281_1D07, // add r1, r1, #0x1C0
+            0xE3A0_0001, // mov r0, #1
+            0xE350_0000, // cmp r0, #0
+            0x14D1_3001, // ldrneb r3, [r1], #1   (taken)
+            0xE350_0001, // cmp r0, #1
+            0x14D1_4001, // ldrneb r4, [r1], #1   (not taken)
+            0x15B1_4001, // ldrne r4, [r1, #1]!   (not taken)
+            0xE3A0_5402, // mov r5, #0x02000000
+            0xE585_1000, // str r1, [r5]
+            0xEA00_0000, // b park
+            0xE1A0_0000, // (filler)
+            0xEAFF_FFFE, // park: b .
+        ],
+        &[(0x1C0, 0x4433_2211)],
+    );
+    let hybrid = assert_hybrid_matches(&image, &[(0x100, 0x12C)], "recomp-writeback", 0x0800_0130);
+    assert_eq!(hybrid.cpu.reg_for_test(1), 0x0800_01C1);
+}

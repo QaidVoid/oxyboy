@@ -758,19 +758,33 @@ impl ArmLift {
         // The writeback runs after the access, and a load into the
         // base register wins over it (ARM ARM A4.1.6).
         if writeback && rn != Register::Pc && !(load && rd == rn) {
-            if let Some(sum) = pre_sum {
-                self.current[rn.bits() as usize] = sum;
-            } else {
-                let sum = self.fresh();
-                self.emit(
-                    Op::Add {
-                        set_flags: false,
-                        a: base,
-                        b: offset,
-                    },
-                    vec![sum],
-                );
-                self.current[rn.bits() as usize] = sum;
+            match pre_sum {
+                // The pre-indexed address is already computed; a
+                // guarded writeback still needs a slot write so the
+                // guard-fail path keeps the old base.
+                Some(sum) if self.guard.is_some_and(|cond| cond != Condition::Al) => {
+                    let id = self.write(rn);
+                    self.emit(
+                        Op::Mov {
+                            set_flags: false,
+                            a: Value::Id(sum),
+                            carry_in: Value::Const(0),
+                        },
+                        vec![id],
+                    );
+                }
+                Some(sum) => self.current[rn.bits() as usize] = sum,
+                None => {
+                    let sum = self.write(rn);
+                    self.emit(
+                        Op::Add {
+                            set_flags: false,
+                            a: base,
+                            b: offset,
+                        },
+                        vec![sum],
+                    );
+                }
             }
         }
     }
@@ -881,7 +895,7 @@ impl ArmLift {
             } else {
                 (count * 4).wrapping_neg()
             };
-            let sum = self.fresh();
+            let sum = self.write(rn);
             self.emit(
                 Op::Add {
                     set_flags: false,
@@ -890,7 +904,6 @@ impl ArmLift {
                 },
                 vec![sum],
             );
-            self.current[rn.bits() as usize] = sum;
         }
     }
 }
