@@ -155,19 +155,15 @@ pub fn emit_function(function: &Function) -> String {
         out: String::new(),
         indent: 1,
     };
-    // Pass 1 collects goto targets; pass 2 renders with labels.
-    emitter.run();
-    emitter.out.clear();
-    emitter.consumed.clear();
-    emitter.loop_stack.clear();
-    emitter.indent = 1;
+    emitter.render();
+    let body = std::mem::take(&mut emitter.out);
     let name = if function.name.is_empty() {
         "sub_0".to_string()
     } else {
         function.name.clone()
     };
     emitter.out.push_str(&format!("void {name}(void) {{\n"));
-    emitter.run();
+    emitter.out.push_str(&body);
     if emitter.goto_targets.contains(&BlockId(u32::MAX)) {
         emitter.line("b_indirect:;");
         emitter.line("return;");
@@ -238,12 +234,7 @@ pub fn emit_unit(addrs: &[u32], functions: &[Function], annotations: &Annotation
             out: String::new(),
             indent: 1,
         };
-        emitter.run();
-        emitter.out.clear();
-        emitter.consumed.clear();
-        emitter.loop_stack.clear();
-        emitter.indent = 1;
-        emitter.run();
+        emitter.render();
         out.push_str(&format!("u32 {name}({}) {{\n", emitter.unit_params()));
         out.push_str(&emitter.unit_declarations());
         out.push_str(&emitter.out);
@@ -473,6 +464,24 @@ fn negate(cond: Condition) -> Option<Condition> {
 }
 
 impl Emitter<'_> {
+    /// Renders the body into `out`. A walk only labels blocks it knows
+    /// are goto targets, and which blocks need a goto depends on the
+    /// walk order, so walks repeat until the target set is stable; it
+    /// only grows, so this ends within one walk per block.
+    fn render(&mut self) {
+        for _ in 0..=self.function.blocks.len() {
+            let known = self.goto_targets.clone();
+            self.out.clear();
+            self.consumed.clear();
+            self.loop_stack.clear();
+            self.indent = 1;
+            self.run();
+            if self.goto_targets == known {
+                return;
+            }
+        }
+    }
+
     fn run(&mut self) {
         self.emit_from(BlockId(0), None);
         for index in 0..self.function.blocks.len() {
@@ -558,8 +567,7 @@ impl Emitter<'_> {
                 return true;
             }
             if let Some(shape) = self.shape_at(block).cloned() {
-                self.open_loop(shape, stop);
-                return false;
+                return self.open_loop(shape, stop);
             }
             self.consumed.insert(block);
             self.emit_insts(block, false);
@@ -670,12 +678,12 @@ impl Emitter<'_> {
     }
 
     /// Emits one recognized loop and continues at its exit. `stop`
-    /// is the enclosing walk's latch, used for the exit continuation.
-    fn open_loop(&mut self, shape: Shape, stop: Option<(BlockId, BlockId)>) {
+    /// is the enclosing walk's latch, used for the exit continuation;
+    /// returns whether that continuation closed the enclosing loop.
+    fn open_loop(&mut self, shape: Shape, stop: Option<(BlockId, BlockId)>) -> bool {
         self.consumed.insert(shape.header);
         if shape.header == shape.latch {
-            self.single_block_loop(&shape, stop);
-            return;
+            return self.single_block_loop(&shape, stop);
         }
         let tested = matches!(shape.close, Close::While | Close::WhileLatch { .. });
         let skip = tested && self.last_inst_is_cmp(shape.header);
@@ -713,15 +721,13 @@ impl Emitter<'_> {
             self.frame_close(&shape);
         }
         let (action, next) = self.fallthrough_or_goto(shape.exit);
-        if action == Action::Fallthrough {
-            self.emit_from(next, stop);
-        }
+        action == Action::Fallthrough && self.emit_from(next, stop)
     }
 
     /// `do { block } while (cond);` for a loop that is one block.
-    fn single_block_loop(&mut self, shape: &Shape, stop: Option<(BlockId, BlockId)>) {
+    fn single_block_loop(&mut self, shape: &Shape, stop: Option<(BlockId, BlockId)>) -> bool {
         let Close::DoWhile { cond, invert } = shape.close else {
-            return;
+            return false;
         };
         self.line("do {");
         self.indent += 1;
@@ -731,9 +737,7 @@ impl Emitter<'_> {
         let text = self.condition_text(cond, shape.header, invert);
         self.line(&format!("}} while ({text});"));
         let (action, next) = self.fallthrough_or_goto(shape.exit);
-        if action == Action::Fallthrough {
-            self.emit_from(next, stop);
-        }
+        action == Action::Fallthrough && self.emit_from(next, stop)
     }
 
     /// The loop close emitted by the open_loop frame itself, when the
@@ -1012,6 +1016,9 @@ impl Emitter<'_> {
             };
             self.line(&text);
             self.indent += 1;
+            if self.goto_targets.contains(&arm) {
+                self.label(arm);
+            }
             self.emit_insts(arm, false);
             let state = match self.function.blocks[arm.0 as usize].term.clone() {
                 Terminator::Return { state, .. } => state,
@@ -1154,6 +1161,9 @@ impl Emitter<'_> {
                 return;
             }
             self.consumed.insert(current);
+            if self.goto_targets.contains(&current) {
+                self.label(current);
+            }
             self.emit_insts(current, false);
             match self.function.blocks[current.0 as usize].term.clone() {
                 Terminator::Branch { target, args: _ } => {
@@ -1877,6 +1887,33 @@ mod tests {
             text.matches('}').count(),
             "unbalanced braces in:\n{text}"
         );
+    }
+
+    /// Random control-flow graphs, irreducible ones included, render
+    /// with a label for every goto and balanced braces.
+    #[test]
+    fn random_control_flow_is_wellformed() {
+        let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut next = |bound: u32| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % u64::from(bound)) as u32
+        };
+        for _ in 0..3_000 {
+            let count = 2 + next(11);
+            let blocks = (0..count)
+                .map(|_| {
+                    let term = match next(4) {
+                        0 => ret(),
+                        1 => branch(BlockId(next(count))),
+                        _ => branch_cond(Condition::Ne, BlockId(next(count)), BlockId(next(count))),
+                    };
+                    block(vec![cmp(next(4), 0)], term)
+                })
+                .collect();
+            assert_wellformed(&emitted(blocks));
+        }
     }
 
     #[test]
