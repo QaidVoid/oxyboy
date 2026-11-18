@@ -60,20 +60,25 @@ pub const IO_NAMES: &[(u16, &str)] = &[
     (0x082, "SOUNDCNT_H"),
     (0x084, "SOUNDCNT_X"),
     (0x088, "SOUNDBIAS"),
+    (0x090, "WAVE_RAM"),
     (0x0A0, "FIFO_A"),
     (0x0A4, "FIFO_B"),
     (0x0B0, "DMA0SAD"),
     (0x0B4, "DMA0DAD"),
     (0x0B8, "DMA0CNT"),
+    (0x0BA, "DMA0CNT_H"),
     (0x0BC, "DMA1SAD"),
     (0x0C0, "DMA1DAD"),
     (0x0C4, "DMA1CNT"),
+    (0x0C6, "DMA1CNT_H"),
     (0x0C8, "DMA2SAD"),
     (0x0CC, "DMA2DAD"),
     (0x0D0, "DMA2CNT"),
+    (0x0D2, "DMA2CNT_H"),
     (0x0D4, "DMA3SAD"),
     (0x0D8, "DMA3DAD"),
     (0x0DC, "DMA3CNT"),
+    (0x0DE, "DMA3CNT_H"),
     (0x100, "TM0CNT_L"),
     (0x102, "TM0CNT_H"),
     (0x104, "TM1CNT_L"),
@@ -82,16 +87,26 @@ pub const IO_NAMES: &[(u16, &str)] = &[
     (0x10A, "TM2CNT_H"),
     (0x10C, "TM3CNT_L"),
     (0x10E, "TM3CNT_H"),
-    (0x120, "SIOCNT"),
-    (0x122, "SIODATA32"),
-    (0x128, "SIOMULTI0"),
-    (0x12A, "SIOMULTI1"),
+    // SIODATA32 doubles as SIOMULTI0, SIODATA8 as SIOMLT_SEND.
+    (0x120, "SIODATA32"),
+    (0x122, "SIOMULTI1"),
+    (0x124, "SIOMULTI2"),
+    (0x126, "SIOMULTI3"),
+    (0x128, "SIOCNT"),
+    (0x12A, "SIODATA8"),
     (0x130, "KEYINPUT"),
     (0x132, "KEYCNT"),
+    (0x134, "RCNT"),
+    (0x140, "JOYCNT"),
+    (0x150, "JOY_RECV"),
+    (0x154, "JOY_TRANS"),
+    (0x158, "JOYSTAT"),
     (0x200, "IE"),
     (0x202, "IF"),
     (0x204, "WAITCNT"),
     (0x208, "IME"),
+    (0x300, "POSTFLG"),
+    (0x301, "HALTCNT"),
 ];
 
 /// The name of the IO register at `addr`, when `addr` lands in the
@@ -122,5 +137,20 @@ mod tests {
         assert_eq!(io_name(0x03FF_FFFE), None);
         assert_eq!(io_name(0x0400_0400), None);
         assert_eq!(io_name(0x0400_0086), None);
+    }
+
+    #[test]
+    fn serial_and_system_registers_follow_gbatek() {
+        assert_eq!(io_name(0x0400_0120), Some("SIODATA32"));
+        assert_eq!(io_name(0x0400_0128), Some("SIOCNT"));
+        assert_eq!(io_name(0x0400_012A), Some("SIODATA8"));
+        assert_eq!(io_name(0x0400_0134), Some("RCNT"));
+        assert_eq!(io_name(0x0400_0301), Some("HALTCNT"));
+        assert_eq!(io_name(0x0400_00BA), Some("DMA0CNT_H"));
+    }
+
+    #[test]
+    fn the_table_is_sorted_for_binary_search() {
+        assert!(super::IO_NAMES.windows(2).all(|w| w[0].0 < w[1].0));
     }
 }
