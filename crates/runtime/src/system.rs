@@ -119,6 +119,21 @@ impl System {
         self.ppu.take_frame_ended()
     }
 
+    /// System cycles until the next hardware event that can raise an
+    /// interrupt the CPU would take (a video edge or a timer overflow),
+    /// or `u32::MAX` while interrupts are masked. Native chunks stop
+    /// there so the interpreter takes the interrupt near its time.
+    #[must_use]
+    pub fn cycles_to_interrupt_event(&self) -> u32 {
+        let bus = &self.bus;
+        if bus.ime() & 1 == 0 || bus.int_enable() == 0 || self.cpu.cpsr() & 0x80 != 0 {
+            return u32::MAX;
+        }
+        self.ppu
+            .cycles_to_next_edge()
+            .min(bus.cycles_to_timer_overflow())
+    }
+
     /// System cycles from the current video dot to the next frame
     /// boundary (the frame runner's native-unit budget).
     #[must_use]

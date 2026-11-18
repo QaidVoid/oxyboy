@@ -970,6 +970,12 @@ impl Bus {
         self.timers = timers;
     }
 
+    /// System cycles to the next timer overflow, or `u32::MAX` when no
+    /// timer runs from the clock.
+    pub(crate) fn cycles_to_timer_overflow(&self) -> u32 {
+        self.timers.cycles_to_overflow(self).unwrap_or(u32::MAX)
+    }
+
     /// The longest span a halted CPU can sleep through without moving
     /// any timer overflow or APU sample: the step that ends there
     /// applies them exactly as single-cycle steps would.

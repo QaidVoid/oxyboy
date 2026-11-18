@@ -96,8 +96,32 @@ pub struct TranslatedFn {
 /// Host context the emitted code hands back to every callback. Opaque
 /// to the C side; the host callbacks dereference it here.
 struct HostCtx {
-    bus: *mut Bus,
+    system: *mut System,
     code_pages: *const u8,
+    /// The chunk's charged cycles when the current guest instruction
+    /// began (before its fetch).
+    inst_start: u64,
+    /// Cycles already fed to the scheduler during this chunk.
+    synced: u64,
+}
+
+impl HostCtx {
+    fn bus(&mut self) -> &mut Bus {
+        unsafe { (*self.system).bus_mut() }
+    }
+
+    /// Before an IO access, brings the PPU, timers, and APU up to the
+    /// start of the accessing instruction: where the interpreter has
+    /// them when the same instruction runs. A native poll of VCOUNT or
+    /// a timer counter then sees time pass as on hardware.
+    fn sync_for_io(&mut self, addr: u32) {
+        if (addr >> 24) & 0x0F != 0x04 || self.inst_start <= self.synced {
+            return;
+        }
+        let pending = self.inst_start - self.synced;
+        self.synced = self.inst_start;
+        unsafe { (*self.system).advance_clock(u32::try_from(pending).unwrap_or(u32::MAX)) };
+    }
 }
 
 /// A loaded translation plus its entry table.
@@ -246,7 +270,10 @@ impl Driver {
     /// Propagates native-call failures.
     pub fn run_frame(&mut self, system: &mut System) -> Result<(), String> {
         while !system.frame_ended() {
-            self.cycle_budget = u64::from(system.cycles_to_frame_end()).max(1);
+            let bound = system
+                .cycles_to_frame_end()
+                .min(system.cycles_to_interrupt_event());
+            self.cycle_budget = u64::from(bound).max(1);
             self.step(system)?;
         }
         self.cycle_budget = u64::MAX;
@@ -353,8 +380,10 @@ impl Driver {
 
         let budget = self.budget;
         let mut ctx = HostCtx {
-            bus: system.bus_mut(),
+            system: std::ptr::from_mut(system),
             code_pages: self.code_pages.as_ptr(),
+            inst_start: 0,
+            synced: 0,
         };
         let ops = GuestOps {
             ctx: std::ptr::from_mut(&mut ctx).cast::<c_void>(),
@@ -387,7 +416,8 @@ impl Driver {
         // in r15; an exit sets `exited` and the resume pc.
         let resume = if st.exited != 0 { st.pc } else { st.r[15] };
         system.cpu.set_pc(resume);
-        system.advance_clock(u32::try_from(st.cycles).unwrap_or(u32::MAX));
+        let remaining = st.cycles.saturating_sub(ctx.synced);
+        system.advance_clock(u32::try_from(remaining).unwrap_or(u32::MAX));
         Ok(u32::try_from(st.cycles).unwrap_or(u32::MAX))
     }
 }
@@ -401,7 +431,8 @@ unsafe extern "C" fn host_load(
     mode: u32,
 ) -> u32 {
     let host = unsafe { &mut *(ctx.cast::<HostCtx>()) };
-    let bus = unsafe { &mut *host.bus };
+    host.sync_for_io(addr);
+    let bus = host.bus();
     let width = match size {
         SIZE_BYTE => 1,
         SIZE_HALF => 2,
@@ -437,7 +468,8 @@ unsafe extern "C" fn host_load(
 /// the same order relative to the data callbacks.
 unsafe extern "C" fn host_fetch(ctx: *mut c_void, st: *mut GuestState, addr: u32, width: u32) {
     let host = unsafe { &mut *(ctx.cast::<HostCtx>()) };
-    let bus = unsafe { &mut *host.bus };
+    host.inst_start = unsafe { (*st).cycles };
+    let bus = host.bus();
     let cost = bus.fetch_cost(addr, u8::try_from(width).unwrap_or(4));
     unsafe { (*st).cycles += u64::from(cost) };
 }
@@ -454,7 +486,6 @@ unsafe extern "C" fn host_store(
     pc: u32,
 ) -> u32 {
     let host = unsafe { &mut *(ctx.cast::<HostCtx>()) };
-    let bus = unsafe { &mut *host.bus };
     let width = match size {
         SIZE_BYTE => 1,
         SIZE_HALF => 2,
@@ -477,9 +508,11 @@ unsafe extern "C" fn host_store(
             }
             return 1;
         }
-        let cost = bus.access_cost(addr, width);
+        host.sync_for_io(addr);
+        let cost = host.bus().access_cost(addr, width);
         unsafe { (*st).cycles += u64::from(cost) };
     }
+    let bus = host.bus();
     match size {
         SIZE_BYTE => bus.write_u8(addr, value as u8),
         SIZE_HALF => bus.write_u16(addr, value as u16),
