@@ -409,6 +409,12 @@ impl Cpu {
         self.cpsr = (self.cpsr & !0x1F) | u32::from(new.bits());
     }
 
+    /// The PC alignment for the current state: halfwords in THUMB,
+    /// words in ARM.
+    fn pc_align_mask(&self) -> u32 {
+        if self.cpsr & 0x20 != 0 { !1 } else { !3 }
+    }
+
     /// The SPSR of the current mode; User/System have none (reads 0,
     /// writes ignored: ARM7TDMI behavior, documented as UNPREDICTABLE in
     /// the ARM ARM A2.6 note on SPSR access).
@@ -1081,8 +1087,9 @@ impl Cpu {
         }
         if !comparison && rd == Register::Pc {
             // Data-processing writes to PC do not interwork on ARMv4T:
-            // bits 1:0 are ignored (ARM ARM A2.3).
-            self.pc = res & !3;
+            // the low bits are ignored for the state the CPU ends in,
+            // which an S-form return may have switched to THUMB.
+            self.pc = res & self.pc_align_mask();
             Flow::Handled
         } else {
             Flow::Sequential
@@ -1463,7 +1470,7 @@ impl Cpu {
                 // suite pins a misaligned STM read back by LDM).
                 let value = bus.read_u32(addr & !3);
                 if r == Register::Pc {
-                    loaded_pc = Some(value & !3);
+                    loaded_pc = Some(value);
                 } else if psr_and_force_user && !pc_in_list {
                     self.set_reg_user(r, value);
                 } else {
@@ -1514,7 +1521,7 @@ impl Cpu {
                 let spsr = self.spsr_of_current();
                 self.restore_cpsr(spsr);
             }
-            self.pc = target;
+            self.pc = target & self.pc_align_mask();
             return Flow::Handled;
         }
         Flow::Sequential

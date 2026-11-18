@@ -1031,3 +1031,45 @@ fn hle_swi_updates_the_bios_protection_latch() {
     assert_eq!(reg(&cpu, 0), 2, "sqrt dispatched");
     assert_eq!(bus.read_u32(0x0000_0000), BIOS_LATCH_SWI);
 }
+
+/// Exception returns into THUMB code align the target to a halfword
+/// for the restored state; word alignment would land a return at
+/// 2 mod 4 back on the instruction before it.
+#[test]
+fn exception_returns_into_thumb_keep_halfword_targets() {
+    // mov r0,#0x30; msr spsr_fsxc,r0; mov lr,#0x08000000;
+    // add lr,lr,#0x16; movs pc,lr
+    let mut bus = rom(&[
+        0xE3A0_0030,
+        0xE16F_F000,
+        0xE3A0_E408,
+        0xE28E_E016,
+        0xE1B0_F00E,
+    ]);
+    let mut cpu = Cpu::new(0x0800_0000);
+    cpu.set_cpsr_raw(0x13);
+    run(&mut cpu, &mut bus, 5);
+    assert_eq!(cpu.pc(), 0x0800_0016, "movs pc, lr");
+    assert_eq!(cpu.cpsr() & 0x20, 0x20, "THUMB restored");
+    assert_eq!(cpu.mode(), Mode::User);
+
+    // mov r0,#0x30; msr spsr_fsxc,r0; mov sp,#0x03000000;
+    // add sp,sp,#0x100; mov r1,#0x08000000; add r1,r1,#0x16;
+    // stmfd sp!,{r1}; ldmfd sp!,{pc}^
+    let mut bus = rom(&[
+        0xE3A0_0030,
+        0xE16F_F000,
+        0xE3A0_D403,
+        0xE28D_DC01,
+        0xE3A0_1408,
+        0xE281_1016,
+        0xE92D_0002,
+        0xE8FD_8000,
+    ]);
+    let mut cpu = Cpu::new(0x0800_0000);
+    cpu.set_cpsr_raw(0x13);
+    run(&mut cpu, &mut bus, 8);
+    assert_eq!(cpu.pc(), 0x0800_0016, "ldm {{pc}}^");
+    assert_eq!(cpu.cpsr() & 0x20, 0x20, "THUMB restored");
+    assert_eq!(cpu.mode(), Mode::User);
+}
