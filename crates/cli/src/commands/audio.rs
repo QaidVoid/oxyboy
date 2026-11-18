@@ -123,7 +123,7 @@ impl Resampler {
 
 /// Blends two samples at fractional position `t` in 0..1.
 fn lerp(a: i16, b: i16, t: f32) -> i16 {
-    (f32::from(a) + f32::from(b - a) * t).round() as i16
+    (f32::from(a) + (f32::from(b) - f32::from(a)) * t).round() as i16
 }
 
 /// Rate multiplier that pulls the ring level back toward
@@ -366,7 +366,7 @@ pub fn start() -> Result<Output, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Duration, Instant, MAX_ADJUST, RateTracker, Resampler, Ring, TARGET_LEVEL, step_scale,
+        Duration, Instant, MAX_ADJUST, RateTracker, Resampler, Ring, TARGET_LEVEL, lerp, step_scale,
     };
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -384,6 +384,12 @@ mod tests {
             cursor: 0.0,
             last: [0; 2],
         }
+    }
+
+    #[test]
+    fn lerp_spans_the_full_sample_range() {
+        assert_eq!(lerp(-30000, 30000, 0.5), 0);
+        assert_eq!(lerp(i16::MIN, i16::MAX, 1.0), i16::MAX);
     }
 
     #[test]
