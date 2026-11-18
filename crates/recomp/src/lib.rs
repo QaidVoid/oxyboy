@@ -97,15 +97,17 @@ fn emit_block(
     translated: &BTreeSet<u32>,
 ) {
     let _ = writeln!(out, "b{}:;", index);
-    // A block containing an intrinsic is opaque: the model does not
-    // cover the instruction, so the interpreter runs the whole block
-    // from its leader and nothing re-executes. The leader state is
-    // the block's parameters, so flush them: the resumed interpreter
-    // must see what earlier blocks computed.
-    if block
-        .insts
-        .iter()
-        .any(|inst| matches!(inst.op, Op::Intrinsic { .. }))
+    // A block containing an intrinsic, or ending where the lifted
+    // region does (an undefined encoding or unmarked bytes), is
+    // opaque: the model does not cover it, so the interpreter runs the
+    // whole block from its leader and nothing re-executes. The leader
+    // state is the block's parameters, so flush them: the resumed
+    // interpreter must see what earlier blocks computed.
+    if matches!(block.term, Terminator::Unreachable)
+        || block
+            .insts
+            .iter()
+            .any(|inst| matches!(inst.op, Op::Intrinsic { .. }))
     {
         let state: Vec<Value> = block
             .params
@@ -128,7 +130,7 @@ fn emit_block(
     // per-instruction fetches produce. Charges past the last inst
     // belong to the terminator instruction.
     let mut pending: &[ir::CycleCharge] = &block.cycles;
-    for inst in &block.insts {
+    for (index, inst) in block.insts.iter().enumerate() {
         while let [charge, rest @ ..] = pending {
             if charge.addr > inst.pc {
                 break;
@@ -136,7 +138,13 @@ fn emit_block(
             emit_charge(out, charge, function.thumb);
             pending = rest;
         }
-        emit_inst(out, inst);
+        // One guest instruction can lift to several guarded insts; a
+        // failed condition costs its one cycle once.
+        let last_of_instruction = block
+            .insts
+            .get(index + 1)
+            .is_none_or(|next| next.pc != inst.pc);
+        emit_inst(out, inst, last_of_instruction);
     }
     for charge in pending {
         emit_charge(out, charge, function.thumb);
@@ -160,7 +168,7 @@ fn emit_charge(out: &mut String, charge: &ir::CycleCharge, thumb: bool) {
     }
 }
 
-fn emit_inst(out: &mut String, inst: &Inst) {
+fn emit_inst(out: &mut String, inst: &Inst, charge_failed_condition: bool) {
     let body = inst_body(inst);
     match inst.guard {
         None => out.push_str(&body),
@@ -179,7 +187,10 @@ fn emit_inst(out: &mut String, inst: &Inst) {
                     let _ = writeln!(out, "        v{} = {};", dest.0, expr(prev));
                 }
             }
-            out.push_str("        st->cycles += 1u;\n    }\n");
+            if charge_failed_condition {
+                out.push_str("        st->cycles += 1u;\n");
+            }
+            out.push_str("    }\n");
         }
     }
 }
@@ -766,9 +777,8 @@ fn emit_term(
             let _ = writeln!(out, "    st->pc &= 0x{:x}u;", pc_mask);
             out.push_str("    st->exited = 1u; return;\n");
         }
-        Terminator::Unreachable => {
-            out.push_str("    return; /* unreachable in the lifted region */\n");
-        }
+        // Opaque: emit_block exits to the interpreter before here.
+        Terminator::Unreachable => {}
     }
 }
 
@@ -1253,6 +1263,23 @@ mod tests {
         // reruns the block from real registers, not the entry
         // snapshot.
         assert!(body.contains("st->r[0] = v0;"), "leader flush: {body}");
+    }
+
+    #[test]
+    fn unreachable_blocks_hand_the_leader_to_the_interpreter() {
+        let mut f = sample();
+        f.blocks[0].term = Terminator::Unreachable;
+        let source = emit_module(&[(0x0800_0100, &f)]).c_source;
+        let body = source
+            .split_once("void oxy_fn_08000100")
+            .expect("function emitted")
+            .1;
+        assert!(
+            body.contains("st->pc = 0x8000100u; st->exited = 1u; return;"),
+            "exits at the leader: {body}"
+        );
+        assert!(!body.contains("oxy_add"), "no effects emitted: {body}");
+        assert!(!body.contains("unreachable"), "no bare return: {body}");
     }
 
     #[test]

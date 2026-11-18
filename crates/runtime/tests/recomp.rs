@@ -1085,3 +1085,41 @@ fn computed_pc_switch_reaches_the_selected_case() {
     let hybrid = assert_hybrid_matches(&image, &[(0x100, 0x134)], "recomp-pc-switch", 0x0800_0134);
     assert_eq!(hybrid.cpu.reg_for_test(4), 0x22);
 }
+
+#[test]
+fn failed_guards_cost_one_cycle_per_guest_instruction() {
+    if !recomp::Module::compiler_available() {
+        println!("skipping: no host C compiler on PATH");
+        return;
+    }
+    // Each failed `ldrne` lifts to several guarded IR insts but costs
+    // the interpreter one internal cycle.
+    let image = arm_image(
+        "RCFC",
+        &[
+            0xE3A0_1408, // mov r1, #0x08000000
+            0xE281_1D07, // add r1, r1, #0x1C0
+            0xE3A0_0001, // mov r0, #1
+            0xE350_0001, // cmp r0, #1
+            0x14D1_4001, // ldrneb r4, [r1], #1   (not taken)
+            0x15B1_4001, // ldrne r4, [r1, #1]!   (not taken)
+            0xEA00_0000, // b park
+            0xE1A0_0000, // (filler)
+            0xEAFF_FFFE, // park: b .
+        ],
+        &[],
+    );
+    let park = 0x0800_0120;
+    let mut interpreted = System::new(image.bytes().to_vec(), 0x0800_0100);
+    while interpreted.cpu.pc() != park {
+        interpreted.step();
+    }
+    let mut driver =
+        build_driver(&image, &[(0x100, 0x11C)], "recomp-failed-cycles").expect("module builds");
+    let mut hybrid = System::new(image.bytes().to_vec(), 0x0800_0100);
+    let mut cycles = 0u64;
+    while hybrid.cpu.pc() != park {
+        cycles += u64::from(driver.step(&mut hybrid).expect("native call"));
+    }
+    assert_eq!(interpreted.cpu.cycles(), cycles);
+}
