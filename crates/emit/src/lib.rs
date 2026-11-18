@@ -8,17 +8,20 @@
 //! once in address order, so the assembler's location counter tracks the
 //! image layout without any alignment directives.
 //!
-//! The byte-identical invariant holds by construction only for
-//! encodings the renderers emit faithfully. Encodings flagged
-//! unpredictable render as their nearest real syntax (see
-//! `decode::text`), which assembles differently; handling those is
-//! the fallback work, and the corpus harness pins the invariant.
+//! The byte-identical invariant holds even when analysis is wrong:
+//! anything the text cannot reproduce exactly (UNPREDICTABLE or
+//! inexact encodings, unlabeled branch targets, spans that cross a
+//! label, ARM code off a word boundary) is emitted as raw bytes with a
+//! greppable [`Fallback`] warning.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use analysis::config::sanitize_identifier;
 use analysis::{Canonical, Config, FlagMap, Flags};
-use decode::{ArmInstr, Condition, ThumbInstr, arm_text, decode_arm, decode_thumb, thumb_text};
+use decode::{
+    ArmInstr, Condition, ThumbInstr, arm_text, arm_text_is_exact, decode_arm, decode_thumb,
+    thumb_text, thumb_text_is_exact,
+};
 use rom::Image;
 
 /// A safety fallback the emitter took at one address because the
@@ -47,10 +50,18 @@ pub enum Fallback {
     /// alignment, but bit-0 references to the function cannot be
     /// proven, so data words keep their literals.
     MisalignedThumbFunction,
+    /// ARM code marked at an address that is not word-aligned; `.arm`
+    /// would pad the location counter, so raw bytes are emitted.
+    MisalignedArm,
     /// Encoding architecturally UNPREDICTABLE on the ARM7TDMI; the
     /// renderer's nearest-real-syntax text would assemble to a
     /// different encoding, so raw bytes are emitted.
     UnpredictableEncoding,
+    /// The encoding carries information the text cannot express (a
+    /// set should-be-zero field, a non-canonical immediate rotation, or
+    /// an r15 operand the assembler rejects), so the text would
+    /// assemble to different bytes; raw bytes are emitted.
+    InexactText,
     /// Word with the THUMB bit-0 pattern pointing at executed THUMB
     /// code that carries no label; the literal is kept because a
     /// symbolic reference would not be provably safe.
@@ -59,6 +70,9 @@ pub enum Fallback {
     /// rewritten (e.g. `my-func` to `my_func`); the config keeps the
     /// original spelling.
     NameSanitized,
+    /// A config name (after sanitizing) is already the label of another
+    /// address; the generated label is kept so the assembly stays valid.
+    NameCollision,
 }
 
 impl Fallback {
@@ -69,9 +83,12 @@ impl Fallback {
             Self::BranchWithoutLabel => "branch-without-label",
             Self::InstructionOverlapsLabel => "instruction-overlaps-label",
             Self::MisalignedThumbFunction => "misaligned-thumb-function",
+            Self::MisalignedArm => "misaligned-arm",
             Self::UnpredictableEncoding => "unpredictable-encoding",
+            Self::InexactText => "inexact-text",
             Self::WordReferenceNotProvable => "word-reference-not-provable",
             Self::NameSanitized => "name-sanitized",
+            Self::NameCollision => "name-collision",
         }
     }
 }
@@ -88,6 +105,10 @@ fn apply_config_names(
     warnings: &mut Vec<Warning>,
 ) {
     let end = canon.base() + image_len as u32;
+    let mut owners: HashMap<String, u32> = labels
+        .iter()
+        .map(|(&addr, name)| (name.clone(), addr))
+        .collect();
     for function in &config.functions {
         let Some(raw) = function.name.as_deref() else {
             continue;
@@ -109,7 +130,23 @@ fn apply_config_names(
                 ),
             });
         }
-        labels.insert(addr, name);
+        if let Some(&owner) = owners.get(&name)
+            && owner != addr
+        {
+            warnings.push(Warning {
+                addr,
+                fallback: Fallback::NameCollision,
+                message: format!(
+                    "name-collision at 0x{addr:08x}: '{name}' already labels \
+                     0x{owner:08x}; keeping the generated label"
+                ),
+            });
+            continue;
+        }
+        if let Some(old) = labels.insert(addr, name.clone()) {
+            owners.remove(&old);
+        }
+        owners.insert(name, addr);
     }
 }
 
@@ -220,6 +257,18 @@ fn emit_span_body(ctx: &mut Ctx<'_>, start: u32, end: u32) -> String {
                     dialect = Dialect::Thumb;
                 }
                 emit_thumb(ctx, index, addr)
+            } else if !index.is_multiple_of(4) {
+                // `.arm` word-aligns the location counter, so a
+                // misaligned ARM span stays raw in the current dialect.
+                ctx.warn(
+                    addr,
+                    Fallback::MisalignedArm,
+                    format!(
+                        "misaligned-arm at 0x{addr:08x}: ARM code off a word \
+                         boundary; emitting raw bytes"
+                    ),
+                );
+                raw_span(ctx, index, 4 - index % 4, addr)
             } else {
                 if dialect != Dialect::Arm {
                     out.push_str(".arm\n");
@@ -272,7 +321,7 @@ impl ModulePlan {
                 continue;
             };
             let snapped = addr.next_multiple_of(4);
-            if snapped > base && snapped < end {
+            if snapped >= base && snapped < end {
                 boundaries.insert(snapped, stem.to_string());
             }
         }
@@ -595,6 +644,17 @@ fn emit_arm(ctx: &mut Ctx<'_>, index: usize, addr: u32) -> (usize, String) {
         );
         return (4, raw_bytes(ctx.bytes, index, 4));
     }
+    if !arm_text_is_exact(word) {
+        ctx.warn(
+            addr,
+            Fallback::InexactText,
+            format!(
+                "inexact-text at 0x{addr:08x}: word 0x{word:08X} has no \
+                 assembler text that reproduces it; emitting raw bytes"
+            ),
+        );
+        return (4, raw_bytes(ctx.bytes, index, 4));
+    }
     (4, arm_text(word))
 }
 /// Emits one THUMB instruction (BL consumes its second halfword),
@@ -668,6 +728,17 @@ fn emit_thumb(ctx: &mut Ctx<'_>, index: usize, addr: u32) -> (usize, String) {
         );
         return (2, raw_bytes(ctx.bytes, index, 2));
     }
+    if !thumb_text_is_exact(first) {
+        ctx.warn(
+            addr,
+            Fallback::InexactText,
+            format!(
+                "inexact-text at 0x{addr:08x}: halfword 0x{first:04X} has \
+                 no assembler text that reproduces it; emitting raw bytes"
+            ),
+        );
+        return (2, raw_bytes(ctx.bytes, index, 2));
+    }
     (2, thumb_text(first, 0))
 }
 /// True when `size` bytes from `index` are all executed in the same
@@ -706,10 +777,7 @@ fn byte_offset_to_next_label(
         .map(|(target, _)| (*target - addr) as usize)
 }
 /// Emits up to `max` bytes from `index` as raw bytes and records the
-/// overlap warning. The run stops at the first label strictly inside
-/// the span (so the label still prints) and at non-executed bytes.
-/// Always emits at least one byte so the walk makes progress. Returns
-/// bytes consumed and the raw-bytes line.
+/// overlap warning. See [`raw_span`].
 fn demote(ctx: &mut Ctx<'_>, index: usize, max: usize, addr: u32) -> (usize, String) {
     ctx.warn(
         addr,
@@ -719,6 +787,14 @@ fn demote(ctx: &mut Ctx<'_>, index: usize, max: usize, addr: u32) -> (usize, Str
              contains a label or is truncated; emitting raw bytes"
         ),
     );
+    raw_span(ctx, index, max, addr)
+}
+
+/// Emits up to `max` bytes from `index` as raw bytes. The run stops at
+/// the first label strictly inside the span (so the label still
+/// prints) and at non-executed bytes. Always emits at least one byte so
+/// the walk makes progress. Returns bytes consumed and the line.
+fn raw_span(ctx: &Ctx<'_>, index: usize, max: usize, addr: u32) -> (usize, String) {
     let limit = ctx.limit.min(index + max);
     let stop = byte_offset_to_next_label(ctx.labels, addr, max as u32)
         .unwrap_or(max)
@@ -1024,8 +1100,10 @@ mod tests {
         let len = image.bytes().len() as u32;
         map.mark_range(base + len - 2, base + len, Flags::EXEC | Flags::WORD);
         let (asm, warnings) = emit_with_warnings(&image, &map, &Config::default());
+        // The span is both truncated and off a word boundary; the
+        // alignment check fires first.
         assert_eq!(warnings.len(), 1, "{warnings:?}");
-        assert_eq!(warnings[0].fallback, Fallback::InstructionOverlapsLabel);
+        assert_eq!(warnings[0].fallback, Fallback::MisalignedArm);
         assert_eq!(warnings[0].addr, base + len - 2);
         assert!(asm.contains(".byte 0x00, 0x00\n"), "{asm}");
     }
@@ -1092,6 +1170,58 @@ mod tests {
         let (asm, warnings) = emit_with_warnings(&image, &map, &Config::default());
         assert!(warnings.is_empty(), "{warnings:?}");
         assert!(asm.contains(".word 0x080000C9\n"), "{asm}");
+    }
+
+    #[test]
+    fn inexact_text_demotes_to_raw_bytes() {
+        let mut bytes = vec![0u8; 256];
+        // mov r0, #1 with the should-be-zero Rn field set, then
+        // mov r0, #1 encoded as `#4 ror 2`.
+        bytes[0x00..0x04].copy_from_slice(&0xE3A1_0001u32.to_le_bytes());
+        bytes[0x04..0x08].copy_from_slice(&0xE3A0_0104u32.to_le_bytes());
+        // THUMB `bx r0` with should-be-zero bits 2..0 set.
+        bytes[0xC8..0xCA].copy_from_slice(&0x4701u16.to_le_bytes());
+        let image = Image::from_bytes(bytes).expect("fixture parses");
+        let mut map = FlagMap::from_image(&image);
+        let base = map.canonical().base();
+        map.mark_range(base, base + 8, Flags::EXEC | Flags::WORD);
+        map.mark_range(base + 0xC8, base + 0xCA, Flags::EXEC | Flags::THUMB);
+        let (asm, warnings) = emit_with_warnings(&image, &map, &Config::default());
+        let inexact: Vec<u32> = warnings
+            .iter()
+            .filter(|w| w.fallback == Fallback::InexactText)
+            .map(|w| w.addr)
+            .collect();
+        assert_eq!(inexact, vec![base, base + 4, base + 0xC8], "{warnings:?}");
+        assert!(asm.contains(".word 0xE3A10001"), "{asm}");
+        assert!(asm.contains(".word 0xE3A00104"), "{asm}");
+        assert!(asm.contains(".byte 0x01, 0x47"), "{asm}");
+    }
+
+    #[test]
+    fn misaligned_arm_code_stays_raw_without_a_dialect_switch() {
+        let mut bytes = vec![0u8; 256];
+        bytes[0xC8..0xCA].copy_from_slice(&0x46C0u16.to_le_bytes()); // nop
+        bytes[0xCA..0xCE].copy_from_slice(&0xE1A0_0000u32.to_le_bytes());
+        let image = Image::from_bytes(bytes).expect("fixture parses");
+        let mut map = FlagMap::from_image(&image);
+        let base = map.canonical().base();
+        map.mark_range(base + 0xC8, base + 0xCA, Flags::EXEC | Flags::THUMB);
+        map.mark_range(base + 0xCA, base + 0xCE, Flags::EXEC);
+        let (asm, warnings) = emit_with_warnings(&image, &map, &Config::default());
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.fallback == Fallback::MisalignedArm && w.addr == base + 0xCA),
+            "{warnings:?}"
+        );
+        // The two bytes up to the word boundary stay raw before any
+        // `.arm` directive could pad.
+        let tail = &asm[asm
+            .find("@ WARNING: misaligned-arm")
+            .expect("warning comment")..];
+        let next = tail.lines().nth(1).expect("the raw line");
+        assert_eq!(next, ".byte 0x00, 0x00", "{asm}");
     }
 
     #[test]
@@ -1169,6 +1299,21 @@ mod tests {
                 (base + 0x88, "b".to_string()),
                 (base + 0xC4, "a".to_string()),
             ]
+        );
+    }
+
+    #[test]
+    fn module_plan_keeps_a_claim_at_the_image_base() {
+        let (image, _) = fixture();
+        let base = map_base(&image);
+        let config = Config {
+            functions: vec![claimed(base, "crt0"), claimed(base + 0x88, "b")],
+            tables: Vec::new(),
+        };
+        let plan = ModulePlan::from_config(&config, &image);
+        assert_eq!(
+            plan.spans(),
+            &[(base, "crt0".to_string()), (base + 0x88, "b".to_string())]
         );
     }
 
@@ -1324,5 +1469,30 @@ mod tests {
             "{:?}",
             emission.warnings
         );
+    }
+
+    #[test]
+    fn colliding_config_names_keep_the_generated_label() {
+        let (image, map) = fixture();
+        let base = map.canonical().base();
+        let named = |addr: u32, name: &str| FunctionSpec {
+            name: Some(name.to_string()),
+            ..FunctionSpec::bare(addr, State::Arm)
+        };
+        let config = Config {
+            functions: vec![named(base, "my_fn"), named(base + 0xC0, "my-fn")],
+            tables: Vec::new(),
+        };
+        let (asm, warnings) = emit_with_warnings(&image, &map, &config);
+        assert_eq!(asm.matches("my_fn:\n").count(), 1, "{asm}");
+        assert!(
+            asm.contains(&format!("loc_{:08x}:\n", base + 0xC0)),
+            "{asm}"
+        );
+        let collision = warnings
+            .iter()
+            .find(|w| w.fallback == Fallback::NameCollision)
+            .expect("a collision warning");
+        assert_eq!(collision.addr, base + 0xC0);
     }
 }

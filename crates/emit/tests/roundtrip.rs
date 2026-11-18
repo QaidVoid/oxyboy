@@ -41,7 +41,13 @@ fn round_trip(name: &str) {
         "{name}: analysis marked no code; the harness would not exercise \
          emission"
     );
-    let (asm, warnings) = emit_with_warnings(&image, &map, &Config::default());
+    assert_reassembles(&tools, name, &image, &map);
+}
+
+/// Emits `image` under `map`, assembles and links it at the map's
+/// base, and requires byte equality with the image.
+fn assert_reassembles(tools: &Tools, name: &str, image: &Image, map: &FlagMap) {
+    let (asm, warnings) = emit_with_warnings(image, map, &Config::default());
     for warning in &warnings {
         println!("  {} warning: {}", name, warning.message);
     }
@@ -60,6 +66,42 @@ fn round_trip(name: &str) {
         "re-assembled {name} must be byte-identical (emitted: {})",
         asm_path.display()
     );
+}
+
+/// The invariant holds when analysis is wrong: a flag map that marks
+/// misaligned ARM after THUMB, encodings whose text loses fields, a
+/// conditional user-mode load, and a lone BL half at the image end
+/// still re-assembles to the exact image.
+#[test]
+fn adversarial_flags_round_trip_byte_identically() {
+    let Some(tools) = Tools::find() else {
+        println!("skipping adversarial round trip: arm-none-eabi binutils not found");
+        return;
+    };
+    let mut bytes = vec![0u8; 0x100];
+    let words: [(usize, u32); 5] = [
+        (0x00, 0xEA00_002E), // b 0xC0
+        (0xC0, 0xE3A1_0001), // mov r0, #1 with Rn set
+        (0xC4, 0xE3A0_0104), // #1 as #4 ror 2
+        (0xC8, 0x04F4_173C), // ldrbteq r1, [r4], #1852
+        (0xD0, 0xE1A0_0000), // nop, ARM-marked from 0xCE below
+    ];
+    for (offset, word) in words {
+        bytes[offset..offset + 4].copy_from_slice(&word.to_le_bytes());
+    }
+    bytes[0xCC..0xCE].copy_from_slice(&0x4701u16.to_le_bytes()); // bx r0, bits set
+    bytes[0xFE..0x100].copy_from_slice(&0xF800u16.to_le_bytes()); // lone BL half
+    let image = Image::from_bytes(bytes).expect("fixture parses");
+    let mut map = FlagMap::from_image(&image);
+    let base = map.canonical().base();
+    let arm = analysis::Flags::EXEC;
+    let thumb = analysis::Flags::EXEC | analysis::Flags::THUMB;
+    map.mark_range(base, base + 4, arm);
+    map.mark_range(base + 0xC0, base + 0xCC, arm);
+    map.mark_range(base + 0xCC, base + 0xCE, thumb);
+    map.mark_range(base + 0xCE, base + 0xD4, arm);
+    map.mark_range(base + 0xFE, base + 0x100, thumb);
+    assert_reassembles(&tools, "adversarial", &image, &map);
 }
 
 #[test]
