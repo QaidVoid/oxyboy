@@ -1,12 +1,16 @@
 //! An HBlank-DMA (HDMA) color-fade scene. DMA
-//! channel 3 fires on every H-Blank flag edge (repeat on, count 1,
-//! fixed destination) and copies the next entry of a RAM table into
+//! channel 3 fires on every visible line's H-Blank (repeat on, count
+//! 1, fixed destination) and copies the next entry of a RAM table into
 //! BLDY, so with BLDCNT brightness-down on BG0 every scanline fades a
-//! bit further toward black: the classic HDMA gradient. The source
-//! register is NOT re-armed on repeat (GBATEK reload rules cover count
-//! and destination only), so the second frame reads table entries
-//! 228..455; the table holds two identical 228-entry sweeps, making
-//! both frames render the same gradient.
+//! bit further toward black: the classic HDMA gradient.
+//!
+//! Hardware order (GBATEK, mGBA): a line is drawn when its H-Blank
+//! starts, so the transfer at line n's H-Blank shows on line n+1, and
+//! H-Blank DMA does not run during V-Blank. Each frame therefore takes
+//! exactly 160 entries. The source is NOT re-armed on repeat (GBATEK
+//! reload rules cover count and destination only), so the table holds
+//! a 160-periodic sweep and BLDY starts at the entry before it, which
+//! makes both frames identical.
 
 use runtime::bus::Bus;
 use runtime::ppu::{CYCLES_PER_LINE, Ppu, VISIBLE_LINES, WIDTH};
@@ -17,10 +21,9 @@ const DISPCNT: u32 = 0x0400_0000;
 const TABLE: u32 = 0x0200_0000;
 
 /// BLDY sweep entry `i`: 0 at the top of the frame rising to 15 at the
-/// bottom; the 456-entry table repeats the 228-entry sweep so frame 2
-/// equals frame 1 despite the source drift.
+/// bottom, repeating every 160 entries (one frame of transfers).
 fn sweep(i: u32) -> u16 {
-    ((i % 228) * 16 / 228) as u16
+    ((i % 160) * 16 / 160) as u16
 }
 
 fn set_up(bus: &mut Bus) {
@@ -37,6 +40,7 @@ fn set_up(bus: &mut Bus) {
     bus.write_u16(0x0500_0002, 0x7FFF); // palette entry 1 = white
     bus.write_u16(0x0400_0008, 0x0101); // BG0CNT: 4bpp CBB0 SBB1
     bus.write_u16(0x0400_0050, 0x00C1); // BLDCNT: BG0, brightness down
+    bus.write_u16(0x0400_0054, sweep(159)); // BLDY for line 0
     bus.write_u16(DISPCNT, 0x0100); // mode 0, BG0
 
     // DMA3: table -> BLDY, halfword, count 1, repeat, HBlank timing.
@@ -78,7 +82,7 @@ fn golden_path(name: &str) -> std::path::PathBuf {
 #[test]
 fn hdma_fade_scene_renders_two_identical_gradient_frames() {
     let mut bus = Bus::new(Vec::new());
-    for i in 0..456u32 {
+    for i in 0..320u32 {
         bus.write_u16(TABLE + 2 * i, sweep(i));
     }
     set_up(&mut bus);
@@ -91,8 +95,14 @@ fn hdma_fade_scene_renders_two_identical_gradient_frames() {
     out += &grid(&second);
     golden::assert_matches(golden_path("hdma-fade.txt"), &out);
 
-    // The repeat channel stays armed across frames: if it had
-    // self-disabled, frame 2 would be a solid dark frame and the
-    // equality assertion above would fail.
+    // The repeat channel stays armed across frames, and V-Blank lines
+    // take no entries: a self-disabled channel would leave frame 2
+    // flat, and 228 transfers per frame would shift it by 68 entries.
     assert_eq!(first, second, "both frames show the same gradient");
+
+    // Line 0 shows the BLDY set before the frame; line 1 shows the
+    // first table entry, written during line 0's H-Blank.
+    let pixel = |frame: &[u8], y: usize| frame[y * WIDTH * 4];
+    assert_eq!(pixel(&first, 0), pixel(&first, 159), "line 0 = sweep(159)");
+    assert!(pixel(&first, 1) > pixel(&first, 159), "line 1 = sweep(0)");
 }

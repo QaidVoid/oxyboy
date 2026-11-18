@@ -91,15 +91,24 @@ impl Ppu {
             remaining -= take;
             if !self.hblank && self.dot >= HBLANK_FLAG_START {
                 self.hblank = true;
+                let visible = (self.line as usize) < VISIBLE_LINES;
+                // The line is drawn as H-Blank starts, so writes made
+                // by the H-Blank IRQ handler or DMA land on the next
+                // line.
+                if visible {
+                    self.render_scanline(bus);
+                }
                 let was = bus.dispstat();
                 bus.set_dispstat_flag(0x0002, true);
                 if was & 0x0010 != 0 {
                     // H-Blank IRQ enable (DISPSTAT bit 4) gates IF bit 1.
                     bus.raise_if(0x0002);
                 }
-                // H-Blank-timed DMA channels fire on this flag edge;
-                // their cycles advance the PPU clock too.
-                self.dot += bus.dma_flag_edge(DmaTiming::HBlank);
+                // H-Blank DMA runs on visible lines only (GBATEK); its
+                // cycles advance the PPU clock too.
+                if visible {
+                    self.dot += bus.dma_flag_edge(DmaTiming::HBlank);
+                }
             }
             if self.dot >= CYCLES_PER_LINE {
                 self.finish_line(bus);
@@ -133,14 +142,10 @@ impl Ppu {
         &self.frame
     }
 
-    /// Completes the current scanline: renders it if visible, then
-    /// moves to the next line and applies the line-start register
-    /// effects.
+    /// Completes the current scanline: moves to the next line and
+    /// applies the line-start register effects.
     fn finish_line(&mut self, bus: &mut Bus) {
         self.dot -= CYCLES_PER_LINE;
-        if (self.line as usize) < VISIBLE_LINES {
-            self.render_scanline(bus);
-        }
         self.hblank = false;
         bus.set_dispstat_flag(0x0002, false);
         self.line = if self.line + 1 >= LINES_PER_FRAME as u16 {
