@@ -117,8 +117,57 @@ fn corpus_skips_missing_roms_by_name() {
     let manifest = dir.join("corpus.json");
     write_manifest(&manifest, &dir.join("absent.gba"), 60_000, None);
 
-    let (code, stdout, _) = corpus(&manifest, &[]);
-    assert_eq!(code, 0);
+    // Nothing to check is a failure, not "all green".
+    let (code, stdout, stderr) = corpus(&manifest, &[]);
+    assert_eq!(code, 1);
     assert!(stdout.contains("skipped"), "stdout: {stdout}");
     assert!(stdout.contains("mode3"), "stdout: {stdout}");
+    assert!(
+        stderr.contains("no corpus ROM was found"),
+        "stderr: {stderr}"
+    );
+
+    // One present entry is enough; the missing one is listed.
+    let rom = mode3_rom(&dir, "mode3.gba");
+    let rom = rom.to_str().expect("utf-8 path");
+    let absent = dir.join("absent.gba");
+    let absent = absent.to_str().expect("utf-8 path");
+    fs::write(
+        &manifest,
+        format!(
+            "{{\"entries\": [\
+             {{\"name\": \"mode3\", \"rom\": \"{rom}\", \"frames\": 2, \"budget_ms\": 60000}},\
+             {{\"name\": \"cart\", \"rom\": \"{absent}\", \"frames\": 2, \"budget_ms\": 60000}}]}}\n"
+        ),
+    )
+    .expect("write manifest");
+    let (code, stdout, _) = corpus(&manifest, &[]);
+    assert_eq!(code, 0);
+    assert!(
+        stdout.contains("skipped (ROM missing): cart"),
+        "stdout: {stdout}"
+    );
+    assert!(stdout.contains("1 checked, all green"), "stdout: {stdout}");
+}
+
+#[test]
+fn corpus_rejects_zero_frames() {
+    let dir = temp_dir("zero-frames");
+    let rom = mode3_rom(&dir, "mode3.gba");
+    let manifest = dir.join("corpus.json");
+    let rom = rom.to_str().expect("utf-8 path");
+    fs::write(
+        &manifest,
+        format!(
+            "{{\"entries\": [{{\"name\": \"mode3\", \"rom\": \"{rom}\", \
+             \"frames\": 0, \"budget_ms\": 60000}}]}}\n"
+        ),
+    )
+    .expect("write manifest");
+    let (code, _, stderr) = corpus(&manifest, &[]);
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("frames must be at least 1"),
+        "stderr: {stderr}"
+    );
 }

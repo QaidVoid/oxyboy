@@ -134,6 +134,10 @@ pub fn run(args: CorpusArgs) -> i32 {
             skipped.push(job.name.clone());
             continue;
         }
+        if job.frames == 0 {
+            failures.push(format!("{}: frames must be at least 1", job.name));
+            continue;
+        }
         let outcome = check_entry(job);
         match outcome {
             Ok(result) => {
@@ -185,6 +189,13 @@ pub fn run(args: CorpusArgs) -> i32 {
     }
     if !skipped.is_empty() {
         println!("skipped (ROM missing): {}", skipped.join(", "));
+    }
+    // A corpus with nothing to run proves nothing; individual missing
+    // entries (a local-only cart) are fine.
+    if skipped.len() == jobs.len() {
+        failures.push(
+            "no corpus ROM was found (build them with scripts/build-test-roms.sh)".to_string(),
+        );
     }
     if !failures.is_empty() {
         eprintln!("oxyboy corpus: {} failure(s):", failures.len());

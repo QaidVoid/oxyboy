@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # Worked example: one ROM through the whole oxyboy toolchain.
 # Runs info, analyze, disasm with a reassembly check,
 # lift --c with a gcc syntax check, recomp, and a headless run,
@@ -11,7 +11,7 @@
 # (scripts/build-test-roms.sh). The reassembly check additionally
 # needs arm-none-eabi-binutils and the gcc check needs a host gcc;
 # both skip loudly when missing.
-set -e
+set -euo pipefail
 
 ROM=${1:-target/test-roms/switest.gba}
 OUT=${2:-target/example}

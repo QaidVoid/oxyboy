@@ -165,7 +165,9 @@ if fetch "$GBA_DIR" "$GBA_TESTS_URL" "$GBA_TESTS_REV"; then
                     n="${verdict#fail }"
                     echo "save/$rom: FAIL at test $n (category total $total)"
                     scored=$((scored + 1))
-                    mark_result "save_$rom" "$((n - 1))"
+                    # Save ROMs gate as pass or fail: a partial run is
+                    # a failure, whatever test it stopped at.
+                    mark_result "save_$rom" 0
                     ;;
                 timeout)
                     echo "save/$rom: TIMEOUT (no verdict after $FRAMES frames)"
