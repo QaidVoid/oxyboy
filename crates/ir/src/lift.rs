@@ -489,6 +489,21 @@ impl Lifter<'_> {
                         }
                         ArmInstr::BranchExchange { rn } => {
                             cycles.push(CycleCharge { addr, cycles: 0 });
+                            if rn == Register::Pc {
+                                // `bx pc` jumps to the PC read value; the
+                                // pc slot itself is stale.
+                                lift.guard = guard;
+                                lift.addr = addr;
+                                let pc = lift.write(Register::Pc);
+                                lift.emit(
+                                    Op::Mov {
+                                        set_flags: false,
+                                        a: Value::Const(addr + 8),
+                                        carry_in: Value::Const(0),
+                                    },
+                                    vec![pc],
+                                );
+                            }
                             let term = if rn == Register::Lr {
                                 RawTerm::Return {
                                     switches_state: true,
@@ -510,16 +525,22 @@ impl Lifter<'_> {
                         }
                         ArmInstr::DataProcessing {
                             rd: Register::Pc,
-                            opcode: DataOp::Mov,
-                            operand2: ShifterOperand::Register { rm, shift },
-                            ..
-                        } => {
-                            // `mov pc, rX` is the common indirect jump. A
-                            // resolved switch dispatch lowers to a
-                            // compare chain over the table's targets;
-                            // anything else (guarded forms included)
-                            // keeps the raw indirect exit.
-                            if guard.is_none_or(|c| c == Condition::Al)
+                            opcode,
+                            set_flags,
+                            rn,
+                            operand2,
+                        } if !matches!(
+                            opcode,
+                            DataOp::Tst | DataOp::Teq | DataOp::Cmp | DataOp::Cmn
+                        ) =>
+                        {
+                            // A resolved switch dispatch (`mov pc, rX`)
+                            // lowers to a compare chain over the table's
+                            // targets.
+                            if opcode == DataOp::Mov
+                                && !set_flags
+                                && guard.is_none_or(|c| c == Condition::Al)
+                                && let ShifterOperand::Register { rm, shift } = operand2
                                 && let Some(table) = self.table_at(addr, self.region.state)
                             {
                                 let table = table.clone();
@@ -539,35 +560,33 @@ impl Lifter<'_> {
                                 break term;
                             }
                             cycles.push(CycleCharge { addr, cycles: 0 });
+                            lift.guard = guard;
+                            lift.addr = addr;
+                            if set_flags {
+                                // `subs pc, lr, #4` and friends restore
+                                // CPSR from SPSR, which the IR does not
+                                // model: the interpreter runs the block.
+                                lift.emit(
+                                    Op::Intrinsic {
+                                        name: "exception-return",
+                                        args: vec![],
+                                    },
+                                    vec![],
+                                );
+                            } else {
+                                // The real operation computes the target
+                                // into the pc slot (`addls pc, pc, r0,
+                                // lsl #2`, `sub pc, lr, #4`).
+                                lift.lift(ArmInstr::DataProcessing {
+                                    opcode,
+                                    set_flags,
+                                    rd: Register::Pc,
+                                    rn,
+                                    operand2,
+                                });
+                            }
                             let term = RawTerm::IndirectExit {
-                                reg: rm,
-                                switches_state: false,
-                                // ALU writes to pc word-align the target.
-                                pc_mask: !3,
-                            };
-                            break match guard.filter(|cond| *cond != Condition::Al) {
-                                Some(cond) => {
-                                    leaders.push(addr + 4);
-                                    self.lower_guarded(&mut lift, addr, cond, term)
-                                }
-                                None => term,
-                            };
-                        }
-                        ArmInstr::DataProcessing {
-                            rd: Register::Pc,
-                            operand2,
-                            ..
-                        } => {
-                            // `mov pc, rX` is the common indirect jump;
-                            // other ALU writes to pc keep the pc value
-                            // as the exit target until the real lifter
-                            // computes the sum.
-                            cycles.push(CycleCharge { addr, cycles: 0 });
-                            let term = RawTerm::IndirectExit {
-                                reg: match operand2 {
-                                    ShifterOperand::Register { rm, .. } => rm,
-                                    _ => Register::Pc,
-                                },
+                                reg: Register::Pc,
                                 switches_state: false,
                                 // ALU writes to pc word-align the target.
                                 pc_mask: !3,
@@ -760,6 +779,12 @@ impl Lifter<'_> {
                         ThumbInstr::HighRegisterOperation { op, rd, rs } => match (op, rd) {
                             (ThumbHiOp::Bx, _) => {
                                 cycles.push(CycleCharge { addr, cycles: 0 });
+                                if rs == Register::Pc {
+                                    // `bx pc` (the THUMB-to-ARM veneer)
+                                    // jumps to the PC read value.
+                                    lift.addr = addr;
+                                    lift.thumb_hi(ThumbHiOp::Mov, Register::Pc, Register::Pc);
+                                }
                                 break if rs == Register::Lr {
                                     RawTerm::Return {
                                         switches_state: true,
@@ -792,16 +817,20 @@ impl Lifter<'_> {
                                     break term;
                                 }
                                 cycles.push(CycleCharge { addr, cycles: 0 });
+                                lift.addr = addr;
+                                lift.thumb_hi(op, Register::Pc, rs);
                                 break RawTerm::IndirectExit {
-                                    reg: rs,
+                                    reg: Register::Pc,
                                     switches_state: false,
                                     pc_mask: !1,
                                 };
                             }
                             (ThumbHiOp::Add, Register::Pc) => {
                                 cycles.push(CycleCharge { addr, cycles: 0 });
+                                lift.addr = addr;
+                                lift.thumb_hi(op, Register::Pc, rs);
                                 break RawTerm::IndirectExit {
-                                    reg: rs,
+                                    reg: Register::Pc,
                                     switches_state: false,
                                     pc_mask: !1,
                                 };
@@ -2029,6 +2058,37 @@ mod tests {
             link.op,
             Op::Mov { a: Value::Const(a), .. } if a == (block.addr + 2) | 1
         ));
+    }
+
+    /// The indirect exit target of a block and the op computing it.
+    fn thumb_exit_target(halves: &[u16]) -> (u32, Value, Option<Op>) {
+        let function = lift_thumb(halves, halves.len());
+        let block = &function.blocks[0];
+        let Terminator::IndirectExit { target, .. } = block.term else {
+            panic!("an indirect exit");
+        };
+        let op = block
+            .insts
+            .iter()
+            .find(|inst| Value::Id(inst.dests[0]) == target)
+            .map(|inst| inst.op.clone());
+        (block.addr, target, op)
+    }
+
+    #[test]
+    fn thumb_pc_writes_use_the_thumb_pc_read() {
+        // bx pc: the THUMB-to-ARM veneer jumps to addr + 4.
+        let (base, _, op) = thumb_exit_target(&[0x4778, 0x46C0]);
+        assert!(
+            matches!(op, Some(Op::Mov { a: Value::Const(a), .. }) if a == base + 4),
+            "{op:?}"
+        );
+        // movs r0, #8; add pc, r0: pc = (addr + 4) + r0.
+        let (base, _, op) = thumb_exit_target(&[0x2008, 0x4487]);
+        assert!(
+            matches!(op, Some(Op::Add { a: Value::Const(a), .. }) if a == base + 2 + 4),
+            "{op:?}"
+        );
     }
 
     /// THUMB `bl` links with the THUMB bit set so the callee's `bx lr`

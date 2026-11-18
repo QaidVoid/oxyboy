@@ -1074,6 +1074,62 @@ mod tests {
         assert_eq!(*target, Value::Const(base + 8 + 1));
     }
 
+    /// The exit target of `words` lifted as ARM and optimized, with
+    /// the op that computes it when it is not a constant.
+    fn arm_exit_target(words: &[u32]) -> (u32, Value, Option<Op>) {
+        let mut function = lift_arm(words);
+        let base = function.blocks[0].addr;
+        optimize(&mut function);
+        let block = function
+            .blocks
+            .iter()
+            .find(|block| matches!(block.term, Terminator::IndirectExit { .. }))
+            .expect("an indirect exit");
+        let Terminator::IndirectExit { target, .. } = block.term else {
+            unreachable!();
+        };
+        let op = block
+            .insts
+            .iter()
+            .find(|inst| Value::Id(inst.dests[0]) == target)
+            .map(|inst| inst.op.clone());
+        (base, target, op)
+    }
+
+    #[test]
+    fn bx_pc_exits_to_the_pc_read_value() {
+        // ARM `bx pc` reads addr + 8.
+        let (base, target, _) = arm_exit_target(&[0xE12F_FF1F]);
+        assert_eq!(target, Value::Const(base + 8));
+    }
+
+    #[test]
+    fn alu_writes_to_pc_compute_their_target() {
+        // mov r0, #1; add pc, pc, r0, lsl #2: pc = (addr + 8) + shifted.
+        let (base, _, op) = arm_exit_target(&[0xE3A0_0001, 0xE08F_F100]);
+        assert!(
+            matches!(op, Some(Op::Add { a: Value::Const(a), .. }) if a == base + 4 + 8),
+            "{op:?}"
+        );
+        // mov lr, #0x40; sub pc, lr, #4
+        let (_, target, _) = arm_exit_target(&[0xE3A0_E040, 0xE24E_F004]);
+        assert_eq!(target, Value::Const(0x3C));
+    }
+
+    #[test]
+    fn s_form_pc_writes_defer_to_the_interpreter() {
+        // subs pc, lr, #4 restores CPSR: an opaque exception return.
+        let mut function = lift_arm(&[0xE25E_F004]);
+        optimize(&mut function);
+        assert!(function.blocks[0].insts.iter().any(|inst| matches!(
+            inst.op,
+            Op::Intrinsic {
+                name: "exception-return",
+                ..
+            }
+        )));
+    }
+
     /// A conditional branch reads the comparison's flags; the pass
     /// must not drop the `cmp` as dead (the recomp corpus
     /// regressed exactly here).

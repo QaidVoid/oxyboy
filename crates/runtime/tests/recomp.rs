@@ -1053,3 +1053,35 @@ fn failed_guard_keeps_the_writeback_base() {
     let hybrid = assert_hybrid_matches(&image, &[(0x100, 0x12C)], "recomp-writeback", 0x0800_0130);
     assert_eq!(hybrid.cpu.reg_for_test(1), 0x0800_01C1);
 }
+
+#[test]
+fn computed_pc_switch_reaches_the_selected_case() {
+    if !recomp::Module::compiler_available() {
+        println!("skipping: no host C compiler on PATH");
+        return;
+    }
+    // GCC's ARM switch idiom without a table hint: the add into pc must
+    // compute pc + 8 + r0*4, not exit to r0.
+    let image = arm_image(
+        "RCSW",
+        &[
+            0xE3A0_0001, // mov r0, #1
+            0xE350_0002, // cmp r0, #2
+            0x908F_F100, // addls pc, pc, r0, lsl #2
+            0xEA00_0007, // b default
+            0xEA00_0002, // b case0
+            0xEA00_0003, // b case1
+            0xE1A0_0000, // (filler)
+            0xE1A0_0000, // (filler)
+            0xE3A0_4011, // case0: mov r4, #0x11
+            0xEA00_0002, // b end
+            0xE3A0_4022, // case1: mov r4, #0x22
+            0xEA00_0000, // b end
+            0xE3A0_4033, // default: mov r4, #0x33
+            0xEAFF_FFFE, // end: b .
+        ],
+        &[],
+    );
+    let hybrid = assert_hybrid_matches(&image, &[(0x100, 0x134)], "recomp-pc-switch", 0x0800_0134);
+    assert_eq!(hybrid.cpu.reg_for_test(4), 0x22);
+}

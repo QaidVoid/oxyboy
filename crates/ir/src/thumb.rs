@@ -436,8 +436,9 @@ impl ArmLift {
         }
     }
 
-    /// Format 5 without BX and without a PC destination: ADD/MOV copy
-    /// without flags, CMP compares. PC reads use the THUMB delta.
+    /// Format 5 without BX: ADD/MOV copy without flags (a PC
+    /// destination writes the pc slot, which the caller exits through),
+    /// CMP compares. PC reads use the THUMB delta.
     pub(crate) fn thumb_hi(&mut self, op: decode::ThumbHiOp, rd: Register, rs: Register) {
         match op {
             decode::ThumbHiOp::Add | decode::ThumbHiOp::Mov => {
