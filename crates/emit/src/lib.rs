@@ -627,7 +627,7 @@ fn emit_thumb(ctx: &mut Ctx<'_>, index: usize, addr: u32) -> (usize, String) {
                      no static target; emitting raw bytes"
                 ),
             );
-            return (4, raw_bytes(ctx.bytes, index, 4));
+            return (2, raw_bytes(ctx.bytes, index, 2));
         }
         _ => None,
     };
@@ -1109,8 +1109,24 @@ mod tests {
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert_eq!(warnings[0].fallback, Fallback::BranchWithoutLabel);
         assert_eq!(warnings[0].addr, base + 0xC8);
-        assert!(asm.contains(".word 0x8000F800"), "{asm}");
+        assert!(asm.contains(".byte 0x00, 0xF8"), "{asm}");
+        assert!(asm.contains("strh r0, [r0, #0]"), "{asm}");
         assert!(!asm.contains("bl lr"), "{asm}");
+    }
+
+    #[test]
+    fn bl_from_lr_at_the_image_end_stays_in_bounds() {
+        let mut bytes = vec![0u8; 256];
+        bytes[0x00..0x04].copy_from_slice(&0xEA00_0030u32.to_le_bytes());
+        bytes[0xFE..0x100].copy_from_slice(&0xF800u16.to_le_bytes());
+        let image = Image::from_bytes(bytes).expect("fixture parses");
+        let mut map = FlagMap::from_image(&image);
+        let base = map.canonical().base();
+        map.mark_range(base, base + 4, Flags::EXEC | Flags::WORD);
+        map.mark_range(base + 0xFE, base + 0x100, Flags::EXEC | Flags::THUMB);
+        let (asm, warnings) = emit_with_warnings(&image, &map, &Config::default());
+        assert_eq!(warnings[0].fallback, Fallback::BranchWithoutLabel);
+        assert!(asm.contains(".byte 0x00, 0xF8"), "{asm}");
     }
 
     #[test]
