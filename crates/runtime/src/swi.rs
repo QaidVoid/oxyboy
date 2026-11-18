@@ -577,7 +577,7 @@ fn diff_filter(cpu: &mut Cpu, bus: &mut Bus, in_width: u8, out_width: u8) {
         } else {
             bus.write_u16(dest, new);
             dest = dest.wrapping_add(2);
-            remaining -= 2;
+            remaining = remaining.saturating_sub(2);
         }
         old = new;
         src = src.wrapping_add(u32::from(in_width));

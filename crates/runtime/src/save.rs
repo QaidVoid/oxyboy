@@ -614,7 +614,10 @@ impl Eeprom {
         // address bits, 2-bit prefix.
         let data = ((self.rx >> 1) & 0xFFFF_FFFF_FFFF_FFFF) as u64;
         let addr = ((self.rx >> 65) & ((1 << width) - 1)) as usize;
-        for (i, cell) in self.data[addr * 8..addr * 8 + 8].iter_mut().enumerate() {
+        // The chip decodes only the address bits its size needs, as
+        // the read path does.
+        let page = (addr * 8) & (self.data.len() - 1);
+        for (i, cell) in self.data[page..page + 8].iter_mut().enumerate() {
             *cell = (data >> (56 - 8 * i)) as u8;
         }
         self.reply = Reply::Wrote;
@@ -988,6 +991,21 @@ mod tests {
             got = (got << 1) | u64::from(save.read_eeprom_half().unwrap_or(0xFF));
         }
         assert_eq!(got, data);
+    }
+
+    #[test]
+    fn eeprom_8k_write_ignores_unused_high_address_bits() {
+        let mut save = Save::new(SaveKind::Eeprom8k);
+        let addr: u16 = 0x3FFF;
+        let mut bits = vec![1, 0];
+        for i in (0..14).rev() {
+            bits.push(u8::from((addr >> i) & 1 == 1));
+        }
+        bits.extend([1; 64]);
+        bits.push(0);
+        save.announce_eeprom_stream(81);
+        push_bits(&mut save, &bits);
+        assert_eq!(save.to_bytes()[0x3FF * 8..0x400 * 8], [0xFF; 8]);
     }
 
     #[test]

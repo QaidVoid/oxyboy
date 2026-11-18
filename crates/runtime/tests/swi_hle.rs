@@ -476,6 +476,23 @@ fn diff_filters_accumulate_deltas() {
 }
 
 #[test]
+fn diff16_with_an_odd_size_stops_after_the_last_halfword() {
+    // Header size 3 is not a halfword multiple; the unit that covers
+    // the odd byte is the last one written.
+    let mut stream = 0x0000_0382u32.to_le_bytes().to_vec();
+    stream.extend_from_slice(&0x0005u16.to_le_bytes());
+    stream.extend_from_slice(&0x0001u16.to_le_bytes());
+    stream.extend_from_slice(&0x0001u16.to_le_bytes());
+    let (_, mut bus) = run_arm_swi(0x18, &stream, |cpu, _| {
+        cpu.set_reg_for_test(0, 0x0800_0100);
+        cpu.set_reg_for_test(1, 0x0200_0000);
+    });
+    assert_eq!(bus.read_u16(0x0200_0000), 0x0005);
+    assert_eq!(bus.read_u16(0x0200_0002), 0x0006);
+    assert_eq!(bus.read_u16(0x0200_0004), 0x0000);
+}
+
+#[test]
 fn thumb_swi_dispatches_the_same_calls() {
     // THUMB SWI carries the number in 8 bits; a Div through the THUMB
     // encoding must produce the same result.
