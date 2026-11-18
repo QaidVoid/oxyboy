@@ -183,3 +183,52 @@ fn thumb_golden_text() {
         assert!(decode_thumb(first, next).is_unpredictable());
     }
 }
+
+#[test]
+fn user_mode_transfers_put_the_condition_after_t() {
+    assert_eq!(arm_text(0x04F4_173C), "ldrbteq r1, [r4], #1852");
+    assert_eq!(arm_text(0x44E8_D30D), "strbtmi sp, [r8], #781");
+    assert_eq!(arm_text(0x14B1_0004), "ldrtne r0, [r1], #4");
+}
+
+#[test]
+fn exactness_flags_the_text_that_loses_information() {
+    use decode::{arm_text_is_exact, thumb_text_is_exact};
+    let arm: &[(u32, bool)] = &[
+        (0xE3A0_0001, true),  // mov r0, #1
+        (0xE3A1_0001, false), // mov with Rn = r1 (should be zero)
+        (0xE3A0_0104, false), // #1 encoded as #4 ror 2
+        (0xE351_1000, false), // cmp with Rd = r1 (should be zero)
+        (0xE002_0391, true),  // mul r2, r1, r3
+        (0xE002_1391, false), // mul with Rn = r1 (should be zero)
+        (0xE5DF_F000, false), // ldrb pc, [pc]
+        (0xE59F_F002, false), // ldr pc, [pc, #2] (misaligned literal)
+        (0xE59F_F004, true),  // ldr pc, [pc, #4]
+        (0xE1A0_C00E, true),  // mov r12, lr
+        (0xE10C_C091, false), // swp r12, r1, [r12] (Rn overlaps Rd)
+        (0xE8BD_0000, false), // ldmia sp!, {} (empty list)
+    ];
+    for (word, exact) in arm {
+        assert_eq!(
+            arm_text_is_exact(*word),
+            *exact,
+            "{word:#010X} {}",
+            arm_text(*word)
+        );
+    }
+    let thumb: &[(u16, bool)] = &[
+        (0x4700, true),  // bx r0
+        (0x4701, false), // bx r0 with bits 2..0 set
+        (0x1C08, true),  // adds r0, r1, #0
+        (0x1C00, false), // adds r0, r0, #0 (assembles to the imm8 form)
+        (0x457F, false), // cmp r7, pc
+    ];
+    for (half, exact) in thumb {
+        assert_eq!(
+            thumb_text_is_exact(*half),
+            *exact,
+            "{half:#06X} {}",
+            thumb_text(*half, 0)
+        );
+    }
+}

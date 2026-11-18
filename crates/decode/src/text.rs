@@ -189,10 +189,9 @@ pub fn arm_text(word: u32) -> String {
                 (false, true) => "strb",
             };
             let operand = arm_transfer_offset(offset, up);
+            // Unified syntax puts the condition after the T: `ldrbteq`.
             format!(
-                "{}{cond}{} {}, {}",
-                base,
-                t,
+                "{base}{t}{cond} {}, {}",
                 reg_name(rd),
                 addressing(rn, operand, pre_index, writeback)
             )
@@ -278,6 +277,157 @@ pub fn arm_text(word: u32) -> String {
             let comment = name.map(|name| format!(" @ {name}")).unwrap_or_default();
             format!("swi{} #0x{imm24:X}{comment}", cond_suffix(word))
         }
+    }
+}
+
+/// Whether [`arm_text`] assembles back to exactly `word` under GNU as.
+///
+/// The text is a faithful rendering of the decoded fields, but some
+/// encodings carry information no assembler syntax expresses: set
+/// should-be-zero fields, an immediate rotation other than the one the
+/// assembler picks for the value, and r15 operands the ARM ARM calls
+/// UNPREDICTABLE, which GNU as rejects. Emitters fall back to raw
+/// bytes when this is false.
+#[must_use]
+pub fn arm_text_is_exact(word: u32) -> bool {
+    let instr = decode_arm(word);
+    if instr.is_unpredictable() {
+        return false;
+    }
+    let pc = Register::Pc;
+    match instr {
+        ArmInstr::Undefined { .. } => true,
+        ArmInstr::DataProcessing {
+            opcode,
+            rd,
+            rn,
+            operand2,
+            ..
+        } => {
+            let sbz = match opcode {
+                DataOp::Mov | DataOp::Mvn => rn == Register::R0,
+                DataOp::Tst | DataOp::Teq | DataOp::Cmp | DataOp::Cmn => rd == Register::R0,
+                _ => true,
+            };
+            let operand = match operand2 {
+                // GNU as reads `add/sub rd, pc, #imm` as a pc-relative
+                // expression and re-encodes a negative one.
+                ShifterOperand::Immediate { rotate, value } => {
+                    canonical_rotation(rotate, value)
+                        && !(rn == pc
+                            && matches!(opcode, DataOp::Add | DataOp::Sub)
+                            && u32::from(value).rotate_right(u32::from(rotate) * 2) >= 0x8000_0000)
+                }
+                ShifterOperand::Register { .. } => true,
+            };
+            sbz && operand
+        }
+        ArmInstr::Multiply {
+            accumulate,
+            rd,
+            rn,
+            rs,
+            rm,
+            ..
+        } => (accumulate || rn == Register::R0) && ![rd, rn, rs, rm].contains(&pc),
+        ArmInstr::MultiplyLong {
+            rd_hi,
+            rd_lo,
+            rn,
+            rm,
+            ..
+        } => ![rd_hi, rd_lo, rn, rm].contains(&pc),
+        ArmInstr::Swap { rd, rn, rm, .. } => ![rd, rn, rm].contains(&pc) && rn != rd && rn != rm,
+        ArmInstr::PsrWrite {
+            source: PsrSource::Immediate { rotate, value },
+            ..
+        } => canonical_rotation(rotate, value),
+        ArmInstr::LoadStore {
+            byte,
+            writeback,
+            pre_index,
+            rd,
+            rn,
+            offset,
+            ..
+        } => {
+            let register = match offset {
+                TransferOffset::Register { rm, .. } => Some(rm),
+                TransferOffset::Immediate(_) => None,
+            };
+            let user = !pre_index && writeback;
+            let misaligned_pc_literal = rd == pc
+                && rn == pc
+                && matches!(offset, TransferOffset::Immediate(imm) if imm % 4 != 0);
+            !((byte || user) && rd == pc)
+                && !misaligned_pc_literal
+                && register != Some(pc)
+                && pc_base_is_plain(rn, pre_index, writeback, register.is_some())
+        }
+        ArmInstr::LoadStoreHalfwordSigned {
+            writeback,
+            pre_index,
+            rd,
+            rn,
+            offset,
+            ..
+        } => {
+            let register = match offset {
+                HalfwordOffset::Register(rm) => Some(rm),
+                HalfwordOffset::Immediate(_) => None,
+            };
+            rd != pc
+                && register != Some(pc)
+                && pc_base_is_plain(rn, pre_index, writeback, register.is_some())
+        }
+        ArmInstr::BlockTransfer { rn, registers, .. } => rn != pc && !registers.is_empty(),
+        _ => true,
+    }
+}
+
+/// A pc base takes only a pre-indexed immediate offset without
+/// writeback; GNU as rejects the other forms.
+fn pc_base_is_plain(rn: Register, pre_index: bool, writeback: bool, register: bool) -> bool {
+    rn != Register::Pc || (pre_index && !writeback && !register)
+}
+
+/// Whether `value ror (2 * rotate)` uses the smallest rotation that
+/// encodes the value, the one GNU as picks.
+fn canonical_rotation(rotate: u8, value: u8) -> bool {
+    let target = u32::from(value).rotate_right(u32::from(rotate) * 2);
+    let smallest = (0..16u32)
+        .find(|r| target.rotate_left(2 * r) <= 0xFF)
+        .unwrap_or(0);
+    u32::from(rotate) == smallest
+}
+
+/// Whether [`thumb_text`] assembles back to exactly `first` under GNU
+/// as (for the single-halfword forms; BL pairs always do). See
+/// [`arm_text_is_exact`] for the classes of information the text loses.
+#[must_use]
+pub fn thumb_text_is_exact(first: u16) -> bool {
+    let instr = decode_thumb(first, 0);
+    if instr.is_unpredictable() {
+        return false;
+    }
+    match instr {
+        // Bits 2..0 of BX are should-be-zero.
+        ThumbInstr::HighRegisterOperation {
+            op: ThumbHiOp::Bx, ..
+        } => first & 0b111 == 0,
+        ThumbInstr::HighRegisterOperation {
+            op: ThumbHiOp::Cmp,
+            rd,
+            rs,
+        } => rd != Register::Pc && rs != Register::Pc,
+        // `adds rd, rd, #imm3` assembles to the 8-bit-immediate form.
+        ThumbInstr::AddSubtract {
+            immediate: true,
+            rs,
+            rd,
+            ..
+        } => rs != rd,
+        _ => true,
     }
 }
 

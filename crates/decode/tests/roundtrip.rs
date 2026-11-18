@@ -23,7 +23,9 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use decode::{ThumbInstr, arm_text, decode_thumb, thumb_text};
+use decode::{
+    ThumbInstr, arm_text, arm_text_is_exact, decode_thumb, thumb_text, thumb_text_is_exact,
+};
 
 /// Which assembler is driving the round-trip.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -336,4 +338,65 @@ fn arm_and_thumb_roundtrip() {
 
     roundtrip_arm(arm_words, (found.0, &found.1), &workdir);
     roundtrip_thumb(thumb_halfwords, (found.0, &found.1), &workdir);
+}
+
+/// Assembles one line per encoding and returns the first encoding
+/// whose bytes differ, with its text.
+fn first_mismatch(
+    backend: (Backend, &PathBuf),
+    workdir: &std::path::Path,
+    state: &str,
+    lines: &[(u32, String)],
+    width: usize,
+) -> Option<(u32, String, Vec<u8>)> {
+    let mut source = format!(".syntax unified\n.cpu arm7tdmi\n.{state}\n");
+    for (_, text) in lines {
+        source.push_str(text);
+        source.push('\n');
+    }
+    let got = assemble(backend, &source, workdir);
+    assert_eq!(got.len(), lines.len() * width, "one encoding per line");
+    lines
+        .iter()
+        .zip(got.chunks(width))
+        .find(|((encoding, _), bytes)| *bytes != &encoding.to_le_bytes()[..width])
+        .map(|((encoding, text), bytes)| (*encoding, text.clone(), bytes.to_vec()))
+}
+
+/// Every encoding the exactness predicates accept must assemble back
+/// to itself: a deterministic sample of ARM words and the whole THUMB
+/// space outside BL pairs. GNU as only; clang has the documented THUMB
+/// gaps above.
+#[test]
+fn exact_text_reassembles_over_a_large_sample() {
+    let Some(found) = find_backend().filter(|(kind, _)| *kind == Backend::GnuAs) else {
+        println!("exactness sample skipped: needs arm-none-eabi-as");
+        return;
+    };
+    let backend = (found.0, &found.1);
+    let workdir = std::env::temp_dir().join("oxyboy-roundtrip-sample");
+    std::fs::create_dir_all(&workdir).expect("create workdir");
+
+    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+    let arm: Vec<(u32, String)> = (0..200_000)
+        .map(|_| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 32) as u32
+        })
+        .filter(|word| arm_text_is_exact(*word))
+        .map(|word| (word, arm_text(word)))
+        .collect();
+    if let Some((word, text, got)) = first_mismatch(backend, &workdir, "arm", &arm, 4) {
+        panic!("ARM {word:#010X} `{text}` assembled to {got:02X?}");
+    }
+
+    let thumb: Vec<(u32, String)> = (0..=0xFFFFu16)
+        .filter(|half| half >> 11 < 0b11110 && thumb_text_is_exact(*half))
+        .map(|half| (u32::from(half), thumb_text(half, 0)))
+        .collect();
+    if let Some((half, text, got)) = first_mismatch(backend, &workdir, "thumb", &thumb, 2) {
+        panic!("THUMB {half:#06X} `{text}` assembled to {got:02X?}");
+    }
 }

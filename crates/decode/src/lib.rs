@@ -41,7 +41,7 @@ pub use arm::{
 pub use bios::{SWI_NAMES, swi_name};
 pub use condition::Condition;
 pub use register::{Register, RegisterList};
-pub use text::{arm_text, thumb_text};
+pub use text::{arm_text, arm_text_is_exact, thumb_text, thumb_text_is_exact};
 pub use thumb::{
     ThumbAluOp, ThumbHiOp, ThumbImmOp, ThumbInstr, ThumbMemOp, ThumbShift, ThumbSignedMemOp,
     decode_thumb,
