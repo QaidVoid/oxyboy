@@ -904,3 +904,123 @@ fn dma_into_translated_code_invalidates_it() {
     assert!(!driver.is_translated(0x0200_0400), "F2 invalidated");
     assert!(driver.is_translated(0x0200_0100), "F1's page untouched");
 }
+
+/// Places ARM `words` at ROM offset 0x100 and `data` words at their
+/// ROM offsets.
+fn arm_image(title: &str, words: &[u32], data: &[(usize, u32)]) -> Image {
+    let mut bytes = RomBuilder::new().title(title).build();
+    for (i, word) in words.iter().enumerate() {
+        bytes[0x100 + 4 * i..0x104 + 4 * i].copy_from_slice(&word.to_le_bytes());
+    }
+    for (offset, word) in data {
+        bytes[*offset..*offset + 4].copy_from_slice(&word.to_le_bytes());
+    }
+    Image::from_bytes(bytes).expect("parse")
+}
+
+/// Runs `image` from 0x08000100 to `park` interpreted and through
+/// the translated `marks`, then asserts r0-r14, the flags, and EWRAM
+/// agree. Returns the hybrid system for further checks.
+fn assert_hybrid_matches(image: &Image, marks: &[(u32, u32)], tag: &str, park: u32) -> System {
+    let mut interpreted = System::new(image.bytes().to_vec(), 0x0800_0100);
+    let mut steps = 0;
+    while interpreted.cpu.pc() != park && steps < 10_000 {
+        interpreted.step();
+        steps += 1;
+    }
+    assert_eq!(
+        interpreted.cpu.pc(),
+        park,
+        "interpreted run reaches the park"
+    );
+
+    let mut driver = build_driver(image, marks, tag).expect("module builds");
+    let mut hybrid = System::new(image.bytes().to_vec(), 0x0800_0100);
+    let mut steps = 0;
+    while hybrid.cpu.pc() != park && steps < 10_000 {
+        driver.step(&mut hybrid).expect("native call");
+        steps += 1;
+    }
+    assert_eq!(hybrid.cpu.pc(), park, "hybrid run reaches the park");
+
+    for i in 0..15u8 {
+        assert_eq!(
+            interpreted.cpu.reg_for_test(i),
+            hybrid.cpu.reg_for_test(i),
+            "r{i}"
+        );
+    }
+    assert_eq!(
+        interpreted.cpu.cpsr() & 0xF000_0000,
+        hybrid.cpu.cpsr() & 0xF000_0000,
+        "flags"
+    );
+    assert_eq!(interpreted.bus().ewram(), hybrid.bus().ewram(), "EWRAM");
+    hybrid
+}
+
+#[test]
+fn caller_stops_when_a_translated_callee_exits_early() {
+    if !recomp::Module::compiler_available() {
+        println!("skipping: no host C compiler on PATH");
+        return;
+    }
+    // The callee's SWI block is opaque, so the callee exits to the
+    // interpreter; the caller must not continue natively past the call.
+    let image = arm_image(
+        "RCEX",
+        &[
+            0xE3A0_4402, // mov r4, #0x02000000
+            0xE3A0_0019, // mov r0, #25
+            0xE3A0_1004, // mov r1, #4
+            0xEB00_0002, // bl helper
+            0xE584_0000, // str r0, [r4]
+            0xEA00_0002, // b park
+            0xE1A0_0000, // (filler)
+            0xEF06_0000, // helper: swi 6 (Div)
+            0xE1A0_F00E, // mov pc, lr
+            0xEAFF_FFFE, // park: b .
+        ],
+        &[],
+    );
+    let hybrid = assert_hybrid_matches(
+        &image,
+        &[(0x100, 0x118), (0x11C, 0x124)],
+        "recomp-callee-exit",
+        0x0800_0124,
+    );
+    let word = u32::from_le_bytes(hybrid.bus().ewram()[0..4].try_into().expect("slice"));
+    assert_eq!(word, 6, "the store saw the SWI's quotient");
+}
+
+#[test]
+fn loop_back_edge_keeps_the_previous_iteration_values() {
+    if !recomp::Module::compiler_available() {
+        println!("skipping: no host C compiler on PATH");
+        return;
+    }
+    // A list walk that sums each node's predecessor: r1 carries the
+    // previous r0 around the back edge while r0 advances.
+    let image = arm_image(
+        "RCLC",
+        &[
+            0xE3A0_0408, // mov r0, #0x08000000
+            0xE280_0D07, // add r0, r0, #0x1C0
+            0xE3A0_1000, // mov r1, #0
+            0xE3A0_2000, // mov r2, #0
+            0xE082_2001, // loop: add r2, r2, r1
+            0xE1A0_1000, // mov r1, r0
+            0xE590_0004, // ldr r0, [r0, #4]
+            0xE350_0000, // cmp r0, #0
+            0x1AFF_FFFA, // bne loop
+            0xE3A0_4402, // mov r4, #0x02000000
+            0xE584_2000, // str r2, [r4]
+            0xEA00_0000, // b park
+            0xE1A0_0000, // (filler)
+            0xEAFF_FFFE, // park: b .
+        ],
+        &[(0x1C4, 0x0800_01C8), (0x1CC, 0x0800_01D0), (0x1D4, 0)],
+    );
+    let hybrid = assert_hybrid_matches(&image, &[(0x100, 0x134)], "recomp-loop-copy", 0x0800_0134);
+    assert_eq!(hybrid.cpu.reg_for_test(2), 0x0800_01C0 + 0x0800_01C8);
+}

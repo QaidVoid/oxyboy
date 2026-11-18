@@ -705,6 +705,9 @@ fn emit_term(
                     "    if (st->icount >= ops->budget || st->cycles >= ops->cycle_budget) {{ st->pc = 0x{t:x}u; st->exited = 1u; return; }}"
                 );
                 let _ = writeln!(out, "    {}(st, ops);", symbol(*t));
+                // A callee that exited to the host left its resume
+                // point in `st`; the caller must not run past the call.
+                out.push_str("    if (st->exited) return;\n");
                 match cont {
                     Some((b, _)) => {
                         // The callee clobbers the registers; the state
@@ -785,36 +788,47 @@ fn budget_check(out: &mut String, current: usize, target: BlockId, function: &Fu
 
 /// Copies one edge's twenty state values into the target block's
 /// parameter locals and the state struct.
+///
+/// A back edge can pass one of the target's own parameters into a
+/// different slot. Copying slot by slot would then read a parameter
+/// already overwritten this edge, so such edges stage every value in
+/// a temporary first.
 fn edge(out: &mut String, args: &[Value], target: &Block) {
-    for (slot, value) in args.iter().take(20).enumerate() {
-        let Some(param) = target.params.get(slot) else {
-            continue;
-        };
-        match value {
-            Value::Const(c) => {
-                let _ = writeln!(
-                    out,
-                    "    v{} = {c}u; {} = v{};",
-                    param.0,
-                    slot_field(slot),
-                    param.0
-                );
-            }
-            Value::Id(_) => {
-                let e = expr(value);
-                if e == slot_field(slot) {
-                    let _ = writeln!(out, "    v{} = {e};", param.0);
-                } else {
-                    let _ = writeln!(
-                        out,
-                        "    v{} = {e}; {} = v{};",
-                        param.0,
-                        slot_field(slot),
-                        param.0
-                    );
-                }
-            }
+    let pairs: Vec<(usize, ir::ValueId, &Value)> = args
+        .iter()
+        .take(STATE_ARITY)
+        .enumerate()
+        .filter_map(|(slot, value)| target.params.get(slot).map(|&param| (slot, param, value)))
+        .collect();
+    let staged = pairs.iter().any(|&(_, param, value)| match value {
+        Value::Id(id) => *id != param && target.params.contains(id),
+        Value::Const(_) => false,
+    });
+    if staged {
+        out.push_str("    {\n");
+        for &(slot, _, value) in &pairs {
+            let _ = writeln!(out, "        uint32_t t{slot} = {};", expr(value));
         }
+        for &(slot, param, _) in &pairs {
+            let _ = writeln!(
+                out,
+                "        v{} = t{slot}; {} = t{slot};",
+                param.0,
+                slot_field(slot)
+            );
+        }
+        out.push_str("    }\n");
+        return;
+    }
+    for &(slot, param, value) in &pairs {
+        let _ = writeln!(
+            out,
+            "    v{} = {}; {} = v{};",
+            param.0,
+            expr(value),
+            slot_field(slot),
+            param.0
+        );
     }
 }
 
