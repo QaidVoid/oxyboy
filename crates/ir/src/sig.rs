@@ -32,7 +32,7 @@
 //! parameters were guessed; anything else renders with the
 //! `/* guessed */` marker via [`fmt_signature`].
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use crate::opt::operands;
 use crate::{Block, Function, Inst, Op, Reg, Terminator, Value, ValueId};
@@ -131,13 +131,15 @@ pub fn fmt_signature(name: &str, signature: &Signature) -> String {
     format!("{ret} {name}({}){guessed}", parts.join(", "))
 }
 
-/// One static call site: the target's name, the values passed in
-/// `r0..r3`, and which of those the caller redefined since entry.
+/// One static call site: the target's entry address, which of the
+/// values passed in `r0..r3` the caller computed itself, and
+/// which still hold the caller's own incoming argument. A register can
+/// be neither (a merge, or clobbered by an earlier call).
 #[derive(Clone)]
 struct CallSite {
-    target: String,
-    values: [Option<ValueId>; 4],
+    target: u32,
     written: [bool; 4],
+    forwarded: [bool; 4],
 }
 
 /// Per-function evidence gathered from one body scan plus the call
@@ -164,6 +166,7 @@ struct Body {
 
 impl Body {
     fn recover(function: &Function) -> Body {
+        let incoming = incoming_values(function);
         let mut arg_reads = [false; 4];
         let mut arg_types: [Option<Type>; 4] = [None; 4];
         for slot in 0..4 {
@@ -175,8 +178,8 @@ impl Body {
             arg_reads,
             arg_types,
             stack_args: stack_args(function),
-            ret: return_type(function),
-            calls: call_sites(function),
+            ret: return_type(function, &incoming),
+            calls: call_sites(function, &incoming),
             forwarded_count: 0,
             caller_min_count: 0,
         }
@@ -445,10 +448,54 @@ fn sp_offset(addr: &Value, sp: ValueId, entry: &Block) -> Option<u32> {
     }
 }
 
+/// Per register slot `r0..r3`, the values that hold the function's
+/// incoming value on every path: the entry parameter, and block
+/// parameters every incoming edge feeds such a value. Calls clobber
+/// `r0..r3` (AAPCS), so a call's continuation starts fresh.
+fn incoming_values(function: &Function) -> [HashSet<ValueId>; 4] {
+    let mut preds: Vec<Vec<(&[Value], bool)>> = vec![Vec::new(); function.blocks.len()];
+    for block in &function.blocks {
+        let via_call = matches!(block.term, Terminator::Call { .. });
+        for (succ, args) in edges(block) {
+            preds[succ.0 as usize].push((args, via_call));
+        }
+    }
+    std::array::from_fn(|slot| {
+        // Optimistic start, then drop every parameter some edge feeds
+        // a different value (a must-analysis fixpoint).
+        let mut set: HashSet<ValueId> = function
+            .blocks
+            .iter()
+            .filter_map(|block| block.params.get(slot).copied())
+            .collect();
+        loop {
+            let mut changed = false;
+            for (index, block) in function.blocks.iter().enumerate() {
+                let Some(param) = block.params.get(slot).copied() else {
+                    continue;
+                };
+                if !set.contains(&param) {
+                    continue;
+                }
+                let fed = preds[index].iter().all(|(args, via_call)| {
+                    !via_call && matches!(args.get(slot), Some(Value::Id(id)) if set.contains(id))
+                });
+                // A block other than the entry needs at least one edge.
+                if !fed || (index != 0 && preds[index].is_empty()) {
+                    set.remove(&param);
+                    changed = true;
+                }
+            }
+            if !changed {
+                return set;
+            }
+        }
+    })
+}
+
 /// The return evidence: `Some(None)` for proven-void, `Some(Some(t))`
 /// for a returning function, `None` when the body has no returns.
-fn return_type(function: &Function) -> Option<Option<Type>> {
-    let incoming = function.blocks[0].params.get(Reg::R0 as usize).copied();
+fn return_type(function: &Function, incoming: &[HashSet<ValueId>; 4]) -> Option<Option<Type>> {
     let mut any_return = false;
     let mut value: Option<Type> = None;
     for block in &function.blocks {
@@ -457,7 +504,7 @@ fn return_type(function: &Function) -> Option<Option<Type>> {
         };
         any_return = true;
         match state.first() {
-            Some(Value::Id(id)) if Some(*id) == incoming => {}
+            Some(Value::Id(id)) if incoming[Reg::R0 as usize].contains(id) => {}
             Some(Value::Id(id)) => value = Some(def_type(function, *id)),
             Some(Value::Const(_)) => value = Some(Type::U32),
             None => {}
@@ -507,7 +554,17 @@ fn def_type(function: &Function, id: ValueId) -> Type {
 }
 
 /// The static call sites of one function.
-fn call_sites(function: &Function) -> Vec<CallSite> {
+fn call_sites(function: &Function, incoming: &[HashSet<ValueId>; 4]) -> Vec<CallSite> {
+    let computed: HashSet<ValueId> = function
+        .blocks
+        .iter()
+        .flat_map(|block| {
+            block
+                .insts
+                .iter()
+                .flat_map(|inst| inst.dests.iter().copied())
+        })
+        .collect();
     let mut sites = Vec::new();
     for block in &function.blocks {
         let Terminator::Call { target, state, .. } = &block.term else {
@@ -516,22 +573,22 @@ fn call_sites(function: &Function) -> Vec<CallSite> {
         let Value::Const(addr) = target else {
             continue;
         };
-        let mut values = [None; 4];
         let mut written = [false; 4];
-        for (slot, value) in values.iter_mut().enumerate() {
+        let mut forwarded = [false; 4];
+        for slot in 0..4 {
             match state.get(slot) {
                 Some(Value::Id(id)) => {
-                    *value = Some(*id);
-                    written[slot] = !block.params.get(slot).is_some_and(|param| param == id);
+                    written[slot] = computed.contains(id);
+                    forwarded[slot] = incoming[slot].contains(id);
                 }
                 Some(Value::Const(_)) => written[slot] = true,
-                None => written[slot] = false,
+                None => {}
             }
         }
         sites.push(CallSite {
-            target: format!("sub_{addr:08x}"),
-            values,
+            target: *addr,
             written,
+            forwarded,
         });
     }
     sites
@@ -540,19 +597,21 @@ fn call_sites(function: &Function) -> Vec<CallSite> {
 /// The call-graph fixpoint: counts and pointer types propagate
 /// between callers and callees until stable.
 fn propagate(functions: &[Function], bodies: &mut [Body]) {
-    let index_of: BTreeMap<&str, usize> = functions
+    // Call sites name their targets by address, which holds whatever
+    // name a function was given.
+    let index_of: BTreeMap<u32, usize> = functions
         .iter()
         .enumerate()
-        .map(|(index, function)| (function.name.as_str(), index))
+        .filter_map(|(index, function)| Some((function.blocks.first()?.addr, index)))
         .collect();
     let mut caller_min = vec![usize::MAX; functions.len()];
     let mut changed = true;
     while changed {
         changed = false;
-        for (caller_index, caller) in functions.iter().enumerate() {
+        for caller_index in 0..functions.len() {
             let sites = bodies[caller_index].calls.clone();
             for site in &sites {
-                let Some(&callee_index) = index_of.get(site.target.as_str()) else {
+                let Some(&callee_index) = index_of.get(&site.target) else {
                     continue;
                 };
                 // Count evidence for the callee: written registers,
@@ -565,7 +624,7 @@ fn propagate(functions: &[Function], bodies: &mut [Body]) {
                 for slot in 0..4 {
                     if site.written[slot] {
                         observed = slot + 1;
-                    } else if bodies[callee_index].arg_reads[slot] {
+                    } else if site.forwarded[slot] && bodies[callee_index].arg_reads[slot] {
                         forwarded = forwarded.max(slot + 1);
                     }
                 }
@@ -579,11 +638,8 @@ fn propagate(functions: &[Function], bodies: &mut [Body]) {
                 }
                 // Type propagation in both directions, for forwarded
                 // parameters.
-                for (slot, value) in site.values.iter().enumerate() {
-                    let Some(value) = value else {
-                        continue;
-                    };
-                    if caller.blocks[0].params.get(slot) != Some(value) {
+                for slot in 0..4 {
+                    if !site.forwarded[slot] {
                         continue;
                     }
                     let hint = bodies[caller_index].arg_types[slot];
@@ -670,11 +726,18 @@ mod tests {
         }
     }
 
-    /// Assigns the 20-slot parameter lists by block index.
+    /// Assigns the 20-slot parameter lists by block index, and the
+    /// entry address a `sub_XXXXXXXX` name spells.
     fn fn_of(name: &str, blocks: Vec<Block>) -> Function {
         let mut blocks = blocks;
         for (index, block) in blocks.iter_mut().enumerate() {
             block.params = (0..20).map(|slot| pid(index, slot)).collect();
+        }
+        if let Some(addr) = name
+            .strip_prefix("sub_")
+            .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+        {
+            blocks[0].addr = addr;
         }
         Function {
             name: name.to_string(),
@@ -982,6 +1045,119 @@ mod tests {
             fmt_signature("sub_08000000", &signatures["sub_08000000"]),
             "u32 sub_08000000(u32 r0)"
         );
+    }
+
+    fn ret_of(block: usize) -> Terminator {
+        Terminator::Return {
+            state: out_state(block, &[]),
+            switches_state: false,
+        }
+    }
+
+    #[test]
+    fn multi_block_function_without_r0_writes_is_void() {
+        let f = fn_of(
+            "sub_08000000",
+            vec![
+                blk(
+                    Vec::new(),
+                    Terminator::BranchCond {
+                        cond: Condition::Eq,
+                        then_target: BlockId(1),
+                        then_args: out_state(0, &[]),
+                        else_target: BlockId(2),
+                        else_args: out_state(0, &[]),
+                    },
+                ),
+                blk(Vec::new(), ret_of(1)),
+                blk(Vec::new(), ret_of(2)),
+            ],
+        );
+        let signatures = recover(&[f]);
+        assert_eq!(
+            signatures["sub_08000000"].ret, None,
+            "r0 untouched on every path"
+        );
+    }
+
+    #[test]
+    fn registers_after_a_call_are_not_forwarded_arguments() {
+        // a reads r0, b reads r0-r3; k calls a, then b without touching
+        // r0-r3, so b sees a's results, not k's own arguments.
+        let reader = |name: &str, slots: usize| {
+            let insts = (0..slots)
+                .map(|slot| {
+                    def_inst(
+                        did(slot as u32),
+                        Op::Add {
+                            set_flags: false,
+                            a: pval(0, slot),
+                            b: Value::Const(1),
+                        },
+                    )
+                })
+                .collect();
+            fn_of(name, vec![blk(insts, ret_of(0))])
+        };
+        let k = fn_of(
+            "sub_08000000",
+            vec![
+                blk(
+                    Vec::new(),
+                    Terminator::Call {
+                        target: Value::Const(0x0800_0100),
+                        cont: Some((BlockId(1), out_state(0, &[]))),
+                        state: out_state(0, &[]),
+                    },
+                ),
+                blk(
+                    Vec::new(),
+                    Terminator::Call {
+                        target: Value::Const(0x0800_0200),
+                        cont: None,
+                        state: out_state(1, &[]),
+                    },
+                ),
+            ],
+        );
+        let signatures = recover(&[k, reader("sub_08000100", 1), reader("sub_08000200", 4)]);
+        assert_eq!(
+            signatures["sub_08000000"].registers, 1,
+            "only the first call forwards k's arguments"
+        );
+    }
+
+    #[test]
+    fn renamed_callees_still_receive_call_evidence() {
+        let mut g = fn_of(
+            "fill_buffer",
+            vec![blk(
+                vec![def_inst(
+                    did(1),
+                    Op::Load {
+                        addr: pval(0, 0),
+                        size: Size::Word,
+                        signed: false,
+                        mode: crate::LoadMode::Ldr,
+                    },
+                )],
+                ret_of(0),
+            )],
+        );
+        g.blocks[0].addr = 0x0800_0100;
+        let f = fn_of(
+            "sub_08000000",
+            vec![blk(
+                Vec::new(),
+                Terminator::Call {
+                    target: Value::Const(0x0800_0100),
+                    cont: None,
+                    state: out_state(0, &[]),
+                },
+            )],
+        );
+        let signatures = recover(&[f, g]);
+        assert_eq!(signatures["sub_08000000"].params, vec![Type::Ptr]);
     }
 
     #[test]
