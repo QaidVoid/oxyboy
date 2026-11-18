@@ -54,9 +54,8 @@ const CNT_L: [u32; 4] = [0x0B8, 0x0C4, 0x0D0, 0x0DC];
 /// count of 0 means the maximum; channels 0-2 transfer at most 0x4000
 /// units, channel 3 0x10000).
 const MAX_COUNT: [u32; 4] = [0x4000, 0x4000, 0x4000, 0x1_0000];
-/// The FIFO drain address of the sound channels (GBATEK "FIFO
-/// Reset/Drain": channel 1 drains into A0, channel 2 into A4).
-const FIFO_ADDR: [u32; 4] = [0, 0x0400_00A0, 0x0400_00A4, 0];
+/// The FIFO A and FIFO B data addresses.
+const FIFO_ADDR: [u32; 2] = [0x0400_00A0, 0x0400_00A4];
 
 impl Dma {
     /// Latches the channel's internal state and arms immediate-timing
@@ -118,21 +117,26 @@ impl Dma {
     }
 
     /// Runs the sound-FIFO drains the APU requested (bit 0 = FIFO A,
-    /// bit 1 = FIFO B): DMA channel 1 feeds FIFO A and channel 2
-    /// feeds FIFO B when enabled in special timing (GBATEK
-    /// "DMA-Sound Playback Procedure"). The charged cycles are not
-    /// added to the clock (the refill is synchronous with the timer
-    /// latch, under the coarse timing model).
+    /// bit 1 = FIFO B): whichever special-timing channel among 1 and
+    /// 2 has that FIFO as its destination feeds it (GBATEK
+    /// "DMA-Sound Playback Procedure"; either channel can serve either
+    /// FIFO). The charged cycles are not added to the clock (the
+    /// refill is synchronous with the timer latch; the coarse timing
+    /// model applies).
     pub(super) fn sound_refill(&mut self, bus: &mut Bus, requests: u8) {
-        for (ch, fifo_bit) in [(1usize, 0u8), (2usize, 1u8)] {
-            let cnt_h = bus.io_half(CNT_H[ch]);
-            if requests & (1 << fifo_bit) == 0
-                || cnt_h & 0x8000 == 0
-                || ((cnt_h >> 8) & 0x0003) as u8 != DmaTiming::Special as u8
-            {
+        for (fifo_bit, fifo_addr) in FIFO_ADDR.into_iter().enumerate() {
+            if requests & (1 << fifo_bit) == 0 {
                 continue;
             }
-            self.transfer(bus, ch);
+            for ch in 1..=2 {
+                let cnt_h = bus.io_half(CNT_H[ch]);
+                if cnt_h & 0x8000 != 0
+                    && ((cnt_h >> 8) & 0x0003) as u8 == DmaTiming::Special as u8
+                    && self.channels[ch].dad & 0x0FFF_FFFF == fifo_addr
+                {
+                    self.transfer(bus, ch);
+                }
+            }
         }
     }
 
@@ -156,11 +160,7 @@ impl Dma {
         let dst_adj = if fifo { 0b10 } else { (cnt_h & 0x0003) as u8 };
         let src_adj = ((cnt_h >> 2) & 0x0003) as u8;
         let mut sad = self.channels[ch].sad;
-        let mut dad = if fifo {
-            FIFO_ADDR[ch]
-        } else {
-            self.channels[ch].dad
-        };
+        let mut dad = self.channels[ch].dad;
 
         // Dst adjust 11 (inc+reload) increments during the transfer
         // like inc; the reload happens in `rearm` on the next trigger.

@@ -171,3 +171,28 @@ fn timer_and_dma_sustain_fifo_playback() {
         "DMA 1 still enabled"
     );
 }
+
+#[test]
+fn fifo_dma_follows_the_destination_not_the_channel_number() {
+    let mut bus = Bus::new(Vec::new());
+    let w = |bus: &mut Bus, off: u32, value: u16| bus.write_u16(BASE + off, value);
+    w(&mut bus, 0x084, 0x0080); // master enable
+    w(&mut bus, 0x082, 0x0800); // reset FIFO A
+    w(&mut bus, 0x082, 0x0002 | 0x0004 | 0x0300); // A: both sides, timer 0
+    for k in 0..256u32 {
+        bus.write_u8(IWRAM + k, k as u8);
+    }
+    // DMA 2, usually FIFO B's channel, feeds FIFO A here.
+    bus.write_u32(BASE + 0x0C8, IWRAM);
+    bus.write_u32(BASE + 0x0CC, BASE + 0x0A0);
+    w(&mut bus, 0x0D0, 4);
+    w(&mut bus, 0x0D2, 0x0002 | 0x0010 | 0x0020 | 0x0300 | 0x8000);
+    w(&mut bus, 0x0100, TIMER_RELOAD);
+    w(&mut bus, 0x0102, 0x0080);
+
+    for _ in 0..64 {
+        sample_slot(&mut bus);
+        bus.take_audio();
+    }
+    assert!(bus.fifo_len(0) >= 16, "DMA 2 keeps FIFO A fed");
+}
