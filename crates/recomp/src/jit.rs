@@ -1,11 +1,14 @@
 //! Compiles emitted C with the host compiler and maps the result.
 //!
 //! The library stays mapped for the [`Module`] lifetime; symbols are
-//! resolved per call. Compilation happens in a scratch directory under
-//! the system temp dir and is cleaned up when the module drops.
+//! resolved per call. Each build compiles in its own fresh scratch
+//! directory under the system temp dir (owner-only, never reused), which
+//! is removed when the module drops.
 
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use libloading::{Library, Symbol};
 
@@ -13,9 +16,66 @@ use crate::abi::{GuestOps, GuestState};
 
 /// A compiled and loaded translation unit.
 pub struct Module {
-    /// Keeps the mapped code alive; dropped before the scratch dir.
+    /// Keeps the mapped code alive.
     _lib: Library,
     dir: PathBuf,
+}
+
+/// Compiles `c_source` in `dir` and maps the resulting library.
+fn compile_and_load(c_source: &str, dir: &std::path::Path) -> Result<Library, String> {
+    let src = dir.join("mod.c");
+    let so = dir.join("libmod.so");
+    std::fs::write(&src, c_source).map_err(|e| format!("{}: {e}", src.display()))?;
+    let output = Command::new("cc")
+        .args([
+            "-shared",
+            "-fPIC",
+            "-O1",
+            "-fno-strict-aliasing",
+            "-Wall",
+            "-x",
+            "c",
+        ])
+        .arg(&src)
+        .arg("-o")
+        .arg(&so)
+        .output()
+        .map_err(|e| format!("cc: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "cc failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    unsafe { Library::new(&so) }.map_err(|e| format!("dlopen: {e}"))
+}
+
+/// Builds made by this process so far; part of every scratch name.
+static BUILDS: AtomicU32 = AtomicU32::new(0);
+
+/// Creates a new, empty scratch directory only this user can access.
+/// Creation fails on an existing path, so a directory planted by
+/// another user is never adopted; the name is retried instead.
+fn scratch_dir(tag: &str) -> Result<PathBuf, String> {
+    for _ in 0..16 {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos());
+        let dir = std::env::temp_dir().join(format!(
+            "oxyboy-recomp-{tag}-{}-{}-{nanos:08x}",
+            std::process::id(),
+            BUILDS.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        match builder.create(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("{}: {e}", dir.display())),
+        }
+    }
+    Err("could not create a fresh recomp scratch directory".to_string())
 }
 
 impl Module {
@@ -30,41 +90,22 @@ impl Module {
     }
 
     /// Compiles `c_source` into a shared library and maps it. `tag`
-    /// namespaces the scratch directory.
+    /// names the scratch directory for debugging; every build gets a
+    /// new one, so a rebuild never loads a stale library.
     ///
     /// # Errors
     ///
     /// Returns a printable message on filesystem, compiler, or loader
     /// failure.
     pub fn build(c_source: &str, tag: &str) -> Result<Self, String> {
-        let dir = std::env::temp_dir().join(format!("oxyboy-recomp-{tag}-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-        let src = dir.join("mod.c");
-        let so = dir.join("libmod.so");
-        std::fs::write(&src, c_source).map_err(|e| format!("{}: {e}", src.display()))?;
-        let status = Command::new("cc")
-            .args([
-                "-shared",
-                "-fPIC",
-                "-O1",
-                "-fno-strict-aliasing",
-                "-Wall",
-                "-x",
-                "c",
-            ])
-            .arg(&src)
-            .arg("-o")
-            .arg(&so)
-            .output()
-            .map_err(|e| format!("cc: {e}"))?;
-        if !status.status.success() {
-            return Err(format!(
-                "cc failed:\n{}",
-                String::from_utf8_lossy(&status.stderr)
-            ));
+        let dir = scratch_dir(tag)?;
+        match compile_and_load(c_source, &dir) {
+            Ok(lib) => Ok(Module { _lib: lib, dir }),
+            Err(e) => {
+                std::fs::remove_dir_all(&dir).ok();
+                Err(e)
+            }
         }
-        let lib = unsafe { Library::new(&so) }.map_err(|e| format!("dlopen: {e}"))?;
-        Ok(Module { _lib: lib, dir })
     }
 
     /// Calls the translated function for `start` with the state and
@@ -84,7 +125,9 @@ impl Module {
 
 impl Drop for Module {
     fn drop(&mut self) {
-        // The library unmaps first (declared before `dir`).
+        // The library is still mapped here (fields drop after this
+        // body); unlinking a mapped file is safe, the mapping stays
+        // valid until the library unmaps.
         std::fs::remove_dir_all(&self.dir).ok();
     }
 }
@@ -153,6 +196,86 @@ mod tests {
         0
     }
 
+    /// Calls the module's function at 0x08000100 with r0 = 0x1000 and
+    /// returns the resulting r0.
+    fn call_r0(module: &Module) -> u32 {
+        let host = Host {
+            mem: RefCell::new(vec![0; 0x1_0000]),
+        };
+        let mut st = GuestState {
+            r: [0; 16],
+            n: 0,
+            z: 0,
+            c: 0,
+            v: 0,
+            pc: 0,
+            exited: 0,
+            thumb: 0,
+            cycles: 0,
+            icount: 0,
+        };
+        st.r[0] = 0x1000;
+        let ops = GuestOps {
+            ctx: std::ptr::from_ref(&host)
+                .cast::<core::ffi::c_void>()
+                .cast_mut(),
+            load,
+            store,
+            fetch,
+            budget: 1000,
+            cycle_budget: u64::MAX,
+        };
+        module.call(0x0800_0100, &mut st, &ops).expect("call");
+        st.r[0]
+    }
+
+    #[test]
+    fn rebuilds_with_one_tag_load_their_own_code() {
+        if !Module::compiler_available() {
+            println!("skipping: no host C compiler on PATH");
+            return;
+        }
+        let four = adding_function(4);
+        let eight = adding_function(8);
+        let first = Module::build(
+            &crate::emit_module(&[(0x0800_0100, &four)]).c_source,
+            "same",
+        )
+        .expect("compile");
+        let second = Module::build(
+            &crate::emit_module(&[(0x0800_0100, &eight)]).c_source,
+            "same",
+        )
+        .expect("compile");
+        assert_ne!(first.dir, second.dir, "every build gets its own directory");
+        assert_eq!(call_r0(&first), 0x1004);
+        assert_eq!(call_r0(&second), 0x1008, "not the first library again");
+    }
+
+    #[test]
+    fn scratch_dirs_are_private_and_removed_on_drop() {
+        if !Module::compiler_available() {
+            println!("skipping: no host C compiler on PATH");
+            return;
+        }
+        let f = test_function();
+        let module = Module::build(
+            &crate::emit_module(&[(0x0800_0100, &f)]).c_source,
+            "private",
+        )
+        .expect("compile");
+        let dir = module.dir.clone();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&dir).expect("dir").permissions().mode();
+            assert_eq!(mode & 0o777, 0o700);
+        }
+        drop(module);
+        assert!(!dir.exists(), "scratch dir removed");
+        assert!(Module::build("not c", "broken").is_err());
+    }
+
     #[test]
     fn compiles_and_executes_a_translated_function() {
         if !Module::compiler_available() {
@@ -201,6 +324,11 @@ mod tests {
 
     /// `f { r0 = r0 + 4; mem[r0] = r1; ret }`.
     fn test_function() -> ir::Function {
+        adding_function(4)
+    }
+
+    /// `f { r0 = r0 + add; mem[r0] = r1; ret }`.
+    fn adding_function(add: u32) -> ir::Function {
         use ir::{Block, Function, Inst, Op, Terminator, Value, ValueId};
         let reg = |i: u32| Value::Id(ValueId(i));
         Function {
@@ -227,7 +355,7 @@ mod tests {
                         op: Op::Add {
                             set_flags: false,
                             a: reg(0),
-                            b: Value::Const(4),
+                            b: Value::Const(add),
                         },
                         pc: 0x0800_0100,
                         state: Vec::new(),
