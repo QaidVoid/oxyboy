@@ -505,10 +505,19 @@ impl Bus {
             // VRAM has no 8-bit store: the byte lands in both halves
             // of the containing halfword (GBATEK "VRAM": 8-bit writes
             // "write 8bit data to both upper and lower bytes").
+            // Byte writes to OBJ VRAM are ignored; OBJ tiles start at
+            // 0x10000, or 0x14000 in the bitmap modes 3-5.
             0x06 => {
                 let i = (Self::vram_index(a) & !1) as usize;
-                self.vram[i] = value;
-                self.vram[i + 1] = value;
+                let obj_base = if self.io_half(0) & 0x0007 >= 3 {
+                    0x1_4000
+                } else {
+                    0x1_0000
+                };
+                if i < obj_base {
+                    self.vram[i] = value;
+                    self.vram[i + 1] = value;
+                }
             }
             0x05 => {
                 let i = ((a & 0x0000_03FF) & !1) as usize;

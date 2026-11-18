@@ -312,6 +312,22 @@ fn no_panics_across_region_boundaries() {
 }
 
 #[test]
+fn obj_vram_ignores_byte_writes() {
+    let mut bus = Bus::new(Vec::new());
+    // Tile modes: OBJ VRAM starts at 0x06010000.
+    bus.write_u8(0x0601_0000, 0xAB);
+    assert_eq!(bus.read_u16(0x0601_0000), 0);
+    bus.write_u8(0x0600_FFFE, 0xAB);
+    assert_eq!(bus.read_u16(0x0600_FFFE), 0xABAB);
+    // Bitmap modes: the frame buffer reaches 0x06014000.
+    bus.write_u16(0x0400_0000, 0x0003);
+    bus.write_u8(0x0601_0000, 0xCD);
+    assert_eq!(bus.read_u16(0x0601_0000), 0xCDCD);
+    bus.write_u8(0x0601_4000, 0xCD);
+    assert_eq!(bus.read_u16(0x0601_4000), 0);
+}
+
+#[test]
 fn vram_byte_writes_fill_both_halves_of_the_cell() {
     let mut bus = Bus::new(Vec::new());
     bus.write_u8(0x0600_0100, 0xAB);
