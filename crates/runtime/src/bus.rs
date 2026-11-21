@@ -260,6 +260,18 @@ impl Bus {
         self.access_cycles(addr, width, seq)
     }
 
+    /// The bus timing state an opcode fetch depends on: the prefetch
+    /// buffer and the sequential-access tracker.
+    pub(crate) fn fetch_state(&self) -> (Option<u32>, (u32, u8)) {
+        (self.prefetch, self.last_access)
+    }
+
+    /// Puts back a [`Bus::fetch_state`] snapshot, undoing the timing
+    /// effects of an instruction the interpreter will rerun.
+    pub(crate) fn restore_fetch_state(&mut self, state: (Option<u32>, (u32, u8))) {
+        (self.prefetch, self.last_access) = state;
+    }
+
     /// Cycle cost of one DMA unit: GBATEK "DMA Transfer Time" prices
     /// the first unit of a transfer non-sequential and the rest
     /// sequential, on each side independently. The CPU's sequential
@@ -970,17 +982,67 @@ impl Bus {
         self.timers = timers;
     }
 
-    /// System cycles to the next timer overflow, or `u32::MAX` when no
-    /// timer runs from the clock.
-    pub(crate) fn cycles_to_timer_overflow(&self) -> u32 {
-        self.timers.cycles_to_overflow(self).unwrap_or(u32::MAX)
+    /// System cycles to the next overflow among the timers in `mask`,
+    /// or `u32::MAX` when none can overflow.
+    pub(crate) fn cycles_to_timer_overflow(&self, mask: u8) -> u32 {
+        self.timers
+            .cycles_to_overflow(self, mask)
+            .unwrap_or(u32::MAX)
+    }
+
+    /// The DMA start timings (bit = [`DmaTiming`] value) of enabled
+    /// channels whose end-of-transfer IRQ `ie` would accept.
+    pub(crate) fn dma_irq_timings(&self, ie: u16) -> u8 {
+        (0..4u32).fold(0, |timings, ch| {
+            let cnt_h = self.io_half(0x0BA + 12 * ch);
+            if cnt_h & 0xC000 == 0xC000 && ie & (0x0100 << ch) != 0 {
+                timings | 1 << ((cnt_h >> 12) & 0x0003)
+            } else {
+                timings
+            }
+        })
+    }
+
+    /// The start timings (bit = [`DmaTiming`] value) of every enabled
+    /// DMA channel.
+    pub(crate) fn dma_timings(&self) -> u8 {
+        (0..4u32).fold(0, |timings, ch| {
+            let cnt_h = self.io_half(0x0BA + 12 * ch);
+            if cnt_h & 0x8000 != 0 {
+                timings | 1 << ((cnt_h >> 12) & 0x0003)
+            } else {
+                timings
+            }
+        })
+    }
+
+    /// System cycles until a sound FIFO next asks for a DMA refill: the
+    /// timer overflow whose latch brings a FIFO down to the refill
+    /// level, or `u32::MAX` when no FIFO's timer runs.
+    pub(crate) fn cycles_to_fifo_refill(&self) -> u32 {
+        let cnt_h = self.io_half(Self::SOUNDCNT_H);
+        [(0usize, (cnt_h >> 10) & 1), (1usize, (cnt_h >> 14) & 1)]
+            .into_iter()
+            .filter_map(|(which, timer)| {
+                let level = self.apu.fifo_len(which);
+                let latches = level.saturating_sub(crate::apu::FIFO_REFILL_LEVEL).max(1);
+                self.timers
+                    .cycles_to_nth_overflow(self, timer as usize, latches as u32)
+            })
+            .min()
+            .unwrap_or(u32::MAX)
+    }
+
+    /// Whether an immediate DMA is armed and waiting to run.
+    pub(crate) fn dma_deferred_pending(&self) -> bool {
+        self.dma.has_deferred()
     }
 
     /// The longest span a halted CPU can sleep through without moving
     /// any timer overflow or APU sample: the step that ends there
     /// applies them exactly as single-cycle steps would.
     pub(crate) fn idle_span(&self) -> u32 {
-        let timers = self.timers.cycles_to_overflow(self).unwrap_or(u32::MAX);
+        let timers = self.cycles_to_timer_overflow(0x0F);
         timers.min(self.apu.cycles_to_sample()).max(1)
     }
 

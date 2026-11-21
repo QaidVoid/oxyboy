@@ -119,19 +119,77 @@ impl System {
         self.ppu.take_frame_ended()
     }
 
-    /// System cycles until the next hardware event that can raise an
-    /// interrupt the CPU would take (a video edge or a timer overflow),
-    /// or `u32::MAX` while interrupts are masked. Native chunks stop
-    /// there so the interpreter takes the interrupt near its time.
+    /// System cycles until the CPU would next take an interrupt: 0
+    /// when one is pending and unmasked, otherwise the next event that
+    /// raises an enabled request (a video edge, a timer overflow, or a
+    /// DMA with its end IRQ enabled at its trigger), or `u32::MAX`
+    /// while IME or the CPSR I bit masks everything. Native code stops
+    /// at the first instruction boundary at or past it, where the
+    /// interpreter takes the interrupt.
     #[must_use]
-    pub fn cycles_to_interrupt_event(&self) -> u32 {
+    pub fn cycles_to_irq_event(&self) -> u32 {
         let bus = &self.bus;
-        if bus.ime() & 1 == 0 || bus.int_enable() == 0 || self.cpu.cpsr() & 0x80 != 0 {
+        if bus.ime() & 1 == 0 || self.cpu.cpsr() & 0x80 != 0 {
             return u32::MAX;
         }
-        self.ppu
-            .cycles_to_next_edge()
-            .min(bus.cycles_to_timer_overflow())
+        let ie = bus.int_enable();
+        if ie & bus.int_flags() != 0 {
+            return 0;
+        }
+        let dispstat = bus.dispstat();
+        let dma = bus.dma_irq_timings(ie);
+        let mut span = u32::MAX;
+        if (dispstat & 0x0010 != 0 && ie & 0x0002 != 0) || dma & 1 << 2 != 0 {
+            span = span.min(self.ppu.cycles_to_hblank());
+        }
+        if (dispstat & 0x0008 != 0 && ie & 0x0001 != 0) || dma & 1 << 1 != 0 {
+            span = span.min(self.ppu.cycles_to_line(160));
+        }
+        let lyc = dispstat >> 8;
+        if dispstat & 0x0020 != 0 && ie & 0x0004 != 0 && lyc < 228 {
+            span = span.min(self.ppu.cycles_to_line(lyc));
+        }
+        let mut timers = (0..4u8).fold(0u8, |mask, ch| {
+            let irq = bus.io_half(0x0102 + 4 * u32::from(ch)) & 0x0040 != 0;
+            if irq && ie & (0x0008 << ch) != 0 {
+                mask | 1 << ch
+            } else {
+                mask
+            }
+        });
+        // Sound DMA runs on timer 0/1 overflows.
+        if dma & 1 << 3 != 0 {
+            timers |= 0b11;
+        }
+        span.min(bus.cycles_to_timer_overflow(timers))
+    }
+
+    /// System cycles until an enabled DMA channel could next run: its
+    /// video edge, or the timer overflow that drains a sound FIFO to
+    /// its refill level.
+    /// A DMA changes memory and the bus timing state (the Game Pak
+    /// prefetch buffer) under the CPU, so native code stops there too.
+    #[must_use]
+    pub fn cycles_to_dma_event(&self) -> u32 {
+        let timings = self.bus.dma_timings();
+        let mut span = u32::MAX;
+        if timings & 1 << 2 != 0 {
+            span = span.min(self.ppu.cycles_to_hblank());
+        }
+        if timings & 1 << 1 != 0 {
+            span = span.min(self.ppu.cycles_to_line(160));
+        }
+        if timings & 1 << 3 != 0 {
+            span = span.min(self.bus.cycles_to_fifo_refill());
+        }
+        span
+    }
+
+    /// Where native code must hand control back: the next interrupt
+    /// the CPU would take or the next DMA, whichever comes first.
+    #[must_use]
+    pub fn cycles_to_native_stop(&self) -> u32 {
+        self.cycles_to_irq_event().min(self.cycles_to_dma_event())
     }
 
     /// System cycles from the current video dot to the next frame

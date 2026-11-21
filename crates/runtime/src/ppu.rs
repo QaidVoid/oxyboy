@@ -134,6 +134,26 @@ impl Ppu {
         self.frame_ended
     }
 
+    /// System cycles until the H-Blank flag next rises.
+    #[must_use]
+    pub fn cycles_to_hblank(&self) -> u32 {
+        if self.hblank {
+            CYCLES_PER_LINE.saturating_sub(self.dot) + HBLANK_FLAG_START
+        } else {
+            HBLANK_FLAG_START.saturating_sub(self.dot)
+        }
+    }
+
+    /// System cycles until scanline `target` next begins (the V-Blank
+    /// flag rises as line 160 begins, the VCOUNT match as line LYC
+    /// does).
+    #[must_use]
+    pub fn cycles_to_line(&self, target: u16) -> u32 {
+        let lines = LINES_PER_FRAME as u32;
+        let ahead = (u32::from(target) + 2 * lines - u32::from(self.line) - 1) % lines;
+        ahead * CYCLES_PER_LINE + CYCLES_PER_LINE.saturating_sub(self.dot)
+    }
+
     /// System cycles to the next video event that can raise an
     /// interrupt or run DMA: the H-Blank flag edge or the line end.
     #[must_use]

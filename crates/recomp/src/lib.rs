@@ -130,26 +130,63 @@ fn emit_block(
     // per-instruction fetches produce. Charges past the last inst
     // belong to the terminator instruction.
     let mut pending: &[ir::CycleCharge] = &block.cycles;
-    for (index, inst) in block.insts.iter().enumerate() {
+    let mut checkpoints = block.checkpoints.iter().peekable();
+    for inst in &block.insts {
         while let [charge, rest @ ..] = pending {
             if charge.addr > inst.pc {
                 break;
             }
-            emit_charge(out, charge, function.thumb);
+            while checkpoints.next_if(|c| c.addr < charge.addr).is_some() {}
+            let checkpoint = checkpoints.next_if(|c| c.addr == charge.addr);
+            emit_charge_at(out, charge, checkpoint, &block.params, function.thumb);
             pending = rest;
         }
-        // One guest instruction can lift to several guarded insts; a
-        // failed condition costs its one cycle once.
-        let last_of_instruction = block
-            .insts
-            .get(index + 1)
-            .is_none_or(|next| next.pc != inst.pc);
-        emit_inst(out, inst, last_of_instruction);
+        emit_inst(out, inst);
     }
     for charge in pending {
-        emit_charge(out, charge, function.thumb);
+        while checkpoints.next_if(|c| c.addr < charge.addr).is_some() {}
+        let checkpoint = checkpoints.next_if(|c| c.addr == charge.addr);
+        emit_charge_at(out, charge, checkpoint, &block.params, function.thumb);
     }
     emit_term(out, index, block, function, translated);
+}
+
+/// One guest instruction's boundary: hands control back before it
+/// once the charged cycles reach `irq_at` (the interpreter then takes
+/// the interrupt at the same boundary), charges its fetch, and adds
+/// the failed-condition cycle of a conditional instruction.
+///
+/// On entry to a block the state struct already holds the block's
+/// parameters (edges and call continuations write them through), so
+/// only slots that changed since need flushing.
+fn emit_charge_at(
+    out: &mut String,
+    charge: &ir::CycleCharge,
+    checkpoint: Option<&ir::Checkpoint>,
+    params: &[ir::ValueId],
+    thumb: bool,
+) {
+    if let Some(checkpoint) = checkpoint {
+        out.push_str("    if (st->cycles >= st->irq_at) {\n");
+        for (slot, value) in checkpoint.state.iter().take(STATE_ARITY).enumerate() {
+            if params
+                .get(slot)
+                .is_some_and(|param| *value == Value::Id(*param))
+            {
+                continue;
+            }
+            let _ = writeln!(out, "    {} = {};", slot_field(slot), expr(value));
+        }
+        let _ = writeln!(
+            out,
+            "    st->pc = 0x{:x}u; st->exited = 1u; return;\n    }}",
+            checkpoint.addr
+        );
+    }
+    emit_charge(out, charge, thumb);
+    if let Some(cond) = checkpoint.and_then(|c| c.guard) {
+        let _ = writeln!(out, "    if (!({})) st->cycles += 1u;", cond_expr(cond));
+    }
 }
 
 /// One guest instruction's cycle charge: the opcode fetch through the
@@ -168,15 +205,15 @@ fn emit_charge(out: &mut String, charge: &ir::CycleCharge, thumb: bool) {
     }
 }
 
-fn emit_inst(out: &mut String, inst: &Inst, charge_failed_condition: bool) {
+fn emit_inst(out: &mut String, inst: &Inst) {
     let body = inst_body(inst);
     match inst.guard {
         None => out.push_str(&body),
         Some(cond) => {
             let _ = writeln!(out, "    if ({}) {{", cond_expr(cond));
             out.push_str(&body);
-            // A failed condition costs the interpreter one internal
-            // cycle (ARM step model); the fetch already went out.
+            // The failed-condition cycle is charged once per guest
+            // instruction at its checkpoint.
             out.push_str("    } else {\n");
             // Guard-fail fallbacks: slot writes that a later read can
             // observe outside the guard take the slot's previous
@@ -186,9 +223,6 @@ fn emit_inst(out: &mut String, inst: &Inst, charge_failed_condition: bool) {
                 if let Some(prev) = fallback {
                     let _ = writeln!(out, "        v{} = {};", dest.0, expr(prev));
                 }
-            }
-            if charge_failed_condition {
-                out.push_str("        st->cycles += 1u;\n");
             }
             out.push_str("    }\n");
         }
@@ -1090,6 +1124,7 @@ mod tests {
             name: "sub_08000100".to_string(),
             thumb: false,
             blocks: vec![Block {
+                checkpoints: Vec::new(),
                 addr: 0x0800_0100,
                 params: (0..20).map(ValueId).collect(),
                 cycles: vec![
@@ -1197,7 +1232,7 @@ mod tests {
             "{source}"
         );
         assert!(
-            source.contains("} else {\n        v40 = v3;\n        st->cycles += 1u;\n    }"),
+            source.contains("} else {\n        v40 = v3;\n    }"),
             "fallback in the else arm: {source}"
         );
     }
@@ -1205,6 +1240,14 @@ mod tests {
     #[test]
     fn cycle_charges_go_through_the_host_fetch_callback() {
         let mut f = sample();
+        f.blocks[0].checkpoints = [(0x0800_0100, None), (0x0800_0104, Some(Condition::Ne))]
+            .into_iter()
+            .map(|(addr, guard)| ir::Checkpoint {
+                addr,
+                state: (0..20).map(|slot| Value::Id(ValueId(slot))).collect(),
+                guard,
+            })
+            .collect();
         let source = emit_module(&[(0x0800_0100, &f)]).c_source;
         // One fetch per guest instruction, at the instruction's own
         // address, ahead of its (guarded) body.
@@ -1216,11 +1259,17 @@ mod tests {
             source.contains("ops->fetch(ops->ctx, st, 0x8000104u, 4u);"),
             "{source}"
         );
-        // The flat per-instruction charge is gone; a failed ARM
-        // condition costs the interpreter's internal cycle.
+        // Each instruction boundary can hand control back for an
+        // interrupt, and a failed ARM condition costs one internal
+        // cycle there, once per guest instruction.
         assert!(!source.contains("st->cycles += 1;"), "{source}");
+        assert_eq!(
+            source.matches("if (st->cycles >= st->irq_at) {").count(),
+            2,
+            "{source}"
+        );
         assert!(
-            source.contains("} else {\n        st->cycles += 1u;\n    }"),
+            source.contains("if (!(!st->z)) st->cycles += 1u;"),
             "{source}"
         );
         // THUMB functions fetch halfwords.
@@ -1312,6 +1361,7 @@ mod tests {
             params: (40..60).map(ValueId).collect(),
             insts: vec![],
             cycles: Vec::new(),
+            checkpoints: Vec::new(),
             term: Terminator::Return {
                 state: (0..20)
                     .map(|slot| Value::Id(ValueId(40 + slot as u32)))

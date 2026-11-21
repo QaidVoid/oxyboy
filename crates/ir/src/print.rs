@@ -494,6 +494,7 @@ pub(crate) fn sample_function() -> Function {
                 addr: 0x100,
                 params: entry.clone(),
                 cycles: Vec::new(),
+                checkpoints: Vec::new(),
                 insts: vec![
                     Inst {
                         guard: None,
@@ -564,6 +565,7 @@ pub(crate) fn sample_function() -> Function {
                 params: vec![ValueId(27), ValueId(28)],
                 insts: vec![],
                 cycles: Vec::new(),
+                checkpoints: Vec::new(),
                 term: Terminator::Call {
                     target: reg(3),
                     cont: Some((BlockId(2), vec![reg(27)])),
@@ -577,6 +579,7 @@ pub(crate) fn sample_function() -> Function {
                 addr: 0x130,
                 params: vec![ValueId(29)],
                 cycles: Vec::new(),
+                checkpoints: Vec::new(),
                 insts: vec![Inst {
                     guard: None,
                     dests: vec![ValueId(30), ValueId(31)],
@@ -604,6 +607,7 @@ pub(crate) fn sample_function() -> Function {
                 params: vec![ValueId(32)],
                 insts: vec![],
                 cycles: Vec::new(),
+                checkpoints: Vec::new(),
                 term: Terminator::Return {
                     state: (0..16)
                         .map(|slot| if slot == 0 { reg(32) } else { reg(slot) })

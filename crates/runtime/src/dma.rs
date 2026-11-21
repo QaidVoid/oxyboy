@@ -124,6 +124,11 @@ impl Dma {
         cycles
     }
 
+    /// Whether an immediate channel waits for its deferred run.
+    pub(super) fn has_deferred(&self) -> bool {
+        self.deferred != 0
+    }
+
     /// Runs deferred immediate channels; called once per system step,
     /// after the instruction that armed them.
     pub(super) fn run_deferred(&mut self, bus: &mut Bus) -> u32 {

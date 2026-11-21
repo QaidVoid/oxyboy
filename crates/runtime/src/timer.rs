@@ -87,14 +87,22 @@ impl Timers {
         self.subcounts[ch] = 0;
     }
 
-    /// System cycles until the next overflow of any clocked timer
-    /// (cascade timers only overflow on a predecessor's overflow), or
-    /// `None` when no timer runs from the clock.
-    pub(super) fn cycles_to_overflow(&self, bus: &Bus) -> Option<u32> {
+    /// System cycles until the next overflow among the timers in
+    /// `mask` (bit N = timer N), or `None` when none of them can
+    /// overflow. A cascade timer only overflows when its predecessor
+    /// does, so it stands in for that predecessor.
+    pub(super) fn cycles_to_overflow(&self, bus: &Bus, mask: u8) -> Option<u32> {
+        let ctrl = |ch: usize| bus.io_half(0x0102 + 4 * ch as u32);
+        let mut mask = mask;
+        for ch in (1..4usize).rev() {
+            if mask >> ch & 1 != 0 && ctrl(ch) & 0x0004 != 0 {
+                mask |= 1 << (ch - 1);
+            }
+        }
         (0..4usize)
             .filter_map(|ch| {
-                let ctrl = bus.io_half(0x0102 + 4 * ch as u32);
-                if ctrl & 0x0080 == 0 || (ctrl & 0x0004 != 0 && ch > 0) {
+                let ctrl = ctrl(ch);
+                if mask >> ch & 1 == 0 || ctrl & 0x0080 == 0 || (ctrl & 0x0004 != 0 && ch > 0) {
                     return None;
                 }
                 let period = PERIODS[(ctrl & 0x0003) as usize];
@@ -102,6 +110,24 @@ impl Timers {
                 Some(ticks * period - self.subcounts[ch])
             })
             .min()
+    }
+
+    /// System cycles until timer `ch` overflows for the `n`th time
+    /// (`n` >= 1), or `None` when it is stopped. A cascade timer only
+    /// bounds its first overflow from below by its predecessor's.
+    pub(super) fn cycles_to_nth_overflow(&self, bus: &Bus, ch: usize, n: u32) -> Option<u32> {
+        let ctrl = bus.io_half(0x0102 + 4 * ch as u32);
+        if ctrl & 0x0080 == 0 {
+            return None;
+        }
+        if ctrl & 0x0004 != 0 && ch > 0 {
+            return self.cycles_to_overflow(bus, 1 << ch);
+        }
+        let period = PERIODS[(ctrl & 0x0003) as usize];
+        let first = (0x1_0000 - u32::from(self.counters[ch])) * period - self.subcounts[ch];
+        let reload = u32::from(bus.io_half(0x0100 + 4 * ch as u32));
+        let full = (0x1_0000 - reload) * period;
+        Some(first.saturating_add(full.saturating_mul(n.saturating_sub(1))))
     }
 
     /// The live counter of channel `ch` (TMxCNT_L readback).

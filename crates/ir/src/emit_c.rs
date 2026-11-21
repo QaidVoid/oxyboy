@@ -1830,6 +1830,7 @@ mod tests {
             params: Vec::new(),
             insts,
             cycles: Vec::new(),
+            checkpoints: Vec::new(),
             term,
         }
     }
@@ -2223,6 +2224,7 @@ mod tests {
     /// Lifts and optimizes ARM `words`, then renders the readable C.
     fn lifted_text(words: &[u32]) -> String {
         let mut function = lift_arm(words, words.len());
+        function.drop_checkpoints();
         crate::opt::optimize(&mut function);
         emit_function(&function)
     }

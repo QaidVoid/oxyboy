@@ -84,7 +84,7 @@ const SOUNDBIAS: u32 = 0x088;
 const FIFO_CAPACITY: usize = 32;
 /// The FIFO refill request level in bytes (GBATEK playback procedure:
 /// request a 16-byte DMA when only 4x32-bit remain).
-const FIFO_REFILL_LEVEL: usize = 16;
+pub(crate) const FIFO_REFILL_LEVEL: usize = 16;
 
 /// One FIFO sound queue plus its current sample register.
 #[derive(Default)]

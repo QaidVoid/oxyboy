@@ -388,6 +388,11 @@ pub struct Block {
     /// never touch it, so charges survive even when every IR fragment
     /// of an instruction is eliminated.
     pub cycles: Vec<CycleCharge>,
+    /// The machine state before each guest instruction, in execution
+    /// order: where native code can hand control back between
+    /// instructions (an interrupt falling due there, say). Lifted
+    /// blocks carry one per instruction; synthetic blocks carry none.
+    pub checkpoints: Vec<Checkpoint>,
     /// How control leaves the block.
     pub term: Terminator,
 }
@@ -406,6 +411,31 @@ pub struct CycleCharge {
     /// Internal cycles beyond the fetch (the interpreter's per-op
     /// extras: multiply latency, the THUMB BL second fetch, ...).
     pub cycles: u32,
+}
+
+impl Function {
+    /// Drops every block's [`Checkpoint`]s. Only native execution
+    /// needs them; without them the optimizer can remove the flag and
+    /// register values they would otherwise keep alive.
+    pub fn drop_checkpoints(&mut self) {
+        for block in &mut self.blocks {
+            block.checkpoints.clear();
+        }
+    }
+}
+
+/// The machine state just before the guest instruction at `addr`, in
+/// [`SLOTS`] order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Checkpoint {
+    /// Canonical guest address of the instruction about to run.
+    pub addr: u32,
+    /// Every machine slot's value at that point.
+    pub state: Vec<Value>,
+    /// The ARM condition of a conditional non-branching instruction:
+    /// when it fails, the instruction still costs one internal cycle,
+    /// even if every IR fragment of it was optimized away.
+    pub guard: Option<Condition>,
 }
 
 /// A lifted function: the entry block's parameters are the incoming

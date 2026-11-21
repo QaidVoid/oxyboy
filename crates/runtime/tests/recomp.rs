@@ -922,7 +922,19 @@ fn arm_image(title: &str, words: &[u32], data: &[(usize, u32)]) -> Image {
 /// the translated `marks`, then asserts r0-r14, the flags, and EWRAM
 /// agree. Returns the hybrid system for further checks.
 fn assert_hybrid_matches(image: &Image, marks: &[(u32, u32)], tag: &str, park: u32) -> System {
+    assert_hybrid_matches_with(image, marks, tag, park, |_| {})
+}
+
+/// [`assert_hybrid_matches`] with `setup` applied to both machines.
+fn assert_hybrid_matches_with(
+    image: &Image,
+    marks: &[(u32, u32)],
+    tag: &str,
+    park: u32,
+    setup: impl Fn(&mut System),
+) -> System {
     let mut interpreted = System::new(image.bytes().to_vec(), 0x0800_0100);
+    setup(&mut interpreted);
     let mut steps = 0;
     while interpreted.cpu.pc() != park && steps < 10_000 {
         interpreted.step();
@@ -936,6 +948,7 @@ fn assert_hybrid_matches(image: &Image, marks: &[(u32, u32)], tag: &str, park: u
 
     let mut driver = build_driver(image, marks, tag).expect("module builds");
     let mut hybrid = System::new(image.bytes().to_vec(), 0x0800_0100);
+    setup(&mut hybrid);
     let mut steps = 0;
     while hybrid.cpu.pc() != park && steps < 10_000 {
         driver.step(&mut hybrid).expect("native call");
@@ -1122,4 +1135,54 @@ fn failed_guards_cost_one_cycle_per_guest_instruction() {
         cycles += u64::from(driver.step(&mut hybrid).expect("native call"));
     }
     assert_eq!(interpreted.cpu.cycles(), cycles);
+}
+
+#[test]
+fn interrupts_land_on_the_interpreters_instruction_boundary() {
+    if !recomp::Module::compiler_available() {
+        println!("skipping: no host C compiler on PATH");
+        return;
+    }
+    // A straight-line translated run with no back edge or call: the
+    // timer IRQ fires partway through, and the handler records how
+    // many adds ran first. Native code must stop at the same
+    // instruction boundary the interpreter takes the IRQ at.
+    let mut words = vec![0xE3A0_4000u32]; // mov r4, #0
+    words.extend([0xE284_4001u32; 40]); // add r4, r4, #1
+    words.push(0xEAFF_FFFE); // park: b .
+    let image = arm_image("RCIQ", &words, &[]);
+    let park = 0x0800_0100 + 41 * 4;
+    let handler: [u32; 8] = [
+        0xE3A0_0403, // mov r0, #0x03000000
+        0xE580_4000, // str r4, [r0]
+        0xE3A0_1301, // mov r1, #0x04000000
+        0xE281_1C02, // add r1, r1, #0x200
+        0xE3A0_2008, // mov r2, #8
+        0xE1C1_20B2, // strh r2, [r1, #2]    ; acknowledge timer 0
+        0xE141_2FBE, // strh r2, [r1, #-254] ; stop timer 0
+        0xE12F_FF1E, // bx lr
+    ];
+    let setup = |system: &mut System| {
+        let bus = system.bus_mut();
+        for (i, word) in handler.iter().enumerate() {
+            bus.write_u32(0x0200_0000 + 4 * i as u32, *word);
+        }
+        bus.write_u32(0x0300_7FFC, 0x0200_0000);
+        bus.write_u16(0x0400_0200, 0x0008); // IE: timer 0
+        bus.write_u16(0x0400_0208, 1); // IME
+        bus.write_u16(0x0400_0100, 0x10000u32.wrapping_sub(60) as u16);
+        bus.write_u16(0x0400_0102, 0x00C0); // enable, IRQ, prescaler 1
+    };
+    let hybrid = assert_hybrid_matches_with(
+        &image,
+        &[(0x100, park - 0x0800_0000)],
+        "recomp-irq",
+        park,
+        setup,
+    );
+    let recorded = u32::from_le_bytes(hybrid.bus().iwram()[0..4].try_into().expect("slice"));
+    assert!(
+        (1..40).contains(&recorded),
+        "the IRQ landed mid-run: {recorded}"
+    );
 }

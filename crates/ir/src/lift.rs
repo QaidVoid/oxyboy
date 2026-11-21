@@ -18,7 +18,8 @@ use decode::{
 
 use crate::arm::ArmLift;
 use crate::{
-    Block, BlockId, CycleCharge, Function, Inst, Op, SLOTS, Size, Terminator, Value, ValueId,
+    Block, BlockId, Checkpoint, CycleCharge, Function, Inst, Op, SLOTS, Size, Terminator, Value,
+    ValueId,
 };
 
 /// The interpreter's internal-cycle extras for one ARM instruction
@@ -136,6 +137,7 @@ struct RawBlock {
     end_state: Vec<ValueId>,
     insts: Vec<Inst>,
     cycles: Vec<CycleCharge>,
+    checkpoints: Vec<Checkpoint>,
     term: RawTerm,
 }
 
@@ -281,6 +283,7 @@ impl Lifter<'_> {
                     end_state,
                     insts: vec![compare],
                     cycles: Vec::new(),
+                    checkpoints: Vec::new(),
                     term: RawTerm::BranchCond {
                         cond: Condition::Eq,
                         then_target: target,
@@ -297,6 +300,7 @@ impl Lifter<'_> {
                 params: fallback_params,
                 insts: Vec::new(),
                 cycles: Vec::new(),
+                checkpoints: Vec::new(),
                 term: RawTerm::IndirectExit {
                     reg: Register::Pc,
                     switches_state: false,
@@ -343,6 +347,7 @@ impl Lifter<'_> {
                 params,
                 insts: Vec::new(),
                 cycles: Vec::new(),
+                checkpoints: Vec::new(),
                 term,
             },
         );
@@ -423,6 +428,7 @@ impl Lifter<'_> {
         };
         // One cycle charge per executed guest instruction, in order.
         let mut cycles: Vec<CycleCharge> = Vec::new();
+        let mut checkpoints: Vec<Checkpoint> = Vec::new();
         let mut addr = from;
         let term = loop {
             if addr >= self.region.end {
@@ -436,6 +442,16 @@ impl Lifter<'_> {
             if !self.executed(addr) {
                 break RawTerm::Unreachable;
             }
+            let guard = match self.region.state {
+                State::Arm => Condition::from_bits((self.word(addr) >> 28) as u8)
+                    .filter(|cond| *cond != Condition::Al),
+                State::Thumb => None,
+            };
+            checkpoints.push(Checkpoint {
+                addr,
+                state: lift.current.iter().map(|&id| Value::Id(id)).collect(),
+                guard,
+            });
             match self.region.state {
                 State::Arm => {
                     let word = self.word(addr);
@@ -872,6 +888,13 @@ impl Lifter<'_> {
                 }
             }
         };
+        // A conditional transfer charges its failed condition on the
+        // branch's else arm instead.
+        if matches!(term, RawTerm::BranchCond { .. })
+            && let Some(last) = checkpoints.last_mut()
+        {
+            last.guard = None;
+        }
         leaders.retain(|&leader| self.in_region(leader));
         self.next = lift.next;
         self.raw.insert(
@@ -881,6 +904,7 @@ impl Lifter<'_> {
                 end_state: lift.current.to_vec(),
                 insts: lift.insts,
                 cycles,
+                checkpoints,
                 term,
             },
         );
@@ -972,6 +996,7 @@ impl Lifter<'_> {
                 params,
                 insts: raw.insts.clone(),
                 cycles: raw.cycles.clone(),
+                checkpoints: raw.checkpoints.clone(),
                 term,
             });
         }
@@ -994,6 +1019,7 @@ impl Lifter<'_> {
                 params,
                 insts: Vec::new(),
                 cycles: Vec::new(),
+                checkpoints: Vec::new(),
                 term: Terminator::Call {
                     target: Value::Const(addr),
                     cont: None,

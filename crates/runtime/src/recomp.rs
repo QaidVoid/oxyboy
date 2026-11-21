@@ -47,15 +47,25 @@
 //! (`GuestOps::cycle_budget`): a unit exits at a backward edge or
 //! call once its charged cycles reach the bound, so idle loops cannot
 //! overshoot the boundary and the frame runner stops where
-//! [`System::step_frame`] does. Remaining gaps, all documented: IRQ
-//! boundary checks inside a chunk (an interrupt
-//! waits for the chunk to end), hardware interleaving within a chunk
-//! (timers and the PPU advance when the chunk's cycles feed the
-//! scheduler at its end), ARM function returns via unlifted
+//! [`System::step_frame`] does.
+//!
+//! Interrupts and DMA (exact): every guest instruction is a lifted
+//! checkpoint. Before each one the code compares its charged cycles
+//! with `irq_at`, the next point where the interpreter would take an
+//! interrupt or run a DMA ([`System::cycles_to_native_stop`]), and
+//! hands control back with that instruction's state once it is
+//! reached, so the interrupt lands on the same instruction boundary.
+//! A native IO access first brings the PPU, timers, and APU up to the
+//! start of its instruction (polling VCOUNT or a timer sees time
+//! pass), and a native IO store re-derives `irq_at`, since it can
+//! unmask an interrupt or arm a DMA. A store that bails out for
+//! self-modifying code rolls back its instruction's cycles and bus
+//! fetch state before the interpreter reruns it. Failed ARM conditions
+//! cost their internal cycle at the checkpoint, once per guest
+//! instruction. Remaining gap: ARM function returns via unlifted
 //! `ldr pc`/`ldm .., pc` (no charge; the unit falls back to the
-//! interpreter), and a fully eliminated conditional instruction's
-//! failed-condition cycle. State equality stays the contract; cycle
-//! equality per instruction sequence is not yet guaranteed.
+//! interpreter). State and cycle equality with the interpreter is the
+//! contract.
 
 use core::ffi::c_void;
 
@@ -101,8 +111,13 @@ struct HostCtx {
     /// The chunk's charged cycles when the current guest instruction
     /// began (before its fetch).
     inst_start: u64,
+    /// The bus fetch-timing state when the current instruction began.
+    inst_bus: (Option<u32>, (u32, u8)),
     /// Cycles already fed to the scheduler during this chunk.
     synced: u64,
+    /// The chunk's own stop point (the frame boundary in frame runs);
+    /// `irq_at` never moves past it.
+    stop_at: u64,
 }
 
 impl HostCtx {
@@ -121,6 +136,21 @@ impl HostCtx {
         let pending = self.inst_start - self.synced;
         self.synced = self.inst_start;
         unsafe { (*self.system).advance_clock(u32::try_from(pending).unwrap_or(u32::MAX)) };
+    }
+
+    /// Re-derives `irq_at` after an IO store at the current
+    /// instruction: the store can unmask a pending interrupt, enable a
+    /// new source, or arm an immediate DMA, all of which the
+    /// interpreter acts on right after the storing instruction.
+    fn refresh_irq_at(&mut self, st: *mut GuestState) {
+        let system = unsafe { &*self.system };
+        let due = if system.bus().dma_deferred_pending() {
+            self.inst_start
+        } else {
+            self.inst_start
+                .saturating_add(u64::from(system.cycles_to_native_stop()))
+        };
+        unsafe { (*st).irq_at = due.min(self.stop_at) };
     }
 }
 
@@ -270,10 +300,7 @@ impl Driver {
     /// Propagates native-call failures.
     pub fn run_frame(&mut self, system: &mut System) -> Result<(), String> {
         while !system.frame_ended() {
-            let bound = system
-                .cycles_to_frame_end()
-                .min(system.cycles_to_interrupt_event());
-            self.cycle_budget = u64::from(bound).max(1);
+            self.cycle_budget = u64::from(system.cycles_to_frame_end()).max(1);
             self.step(system)?;
         }
         self.cycle_budget = u64::MAX;
@@ -365,6 +392,7 @@ impl Driver {
             thumb: u32::from(thumb),
             cycles: 0,
             icount: 0,
+            irq_at: u64::MAX,
         };
         // r0-r14 are the current-mode register file; r15 is the PC
         // (a separate field on the CPU) and is taken below.
@@ -383,8 +411,11 @@ impl Driver {
             system: std::ptr::from_mut(system),
             code_pages: self.code_pages.as_ptr(),
             inst_start: 0,
+            inst_bus: system.bus().fetch_state(),
             synced: 0,
+            stop_at: self.cycle_budget,
         };
+        st.irq_at = u64::from(system.cycles_to_native_stop()).min(self.cycle_budget);
         let ops = GuestOps {
             ctx: std::ptr::from_mut(&mut ctx).cast::<c_void>(),
             load: host_load,
@@ -469,6 +500,7 @@ unsafe extern "C" fn host_load(
 unsafe extern "C" fn host_fetch(ctx: *mut c_void, st: *mut GuestState, addr: u32, width: u32) {
     let host = unsafe { &mut *(ctx.cast::<HostCtx>()) };
     host.inst_start = unsafe { (*st).cycles };
+    host.inst_bus = host.bus().fetch_state();
     let bus = host.bus();
     let cost = bus.fetch_cost(addr, u8::try_from(width).unwrap_or(4));
     unsafe { (*st).cycles += u64::from(cost) };
@@ -502,10 +534,15 @@ unsafe extern "C" fn host_store(
             .map(|p| unsafe { *host.code_pages.add(p as usize) })
             .any(|marked| marked != 0);
         if hit {
+            // The interpreter reruns the whole instruction, fetch
+            // included, so nothing of it stays charged here.
             unsafe {
                 (*st).exited = 1;
                 (*st).pc = pc;
+                (*st).cycles = host.inst_start;
             }
+            let state = host.inst_bus;
+            host.bus().restore_fetch_state(state);
             return 1;
         }
         host.sync_for_io(addr);
@@ -517,6 +554,11 @@ unsafe extern "C" fn host_store(
         SIZE_BYTE => bus.write_u8(addr, value as u8),
         SIZE_HALF => bus.write_u16(addr, value as u16),
         _ => bus.write_u32(addr, value),
+    }
+    if (addr >> 24) & 0x0F == 0x04 {
+        // The store may have changed what interrupts or DMA can do.
+        host.sync_for_io(addr);
+        host.refresh_irq_at(st);
     }
     0
 }

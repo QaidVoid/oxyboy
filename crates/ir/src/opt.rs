@@ -411,6 +411,11 @@ fn exit_live(
     live_in: &[HashSet<u32>],
 ) -> HashSet<u32> {
     let mut live: HashSet<u32> = HashSet::new();
+    // A checkpoint can hand its state to the interpreter, so every
+    // value it names stays.
+    for checkpoint in &function.blocks[index].checkpoints {
+        live.extend(ids(&checkpoint.state));
+    }
     match &function.blocks[index].term {
         Terminator::Return { state, .. } => {
             live.extend(ids(state));
@@ -768,6 +773,15 @@ pub fn constant_propagation(function: &mut Function) {
             }
         }
         substitute_term(&mut block.term, &subs);
+        for checkpoint in &mut block.checkpoints {
+            for value in &mut checkpoint.state {
+                if let Value::Id(id) = *value
+                    && let Some((_, to)) = subs.iter().find(|(from, _)| *from == id)
+                {
+                    *value = Value::Const(*to);
+                }
+            }
+        }
         let old = std::mem::take(&mut block.insts);
         block.insts = old
             .into_iter()
@@ -1015,6 +1029,7 @@ mod tests {
                     state: Vec::new(),
                 }],
                 cycles: Vec::new(),
+                checkpoints: Vec::new(),
                 term: Terminator::Call {
                     target: Value::Const(0x0800_0200),
                     cont: None,

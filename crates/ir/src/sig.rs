@@ -722,6 +722,7 @@ mod tests {
             params: Vec::new(),
             insts,
             cycles: Vec::new(),
+            checkpoints: Vec::new(),
             term,
         }
     }

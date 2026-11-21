@@ -213,6 +213,7 @@ mod tests {
             thumb: 0,
             cycles: 0,
             icount: 0,
+            irq_at: u64::MAX,
         };
         st.r[0] = 0x1000;
         let ops = GuestOps {
@@ -300,6 +301,7 @@ mod tests {
             thumb: 0,
             cycles: 0,
             icount: 0,
+            irq_at: u64::MAX,
         };
         st.r[0] = 0x1000;
         st.r[1] = 0xABCD_EF01;
@@ -335,6 +337,7 @@ mod tests {
             name: "sub_08000100".to_string(),
             thumb: false,
             blocks: vec![Block {
+                checkpoints: Vec::new(),
                 addr: 0x0800_0100,
                 params: (0..20).map(ValueId).collect(),
                 cycles: vec![

@@ -60,6 +60,7 @@ pub fn run(args: LiftArgs) -> i32 {
             continue;
         }
         let mut function = ir::lift::lift_function(&image, &map, region, &analysis.tables);
+        function.drop_checkpoints();
         if args.print_after_all {
             optimize_with_dumps(&mut function, &mut dumped);
         } else {

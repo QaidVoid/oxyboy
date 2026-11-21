@@ -360,6 +360,7 @@ mod tests {
             params: Vec::new(),
             insts: Vec::new(),
             cycles: Vec::new(),
+            checkpoints: Vec::new(),
             term,
         }
     }
@@ -370,6 +371,7 @@ mod tests {
             params: Vec::new(),
             insts: Vec::new(),
             cycles: Vec::new(),
+            checkpoints: Vec::new(),
             term: Terminator::Return {
                 state: Vec::<Value>::new(),
                 switches_state: false,
@@ -505,6 +507,7 @@ mod tests {
                 params: Vec::new(),
                 insts: Vec::new(),
                 cycles: Vec::new(),
+                checkpoints: Vec::new(),
                 term: Terminator::Call {
                     target: Value::Const(0x100),
                     cont: Some((BlockId(1), Vec::new())),

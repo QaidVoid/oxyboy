@@ -37,6 +37,11 @@ pub struct GuestState {
     pub cycles: u64,
     /// IR instructions executed, for the host's budget check.
     pub icount: u64,
+    /// The charged cycle count at which an interrupt falls due (or the
+    /// host wants control back). Before each guest instruction the
+    /// code exits with that instruction's state once `cycles` reach
+    /// it; the host moves it when a store changes interrupt state.
+    pub irq_at: u64,
 }
 
 /// `Size::Byte`.
@@ -121,6 +126,7 @@ struct oxy_state {
     uint32_t thumb;
     uint64_t cycles;
     uint64_t icount;
+    uint64_t irq_at;
 };
 
 #define OXY_SIZE_BYTE 0u
