@@ -58,7 +58,7 @@ pub enum Region {
     Ewram,
     /// 0x03000000: 32 KiB on-chip work RAM.
     Iwram,
-    /// 0x04000000: IO registers (stubbed for now).
+    /// 0x04000000: IO registers.
     Io,
     /// 0x05000000: 1 KiB palette RAM.
     Palette,
@@ -832,13 +832,10 @@ impl Bus {
 
     /// Writes an aligned IO halfword with per-register semantics.
     ///
-    /// Implemented: DISPCNT, GREENSWAP, DISPSTAT, VCOUNT,
-    /// IE, IF, and IME (GBATEK "LCD I/O Registers" and "Interrupt
-    /// Control"). Unimplemented registers are plain storage, which is
-    /// indistinguishable from write-only stubs for now.
-    /// DISPSTAT bits 0-2 are read-only flags maintained by the PPU
-    /// (GBATEK: "(R)" on V-Blank/H-Blank/V-Counter), VCOUNT is
-    /// read-only, and IF acknowledges on written 1 bits.
+    /// Registers without side effects are plain storage. DISPSTAT bits
+    /// 0-2 are read-only flags maintained by the PPU (GBATEK: "(R)" on
+    /// V-Blank/H-Blank/V-Counter), VCOUNT is read-only, and IF
+    /// acknowledges on written 1 bits.
     fn io_write_u16(&mut self, half: u32, value: u16) {
         self.log_io(half, u32::from(value), 2, false);
         let off = (half & 0x3FF) as usize;

@@ -2,9 +2,9 @@
 //!
 //! Implements ARM-mode execution for every instruction class the
 //! decoder produces, with CPU modes, banked registers, CPSR/SPSR
-//! handling, and exception entry. Cycle counts are coarse region-default
-//! approximations (one N-cycle per bus access, region cost from
-//! [`crate::bus`]); real WAITSTATE timing is not modeled yet.
+//! handling, and exception entry. Cycle counts come from the bus's
+//! WAITCNT model ([`crate::bus`]), with sequential tracking and the
+//! Game Pak prefetch buffer.
 
 use crate::bus::{BIOS_LATCH_IRQ, BIOS_LATCH_IRQ_RETURN, Bus};
 use decode::{

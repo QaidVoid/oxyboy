@@ -436,7 +436,7 @@ impl Ppu {
 type Candidate = ((u8, u8, u8), u16, bool, bool, bool);
 
 /// The background kinds each mode exposes (GBATEK "DISPCNT" BG mode
-/// table). Modes 4-5 are not implemented yet.
+/// table).
 fn enabled_bgs(dispcnt: u16, mode: u16) -> impl Iterator<Item = (usize, BgKind)> {
     let kinds: [(usize, BgKind); 4] = match mode {
         0 => [
