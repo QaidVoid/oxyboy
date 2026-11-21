@@ -3,17 +3,19 @@ name = "runtime"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+publish.workspace = true
 
 [dependencies]
-decode = { version = "0.1.0", path = "../decode" }
-recomp = { version = "0.1.0", path = "../recomp" }
-rom = { version = "0.1.0", path = "../rom" }
+decode = { path = "../decode" }
+recomp = { path = "../recomp" }
+rom = { path = "../rom" }
 thiserror = "2.0.21"
-trace = { version = "0.1.0", path = "../trace" }
+trace = { path = "../trace" }
 
 [dev-dependencies]
-analysis = { version = "0.1.0", path = "../analysis" }
-ir = { version = "0.1.0", path = "../ir" }
-recomp = { version = "0.1.0", path = "../recomp" }
-rom = { version = "0.1.0", path = "../rom" }
+analysis = { path = "../analysis" }
+ir = { path = "../ir" }
+recomp = { path = "../recomp" }
+rom = { path = "../rom" }
 testutil = { path = "../testutil" }

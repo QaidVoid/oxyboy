@@ -3,11 +3,13 @@ name = "ir"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+publish.workspace = true
 
 [dependencies]
-rom = { version = "0.1.0", path = "../rom" }
-analysis = { version = "0.1.0", path = "../analysis" }
-decode = { version = "0.1.0", path = "../decode" }
+rom = { path = "../rom" }
+analysis = { path = "../analysis" }
+decode = { path = "../decode" }
 
 [dev-dependencies]
-runtime = { version = "0.1.0", path = "../runtime" }
+runtime = { path = "../runtime" }

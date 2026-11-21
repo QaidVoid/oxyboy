@@ -1,0 +1,71 @@
+name: release
+
+# Builds the tool at a release's tag, attaches it to the release and publishes
+# it. release-plz.yml calls this with the tag of the draft it made. A published
+# release is immutable, so running this by hand only helps a release still in
+# draft, such as one whose build failed.
+on:
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag of the release to build, such as v0.2.0
+        required: true
+        type: string
+
+concurrency:
+  group: release-${{ inputs.tag }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  build:
+    name: x86_64-linux
+    # An older runner, so that the tool runs on hosts whose C library is older
+    # than the newest.
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag }}
+          persist-credentials: false
+      - name: Install the pinned toolchain
+        run: rustup toolchain install
+      # cpal links ALSA. The window opens X11 or Wayland through dlopen, so
+      # those need no headers here.
+      - name: Install ALSA headers
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - name: Build
+        run: cargo build --release --locked
+      - name: Package
+        env:
+          TAG: ${{ inputs.tag }}
+        run: scripts/package "$TAG" x86_64-linux
+      # A signed statement of which workflow built the archive from which
+      # commit, which anyone can check with `gh attestation verify`. A checksum
+      # beside the archive would say nothing a tampered release could not say
+      # as well.
+      - name: Attest
+        uses: actions/attest@v4
+        with:
+          subject-path: dist/*.tar.xz
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: gh release upload "$TAG" dist/*.tar.xz --clobber --repo "$GITHUB_REPOSITORY"
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: gh release edit "$TAG" --draft=false --latest --repo "$GITHUB_REPOSITORY"

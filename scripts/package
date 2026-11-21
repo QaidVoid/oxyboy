@@ -1,0 +1,30 @@
+#!/bin/sh
+# Packs a release build of the tool into dist/.
+#
+# Usage: scripts/package <version> <platform>
+#   scripts/package v0.2.0 x86_64-linux
+#
+# The archive holds the tool, the licences and the README. Build with
+# cargo build --release first.
+set -eu
+
+root=$(CDPATH='' cd "$(dirname "$0")/.." && pwd)
+cd "$root"
+
+version=${1#v}
+platform=$2
+name=oxyboy-$version-$platform
+stage=dist/$name
+
+[ -f target/release/oxyboy ] || {
+    printf 'package: target/release/oxyboy is not there, build with cargo build --release first\n' >&2
+    exit 1
+}
+
+rm -rf dist
+mkdir -p "$stage"
+cp target/release/oxyboy "$stage/"
+cp README.md LICENSE-MIT LICENSE-APACHE "$stage/"
+tar -C dist -cJf "dist/$name.tar.xz" "$name"
+rm -rf "$stage"
+printf 'package: dist/%s.tar.xz\n' "$name"

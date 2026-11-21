@@ -3,11 +3,13 @@ name = "emit"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+publish.workspace = true
 
 [dependencies]
-analysis = { version = "0.1.0", path = "../analysis" }
-decode = { version = "0.1.0", path = "../decode" }
-rom = { version = "0.1.0", path = "../rom" }
+analysis = { path = "../analysis" }
+decode = { path = "../decode" }
+rom = { path = "../rom" }
 
 [dev-dependencies]
-testutil = { version = "0.1.0", path = "../testutil" }
+testutil = { path = "../testutil" }
